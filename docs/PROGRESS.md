@@ -1,6 +1,6 @@
 # Progress
 
-## Status: Phase 1 DONE (tag v0.0-phase1). Next: Phase 2, Week 1 Day 2.
+## Status: Phase 2 — Week 1 Day 2 DONE (PR #1 merged, CI green incl. pgvector integration). Next: Day 3 ingestion.
 Project: Compliance Copilot (Option 1). Defaults: 3–4 h/day · 6 weeks · EU deploy. Repo: github.com/JayLakhani2002/compliance-copilot (private for now).
 
 ## Done
@@ -9,7 +9,10 @@ Project: Compliance Copilot (Option 1). Defaults: 3–4 h/day · 6 weeks · EU d
 - Day 1 of curriculum = read ARCHITECTURE + ADRs with the teacher (Jay does this in VS Code).
 
 ## Next (builder)
-- Week 1 Day 2: docker-compose (postgres+pgvector), db.py, migration, integration test. Branch `feature/db-pgvector`. Teacher lesson first (docs/lessons/02_postgres_pgvector.md).
+- Week 1 Day 3: verify EUR-Lex reuse notice → ADR-0012; `ingest/eurlex.py` fetch AI Act + GDPR, article-level chunks with metadata; unit test on article counts. Branch `feature/ingest-eurlex`. Lesson 03 first.
+
+## Done this week
+- Day 2: compose, settings, db models, HNSW index, CI integration job (PR #1).
 
 ## Open questions
-- none blocking. See docs/INBOX.md.
+- Jay: install Docker (INBOX TASK) to run integration tests locally; CI covers it meanwhile.
