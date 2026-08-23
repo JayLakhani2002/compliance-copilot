@@ -17,3 +17,5 @@
 **Interview question.** "When would you move from pgvector to a dedicated vector database, and how would you know it's time?" (Answer shape: measure p95 query latency and recall at your real N; > ~10–50M vectors, heavy filtered search, or multi-tenant isolation needs; you'd know from the retrieval eval + latency dashboard, not from a blog post.)
 
 **Check yourself.** 1) Why cosine and not L2 here? 2) What bug does "one database" prevent?
+
+> Note: the HNSW index is created already in Day 2's `db.py` (the schema is the natural place for it); Day 4's lesson explains *why* HNSW and what `m` / `ef_construction` trade off. Don't worry about those two numbers yet.

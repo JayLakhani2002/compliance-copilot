@@ -20,9 +20,10 @@ services:
       POSTGRES_PASSWORD: password
       POSTGRES_DB: compliance_copilot
     ports:
-      # host:container — 5432 on localhost so DATABASE_URL in .env.example
-      # (postgresql+psycopg://...@localhost:5432/...) works unchanged.
-      - "5432:5432"
+      # 127.0.0.1:host:container — bind to loopback only, so the dev DB (with a
+      # throwaway password) is never reachable from other machines on your network.
+      # DATABASE_URL in .env.example (…@localhost:5432/…) works unchanged.
+      - "127.0.0.1:5432:5432"
     volumes:
       # Named volume so data survives `docker compose down` (but not `-v`) —
       # re-ingesting the corpus every restart would be wasteful for dev.
