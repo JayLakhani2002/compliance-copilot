@@ -8,3 +8,5 @@ Format, newest at bottom:
 ---
 DECISION (Jay, 2026-08-23): Project = Option 1, Compliance Copilot (agentic RAG over EU AI Act + GDPR).
 DECISION (Jay, 2026-08-23): Teacher runs in VS Code Claude panel; builder + agents run in terminal.
+Q [answered] (builder, 2026-08-23): Python version — 3.12 pinned via .python-version (ML libs lag on 3.14). A: decided by planner.
+Q [open] (builder, 2026-08-23): GitHub repo public or private? Planner recommends PUBLIC (portfolio). Jay: run `cd "/Users/jay/Documents/Projects/Langchain Project" && gh repo create compliance-copilot --public --source=. --remote=origin && git push -u origin main && git push -u origin develop`
