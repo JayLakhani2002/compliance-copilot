@@ -106,8 +106,7 @@ def test_article_3_realistic_size_splits_into_about_ten_parts():
     assert "".join(p.text for p in parts) == text  # definition path is lossless
 
 
-# --- Day 6a: definition-aware splitting (ADR-0013's residual gap, docs/
-# handoffs/week2-day6a-defchunks/coder.md) ------------------------------
+# --- Definition-aware splitting (ADR-0013 residual gap + amendment) ----
 #
 # Real excerpt pulled directly from the ingested `chunk` table (AI Act
 # Art. 3, definitions (1)-(5)) via `SELECT text FROM chunk WHERE
