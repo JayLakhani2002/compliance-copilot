@@ -101,3 +101,71 @@ doesn't also match the title's own nested id `art_N.tit_1`.
 Day 4: `embeddings.py` + wire `ingest_regulation()` output into
 `Document`/`Chunk` DB writes (`src/compliance_copilot/db.py`) with HNSW
 index, per `docs/CURRICULUM.md`.
+
+## Round 1 fixes (reviewer APPROVE with fixes — docs/handoffs/week1-day3-ingest/reviewer.md)
+
+1. **[Major] Recital count sanity check.** Added `expected_recitals` (180
+   ai_act / 173 gdpr) to `REGULATIONS`; `ingest_regulation` now checks
+   recitals the same way it already checked articles, with the same clear
+   error message shape. New unit test
+   (`test_ingest_regulation_raises_on_recital_count_mismatch`) monkeypatches
+   `fetch_xhtml`/`parse_articles` to return 113 articles + 1 recital and
+   asserts the recital check fires on its own, independent of the article
+   check.
+2. **[Minor] Atomic cache write + undersized-cache-is-a-miss.**
+   `fetch_xhtml` now writes to `<celex>.xhtml.tmp` and `os.replace()`s it
+   into place (atomic on POSIX/Windows — a killed-mid-write process leaves
+   the old cache or nothing, never a half-written file). Added
+   `_MIN_CACHE_BYTES = 1024`: a cache file smaller than that is treated as a
+   miss and re-fetched. Two new tests cover both the write path and the
+   undersized-cache-is-a-miss read path.
+3. **[Minor] Normalised errors.** Added `EurLexFetchError(RuntimeError)`.
+   `fetch_xhtml` now catches `httpx.RequestError` (the base for
+   connect/DNS/timeout failures — confirmed via Context7's httpx exception
+   hierarchy doc, `_exceptions.py`) around `client.get()` and raises
+   `EurLexFetchError` from it, alongside the existing non-200 case which now
+   raises the same type instead of a bare `RuntimeError`. Two new tests
+   (non-200, `httpx.ConnectError`) confirm both paths raise
+   `EurLexFetchError`.
+4. **[Minor] Fixture + comment fixes.** Removed the stray trailing backtick
+   from Article 1's title in `tests/fixtures/eurlex_sample.xhtml`
+   (`Subject matter\`` → `Subject matter`). Reworded the `REQUEST_HEADERS`
+   why-comment to stop claiming the User-Agent is a contact email — it's a
+   repo URL, and the comment now says so accurately.
+5. **[Pre-existing, reviewer + planner agreed] Lazy DB engine.** In
+   `src/compliance_copilot/db.py`, replaced the module-level
+   `engine = create_engine(...)` / `SessionLocal = sessionmaker(...)` with
+   `get_engine()` (`functools.lru_cache(maxsize=1)` — build once, on first
+   use, not at import). `get_session()` now does `Session(get_engine())`
+   directly (confirmed via Context7 as valid SQLAlchemy 2.0 usage —
+   `Session(engine)` is documented alongside `sessionmaker`). Only consumer
+   outside `db.py` was `cli.py`'s `init-db` command
+   (`from compliance_copilot.db import engine` → `get_engine()`,
+   `init_db(engine)` → `init_db(get_engine())`); `init_db(engine)` itself was
+   already taking the engine as an explicit param so no signature change
+   there. `test_db_models.py`/`test_db_integration.py` didn't import
+   `engine` and needed no changes. This fixes the exact failure the task
+   brief's own verification command hit: `RUN_NETWORK_TESTS=1 DATABASE_URL=
+   uv run pytest -m integration -k eurlex` now passes without any `--ignore`
+   flags (previously failed at collection of unrelated DB test files).
+
+### Test results after fixes
+- `uv run ruff check .` / `uv run ruff format --check .` — clean.
+- `uv run pytest -m "not integration"` — **15 passed, 2 skipped** (up from
+  11 passed — 4 new unit tests for findings 1–3).
+- `RUN_NETWORK_TESTS=1 DATABASE_URL= uv run pytest -m integration -k eurlex`
+  — **2 passed, 1 skipped, 15 deselected**, no `--ignore` needed (finding 5
+  fix verified against the task's own repro command).
+- Cleared both cached `data/raw/*.xhtml` files and re-ran the integration
+  test to force a real network hit: still **113 articles / 180 recitals**
+  (AI Act) and **99 articles / 173 recitals** (GDPR) — recital sanity check
+  passes against the live counts it now enforces.
+- CLI dry-run (`ingest --regulation all --dry-run`) re-verified, same
+  counts.
+
+### Open items carried forward
+- Finding 3 in the reviewer doc was framed as optional/low-priority
+  ("either is defensible for Day 3 scope") but was implemented anyway since
+  it was a small, clean addition alongside finding 2's error path.
+- No other open items beyond what Round 1's own coder.md already listed
+  (Day 4 DB-write wiring, `ArticleChunk.regulation` key convention).

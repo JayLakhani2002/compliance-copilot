@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,17 +31,24 @@ from selectolax.parser import HTMLParser
 CELLAR_URL = "https://publications.europa.eu/resource/celex/{celex}"
 
 # User-Agent identifies this as a polite, reproducible crawler (per-project
-# convention, not a legal requirement of Cellar) — a real contact URL so an
-# EU Publications Office admin could see who's hitting the endpoint and why.
+# convention, not a legal requirement of Cellar) — a repo URL so anyone
+# looking at Cellar's access logs can see who's hitting the endpoint and
+# why (a contact email would be more conventional still; the repo URL gets
+# them to the maintainer just as well and is what's actually set below).
 REQUEST_HEADERS = {
     "Accept": "application/xhtml+xml",
     "Accept-Language": "eng",
     "User-Agent": "compliance-copilot/0.1 (+https://github.com/JayLakhani2002/compliance-copilot)",
 }
 
+# Anything smaller than this on disk is a truncated/corrupt cache file, not a
+# real regulation document (the smallest of the two is GDPR at ~0.8 MB) —
+# fetch_xhtml treats it as a cache miss and re-fetches rather than trusting it.
+_MIN_CACHE_BYTES = 1024
+
 # The two regulations this portfolio project answers questions about
-# (docs/CURRICULUM.md Day 3). expected_articles is a sanity check, not a
-# magic number: EUR-Lex's own consolidated-text article count for each
+# (docs/CURRICULUM.md Day 3). expected_articles/expected_recitals are sanity
+# checks, not magic numbers: EUR-Lex's own consolidated-text counts for each
 # regulation, verified via ADR-0012 — if a parse doesn't match, either the
 # fetch got the wrong/partial document or the HTML structure changed under
 # us and the parser needs fixing, not silent bad data.
@@ -49,11 +57,13 @@ REGULATIONS = {
         "celex": "32024R1689",
         "title": "Regulation (EU) 2024/1689 (AI Act)",
         "expected_articles": 113,
+        "expected_recitals": 180,
     },
     "gdpr": {
         "celex": "32016R0679",
         "title": "Regulation (EU) 2016/679 (GDPR)",
         "expected_articles": 99,
+        "expected_recitals": 173,
     },
 }
 
@@ -63,6 +73,14 @@ REGULATIONS = {
 # nested *inside* the article's div).
 _ARTICLE_ID_RE = re.compile(r"art_(\d+)")
 _RECITAL_ID_RE = re.compile(r"rct_(\d+)")
+
+
+class EurLexFetchError(RuntimeError):
+    """Raised when fetching a regulation's XHTML from Cellar fails, for any
+    reason — a non-200 response or a network-level failure (DNS/connect/
+    timeout) alike. One exception type so a caller (the CLI, ingest_regulation)
+    can catch "the fetch failed" without needing to know httpx's exception
+    hierarchy or guess whether a given failure mode raises or returns."""
 
 
 @dataclass
@@ -99,19 +117,38 @@ def fetch_xhtml(celex: str, cache_dir: Path = Path("data/raw")) -> str:
     """
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_path = cache_dir / f"{celex}.xhtml"
-    if cache_path.exists():
+    # size check, not just .exists(): a file smaller than _MIN_CACHE_BYTES is
+    # what a killed-mid-write process would leave *if* the write weren't
+    # already atomic below — belt-and-braces against any cache file that
+    # predates this fix, or was dropped there by hand.
+    if cache_path.exists() and cache_path.stat().st_size >= _MIN_CACHE_BYTES:
         return cache_path.read_text(encoding="utf-8")
 
     url = CELLAR_URL.format(celex=celex)
-    with httpx.Client(headers=REQUEST_HEADERS, timeout=60, follow_redirects=True) as client:
-        response = client.get(url)
+    try:
+        with httpx.Client(headers=REQUEST_HEADERS, timeout=60, follow_redirects=True) as client:
+            response = client.get(url)
+    except httpx.RequestError as exc:
+        # RequestError is httpx's base for network-level failures (connect,
+        # DNS, timeout — see the exception hierarchy in httpx/_exceptions.py)
+        # as opposed to HTTPStatusError (a response that came back, just with
+        # a bad status — handled below). Normalise both into the same
+        # EurLexFetchError so callers don't need to know httpx's hierarchy.
+        raise EurLexFetchError(f"EUR-Lex/Cellar fetch failed for CELEX {celex}: {exc!r}") from exc
 
     if response.status_code != 200:
-        raise RuntimeError(
+        raise EurLexFetchError(
             f"EUR-Lex/Cellar fetch failed for CELEX {celex}: HTTP {response.status_code} from {url}"
         )
 
-    cache_path.write_text(response.text, encoding="utf-8")
+    # Atomic write: write to a temp file in the same directory, then
+    # os.replace() into place. os.replace() is atomic on POSIX and Windows,
+    # so a process killed mid-write (OOM, disk full, SIGKILL) never leaves a
+    # half-written file at cache_path for a later call to mistake for a
+    # valid cache hit — either the old cache (if any) or nothing is there.
+    tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+    tmp_path.write_text(response.text, encoding="utf-8")
+    os.replace(tmp_path, cache_path)
     return response.text
 
 
@@ -180,14 +217,18 @@ def parse_articles(xhtml: str, regulation_key: str) -> list[ArticleChunk]:
 
 
 def ingest_regulation(key: str) -> list[ArticleChunk]:
-    """Fetch + parse one regulation, then sanity-check the article count
-    against REGULATIONS[key]["expected_articles"].
+    """Fetch + parse one regulation, then sanity-check both the article and
+    recital counts against REGULATIONS[key]'s expected_articles/expected_recitals.
 
     Why assert here and not just trust the parser: this is the "count
     sanity" check docs/lessons/03 calls out by name — if EUR-Lex changes its
     HTML structure, a naive parser would silently return 0 (or a partial)
-    article list instead of failing loudly. A count mismatch is the cheapest
-    possible signal that something upstream broke.
+    list instead of failing loudly. A count mismatch is the cheapest
+    possible signal that something upstream broke. Recitals get the same
+    check as articles (not just articles) — a different id scheme change
+    could break `rct_N` parsing while leaving `art_N` intact, and this is
+    the only check the production ingest/CLI path (not just the integration
+    test) actually runs.
     """
     if key not in REGULATIONS:
         raise ValueError(f"Unknown regulation key {key!r} — choices: {list(REGULATIONS)}")
@@ -196,12 +237,19 @@ def ingest_regulation(key: str) -> list[ArticleChunk]:
     xhtml = fetch_xhtml(meta["celex"])
     chunks = parse_articles(xhtml, key)
     articles = [c for c in chunks if c.kind == "article"]
+    recitals = [c for c in chunks if c.kind == "recital"]
 
     if len(articles) != meta["expected_articles"]:
         raise ValueError(
             f"{key}: expected {meta['expected_articles']} articles, parsed {len(articles)}. "
-            "EUR-Lex's HTML structure may have changed — re-inspect the raw XHTML "
-            "(data/raw/{celex}.xhtml) before trusting this parse.".format(celex=meta["celex"])
+            f"EUR-Lex's HTML structure may have changed — re-inspect the raw XHTML "
+            f"(data/raw/{meta['celex']}.xhtml) before trusting this parse."
+        )
+    if len(recitals) != meta["expected_recitals"]:
+        raise ValueError(
+            f"{key}: expected {meta['expected_recitals']} recitals, parsed {len(recitals)}. "
+            f"EUR-Lex's HTML structure may have changed — re-inspect the raw XHTML "
+            f"(data/raw/{meta['celex']}.xhtml) before trusting this parse."
         )
 
     return chunks

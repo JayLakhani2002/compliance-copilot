@@ -7,7 +7,7 @@
 # --dry-run`.
 import argparse
 
-from compliance_copilot.db import engine, init_db
+from compliance_copilot.db import get_engine, init_db
 from compliance_copilot.ingest.eurlex import REGULATIONS, ingest_regulation
 
 
@@ -41,7 +41,7 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.command == "init-db":
-        init_db(engine)
+        init_db(get_engine())
         print("Database initialised.")
     elif args.command == "ingest":
         keys = list(REGULATIONS) if args.regulation == "all" else [args.regulation]
