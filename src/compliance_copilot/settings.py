@@ -23,5 +23,17 @@ class Settings(BaseSettings):
     # SQLAlchemy still supports under a different URL scheme).
     database_url: str = "postgresql+psycopg://user:password@localhost:5432/compliance_copilot"
 
+    # ADR-0004: default embedding model + its output dimension. The two must
+    # stay in sync (embeddings.py asserts this) — pgvector's Vector column
+    # (db.py) is a *fixed* dimension, so a mismatched model fails loudly at
+    # insert time instead of silently corrupting the nearest-neighbour index.
+    embedding_model: str = "text-embedding-3-small"
+    embedding_dim: int = 1536
+
+    # OPENAI_API_KEY isn't read here directly — langchain-openai's
+    # OpenAIEmbeddings reads it from the environment itself (see
+    # embeddings.py). Declaring it as a field would just duplicate that and
+    # risk it ending up in a log/repr of `settings`.
+
 
 settings = Settings()
