@@ -16,12 +16,16 @@
 # DATABASE_URL with its database name suffixed "_test" (local dev default —
 # `compliance_copilot` -> `compliance_copilot_test`).
 import os
+from pathlib import Path
 
 import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import make_url
 
 from compliance_copilot.db import init_db
+from compliance_copilot.ingest import eurlex, pipeline
+
+FIXTURE_XHTML = Path(__file__).parent / "fixtures" / "eurlex_sample.xhtml"
 
 
 def _resolve_test_database_url() -> str | None:
@@ -83,3 +87,21 @@ def test_engine(test_database_url):
     engine = create_engine(test_database_url)
     init_db(engine, reset=True)
     return engine
+
+
+@pytest.fixture
+def fixture_regulations(monkeypatch):
+    """Patches `ingest` to use the small, real, no-network fixture XHTML
+    (tests/fixtures/eurlex_sample.xhtml — 3 articles, 2 recitals of the
+    real AI Act) instead of hitting Cellar, and patches the expected
+    article/recital counts so `ingest_regulation`'s sanity check (eurlex.py)
+    doesn't fire against those smaller numbers. Shared across every
+    integration test that needs a small ingested corpus in the test DB
+    without spending OpenAI money or a network call — originally
+    test_ingest_pipeline_integration.py's, moved here (ADR-0013) so
+    tests/evals/test_retrieval_plumbing.py can reuse it via normal pytest
+    fixture discovery instead of a cross-test-file import."""
+    xhtml = FIXTURE_XHTML.read_text(encoding="utf-8")
+    monkeypatch.setattr(pipeline, "fetch_xhtml", lambda celex, cache_dir=None: xhtml)
+    monkeypatch.setitem(eurlex.REGULATIONS["ai_act"], "expected_articles", 3)
+    monkeypatch.setitem(eurlex.REGULATIONS["ai_act"], "expected_recitals", 2)
