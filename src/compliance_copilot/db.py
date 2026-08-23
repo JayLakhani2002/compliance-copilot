@@ -1,0 +1,112 @@
+# src/compliance_copilot/db.py — the "postgres" container's schema and
+# connection layer (docs/ARCHITECTURE.md §3). Defines the two tables the
+# ingestion job (§1) writes into and the MCP `search_regulation`/`get_article`
+# tools (§1, ADR-0007) read from: Document (one row per regulation source
+# file) and Chunk (one row per article/recital, holding its embedding for
+# similarity search). ADR-0003 explains why this lives in Postgres/pgvector
+# rather than a dedicated vector DB.
+#
+# ponytail: no Alembic migrations yet — `init_db()` just does
+# `Base.metadata.create_all`, which is fine for a schema that hasn't shipped
+# to anyone yet. Add Alembic the *second* time this schema changes (the
+# create_all point where a fresh DB is no longer everyone's DB).
+from collections.abc import Generator
+from datetime import datetime
+
+from pgvector.sqlalchemy import Vector
+from sqlalchemy import DateTime, ForeignKey, Index, String, Text, create_engine, text
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.orm import (
+    DeclarativeBase,
+    Mapped,
+    Session,
+    mapped_column,
+    relationship,
+    sessionmaker,
+)
+
+from compliance_copilot.settings import settings
+
+
+class Base(DeclarativeBase):
+    """Shared declarative base — every ORM model inherits from this so
+    `Base.metadata` knows about all tables at once (needed by create_all)."""
+
+
+class Document(Base):
+    """One row per ingested source file (e.g. the AI Act, GDPR)."""
+
+    __tablename__ = "document"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    regulation: Mapped[str] = mapped_column(String(50))  # e.g. "AI_ACT", "GDPR"
+    title: Mapped[str] = mapped_column(Text)
+    source_url: Mapped[str] = mapped_column(Text)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+    chunks: Mapped[list["Chunk"]] = relationship(back_populates="document")
+
+
+class Chunk(Base):
+    """One row per article/recital-sized piece of text plus its embedding —
+    the unit the vector search actually ranks (docs/ARCHITECTURE.md §1)."""
+
+    __tablename__ = "chunk"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    document_id: Mapped[int] = mapped_column(ForeignKey("document.id"))
+    article: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    recital: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    title: Mapped[str | None] = mapped_column(Text, nullable=True)
+    text: Mapped[str] = mapped_column(Text)
+    # 1536 = text-embedding-3-small's output dimension (ADR-0004). Fixed (not
+    # variable) dimension so a mismatched embedding model fails loudly at
+    # insert time instead of silently corrupting the nearest-neighbour index.
+    embedding: Mapped[list[float]] = mapped_column(Vector(1536))
+    # JSONB (binary JSON, Postgres-specific, indexable/queryable) for
+    # loosely-structured metadata that doesn't need its own column yet.
+    chunk_metadata: Mapped[dict] = mapped_column(JSONB, default=dict)
+
+    document: Mapped["Document"] = relationship(back_populates="chunks")
+
+
+# HNSW (Hierarchical Navigable Small World) = an approximate-nearest-neighbour
+# graph index — sub-linear query time instead of scanning every row's vector.
+# vector_cosine_ops = the operator class pgvector needs to build the index
+# for cosine distance specifically, matching OpenAI embeddings, which are
+# normalised so cosine similarity is the intended metric (docs/lessons/02).
+# m/ef_construction are pgvector's documented HNSW build parameters (higher =
+# better recall, slower build/more memory); 16/64 are pgvector's own defaults.
+chunk_embedding_hnsw_idx = Index(
+    "chunk_embedding_hnsw_idx",
+    Chunk.embedding,
+    postgresql_using="hnsw",
+    postgresql_with={"m": 16, "ef_construction": 64},
+    postgresql_ops={"embedding": "vector_cosine_ops"},
+)
+
+# Module-level engine/session factory — built once from `settings`, imported
+# wherever a DB connection is needed (CLI, future API routes, MCP tools).
+engine = create_engine(settings.database_url)
+SessionLocal = sessionmaker(bind=engine)
+
+
+def get_session() -> Generator[Session, None, None]:
+    """Yields a Session, closing it afterwards — a context-manager-style
+    dependency other code (FastAPI routes, later) can plug into."""
+    with SessionLocal() as session:
+        yield session
+
+
+def init_db(engine) -> None:  # takes engine explicitly so tests can pass a throwaway one
+    """Creates the `vector` extension, then all tables/indexes. Idempotent —
+    safe to call against a DB that already has the schema (CREATE EXTENSION
+    IF NOT EXISTS / create_all both no-op on existing objects)."""
+    with engine.begin() as conn:
+        # Must run before create_all: the Vector column type doesn't exist
+        # in Postgres until this extension is installed.
+        conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+    # chunk_embedding_hnsw_idx was constructed against Chunk.embedding above,
+    # which auto-registers it on chunk's Table — create_all emits its
+    # CREATE INDEX statement along with every table's CREATE TABLE.
+    Base.metadata.create_all(engine)

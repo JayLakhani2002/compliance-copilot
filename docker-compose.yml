@@ -1,0 +1,40 @@
+# docker-compose.yml — local dev environment. Runs the one stateful service
+# this feature needs (Postgres + pgvector, ADR-0003) so `db.py`/`init-db` and
+# the integration tests have something to talk to. Jay doesn't have Docker on
+# this machine yet (see docs/INBOX.md); once installed, `make db-up` starts
+# this. CI does NOT use this file — it uses a GitHub Actions `services:`
+# postgres container defined directly in .github/workflows/ci.yml.
+services:
+  postgres:
+    # pgvector/pgvector:pg16 = official Postgres 16 image with the pgvector
+    # extension pre-installed (tag confirmed on Docker Hub, 2026-08-23).
+    # Plain `postgres:16` would need the extension built from source.
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    # Hardcoded to match .env.example's DATABASE_URL exactly (user/password/
+    # compliance_copilot) — the postgres image's entrypoint needs separate
+    # POSTGRES_* vars (not a DSN string), so this is the one place that
+    # string gets decomposed. Local dev only, not a real secret.
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: compliance_copilot
+    ports:
+      # host:container — 5432 on localhost so DATABASE_URL in .env.example
+      # (postgresql+psycopg://...@localhost:5432/...) works unchanged.
+      - "5432:5432"
+    volumes:
+      # Named volume so data survives `docker compose down` (but not `-v`) —
+      # re-ingesting the corpus every restart would be wasteful for dev.
+      - pgvector_data:/var/lib/postgresql/data
+    healthcheck:
+      # pg_isready = Postgres's own readiness probe. Other services (none yet,
+      # but the future api/mcp-server containers) can depend_on this with
+      # condition: service_healthy instead of guessing a fixed startup delay.
+      test: ["CMD-SHELL", "pg_isready -U user"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pgvector_data:

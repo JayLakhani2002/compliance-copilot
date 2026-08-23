@@ -2,6 +2,14 @@
 # develop: installs deps with uv, lints, checks formatting, and runs the
 # non-integration test suite. Must be green before a PR merges (R2 in CLAUDE.md).
 # setup-uv docs: https://github.com/astral-sh/setup-uv
+#
+# `integration` job runs the DB tests that need a real Postgres+pgvector
+# (tests/test_db_integration.py) against a GitHub Actions `services:`
+# container — this is why those tests can be skipped everywhere Docker
+# isn't installed locally (docs/INBOX.md) and still get run somewhere before
+# merge. services: postgres + health-check options syntax verified against
+# GitHub's own docs, 2026-08-23:
+# https://docs.github.com/en/actions/using-containerized-services/creating-postgresql-service-containers
 
 name: CI
 
@@ -34,3 +42,43 @@ jobs:
 
       - name: Test (excluding integration tests that hit real services)
         run: uv run pytest -m "not integration"
+
+  integration:
+    runs-on: ubuntu-latest
+    # pgvector/pgvector:pg16 — Postgres 16 with the pgvector extension
+    # pre-installed (tag confirmed on Docker Hub, 2026-08-23), matching
+    # docker-compose.yml's local image so CI and dev use the same DB.
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        # pg_isready = Postgres's own readiness probe; GitHub Actions polls
+        # this before starting the job's steps, so `uv run pytest` never
+        # races Postgres's own startup.
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      # +psycopg driver, matching settings.py's default DSN scheme.
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/postgres
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Integration test (real Postgres + pgvector)
+        run: uv run pytest -m integration

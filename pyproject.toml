@@ -8,7 +8,12 @@ version = "0.1.0"
 description = "Agentic RAG over EU AI Act + GDPR with eval-gated CI"
 requires-python = ">=3.12"
 # No runtime dependencies yet — added feature-by-feature per docs/CURRICULUM.md.
-dependencies = []
+dependencies = [
+    "pgvector>=0.5.0",
+    "psycopg[binary]>=3.3.4",
+    "pydantic-settings>=2.15.0",
+    "sqlalchemy>=2.0.52",
+]
 
 # Dev-only tools (test runner, linter/formatter, git hook manager).
 # uv's special-cased "dev" group installs automatically on `uv sync` / `uv run`.
