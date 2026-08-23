@@ -10,11 +10,23 @@
 # `Base.metadata.create_all`, which is fine for a schema that hasn't shipped
 # to anyone yet. Add Alembic the *second* time this schema changes (the
 # create_all point where a fresh DB is no longer everyone's DB).
+#
+# Why the engine is built lazily (get_engine(), not a module-level `engine`):
+# a module-level `create_engine(settings.database_url)` runs at *import*
+# time — so anything that imports this module (a test file that only needs
+# the ORM models, a linter, `python -c "import compliance_copilot.db"`) was
+# forced to have a parseable DATABASE_URL, even when it never opens a
+# connection. That bit a real run: `DATABASE_URL= pytest -k eurlex` failed at
+# *collection* of unrelated test files with a SQLAlchemy URL-parse error,
+# before pytest's `-k` filter ever got a chance to skip them. Deferring
+# engine creation to first use (functools.lru_cache, so it's still built
+# once and reused) makes import side-effect-free again.
 from collections.abc import Generator
 from datetime import datetime
+from functools import lru_cache
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import DateTime, ForeignKey, Index, String, Text, create_engine, text
+from sqlalchemy import DateTime, Engine, ForeignKey, Index, String, Text, create_engine, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import (
     DeclarativeBase,
@@ -22,7 +34,6 @@ from sqlalchemy.orm import (
     Session,
     mapped_column,
     relationship,
-    sessionmaker,
 )
 
 from compliance_copilot.settings import settings
@@ -85,16 +96,23 @@ chunk_embedding_hnsw_idx = Index(
     postgresql_ops={"embedding": "vector_cosine_ops"},
 )
 
-# Module-level engine/session factory — built once from `settings`, imported
-# wherever a DB connection is needed (CLI, future API routes, MCP tools).
-engine = create_engine(settings.database_url)
-SessionLocal = sessionmaker(bind=engine)
+
+# lru_cache(maxsize=1) as a "compute once, on first call" memoiser — not a
+# real cache keyed by input (get_engine takes no args), just a lazy
+# module-level singleton so `settings.database_url` is only read, and the
+# engine only built, the first time a connection is actually needed.
+@lru_cache(maxsize=1)
+def get_engine() -> Engine:
+    """The app's one SQLAlchemy engine, built from `settings` on first use
+    (see the "why lazy" comment at the top of this file)."""
+    return create_engine(settings.database_url)
 
 
 def get_session() -> Generator[Session, None, None]:
-    """Yields a Session, closing it afterwards — a context-manager-style
-    dependency other code (FastAPI routes, later) can plug into."""
-    with SessionLocal() as session:
+    """Yields a Session bound to get_engine(), closing it afterwards — a
+    context-manager-style dependency other code (FastAPI routes, later) can
+    plug into."""
+    with Session(get_engine()) as session:
         yield session
 
 
