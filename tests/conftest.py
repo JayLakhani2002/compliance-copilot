@@ -98,7 +98,7 @@ def fixture_regulations(monkeypatch):
     doesn't fire against those smaller numbers. Shared across every
     integration test that needs a small ingested corpus in the test DB
     without spending OpenAI money or a network call — originally
-    test_ingest_pipeline_integration.py's, moved here (ADR-0005) so
+    test_ingest_pipeline_integration.py's, moved here (ADR-0013) so
     tests/evals/test_retrieval_plumbing.py can reuse it via normal pytest
     fixture discovery instead of a cross-test-file import."""
     xhtml = FIXTURE_XHTML.read_text(encoding="utf-8")

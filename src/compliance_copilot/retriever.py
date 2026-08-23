@@ -6,7 +6,7 @@
 # pgvector-python's SQLAlchemy `Column.cosine_distance` API.
 #
 # Why a plain function, not a LangChain BaseRetriever subclass yet: the unit
-# Day 5's eval (evals/run_retrieval_eval.py, ADR-0005) needs is "call this
+# Day 5's eval (evals/run_retrieval_eval.py, ADR-0013) needs is "call this
 # directly with two different `kinds` filters and measure hit@k/MRR on
 # each" — wrapping it in LangChain's retriever interface now would add
 # indirection with no benefit until the LangGraph agent actually needs it to
@@ -52,9 +52,9 @@ def retrieve(
     """Embeds `question` and returns the k nearest chunks by cosine distance.
 
     `kinds`: restrict to these Chunk.kind values. Default ("article",) is
-    lesson 05's variant B (articles only — recitals fetched separately later
-    as supporting context, ADR-0005); pass ("article", "recital") for
-    variant A (plain cosine over all chunks).
+    ADR-0013's decision (articles only — recitals fetched separately later
+    as supporting context) after measuring both against the golden set;
+    pass ("article", "recital") for the losing plain-cosine variant.
 
     `regulation`: restrict to one REGULATIONS key ("ai_act"/"gdpr"), or
     leave as None to search both (needed for the golden set's cross-

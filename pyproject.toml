@@ -49,7 +49,7 @@ select = ["E", "F", "I", "B", "UP"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 # repo root on sys.path for test collection — tests/evals/test_retrieval_
-# plumbing.py imports `evals.run_retrieval_eval` (ADR-0005), a top-level
+# plumbing.py imports `evals.run_retrieval_eval` (ADR-0013), a top-level
 # dir alongside src/, not part of the installed compliance_copilot package.
 # Without this, pytest's default "prepend" mode only ever adds each test
 # file's own directory, never the repo root, so that import 404s.

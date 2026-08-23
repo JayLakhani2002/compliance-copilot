@@ -1,10 +1,18 @@
-# evals/run_retrieval_eval.py — Day 5 retrieval eval runner (ADR-0005,
+# evals/run_retrieval_eval.py — Day 5 retrieval eval runner (ADR-0013,
 # docs/GLOSSARY.md's "golden set"/hit@k/MRR terms, lesson 05's two-variant
 # experiment). Loads evals/golden_retrieval.jsonl, runs ONE of the two
 # retriever variants lesson 05 designed against it, and reports hit@5 + MRR
 # overall and per category, plus a per-question table for failure analysis
 # — printing WHAT broke, not just THAT it broke (lesson 05's "failure
 # analysis over the score" point).
+#
+# Golden schema note (reviewer round 1): `expected_anchors` entries are
+# "<regulation>:<anchor>" strings (e.g. "ai_act:art_6"), not bare anchors —
+# `anchor_id` collides across regulations (both AI Act and GDPR have an
+# art_14, with unrelated content), so scoring must match on the pair, not
+# the anchor alone. Every entry is qualified this way, including
+# single-regulation ones, so the scorer never branches on entry.regulation —
+# one format, one comparison, always unambiguous (see run_variant() below).
 #
 # Real embeddings only, via get_embeddings() (ADR-0004) — costs a few cents
 # per run against OPENAI_API_KEY, so run it locally, once or twice, not in
@@ -14,7 +22,7 @@
 #     uv run python -m evals.run_retrieval_eval --variant articles
 #
 # `EVAL_HIT5_MIN` (default "0"): exits nonzero if overall hit@5 falls below
-# this threshold — the "eval as CI gate" mechanism ADR-0005 calls for. 0 by
+# this threshold — the "eval as CI gate" mechanism ADR-0013 calls for. 0 by
 # default so a first/local run never fails before a real threshold is
 # chosen (lesson 05: "wired when the numbers stabilise").
 from __future__ import annotations
@@ -49,7 +57,7 @@ class GoldenEntry:
     id: str
     question: str
     regulation: str  # "ai_act" | "gdpr" | "any"
-    expected_anchors: list[str]
+    expected_anchors: list[str]  # "<regulation>:<anchor>", e.g. "ai_act:art_6"
     category: str
 
 
@@ -86,8 +94,17 @@ def run_variant(
             session=session,
             embeddings=embeddings,
         )
+        # Match on (regulation, anchor), not anchor alone — anchor_id is not
+        # globally unique (art_14 exists in both ai_act and gdpr with
+        # unrelated content), so an anchor-only match could score a hit
+        # against the wrong regulation's chunk for regulation="any"
+        # (cross-regulation) entries, where retrieve() searches both.
         rank = next(
-            (i for i, chunk in enumerate(hits, start=1) if chunk.anchor in entry.expected_anchors),
+            (
+                i
+                for i, chunk in enumerate(hits, start=1)
+                if f"{chunk.regulation}:{chunk.anchor}" in entry.expected_anchors
+            ),
             None,
         )
         results.append(QuestionResult(entry=entry, rank=rank))
@@ -104,12 +121,12 @@ def _mrr(results: list[QuestionResult]) -> float:
 
 def print_report(results: list[QuestionResult], variant: str) -> float:
     print(f"\n=== retrieval eval — variant={variant!r} (k={K}) ===\n")
-    print(f"{'id':<6} {'category':<11} {'expected':<20} {'result':<10} question")
+    print(f"{'id':<6} {'category':<11} {'expected':<26} {'result':<10} question")
     for r in results:
         expected = ",".join(r.entry.expected_anchors)
         outcome = f"rank {r.rank}" if r.rank else "MISS"
         question = r.entry.question[:70]
-        print(f"{r.entry.id:<6} {r.entry.category:<11} {expected:<20} {outcome:<10} {question}")
+        print(f"{r.entry.id:<6} {r.entry.category:<11} {expected:<26} {outcome:<10} {question}")
 
     print(f"\n--- summary (variant={variant!r}) ---")
     overall_hit5 = _hit_at_k(results)

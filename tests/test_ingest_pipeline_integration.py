@@ -13,7 +13,7 @@ import pytest
 # pytest's default "prepend" import mode puts tests/ itself on sys.path, so
 # sibling test modules import as top-level names, not `tests.<name>`.
 #
-# `fixture_regulations` is a conftest.py fixture (moved there, ADR-0005, so
+# `fixture_regulations` is a conftest.py fixture (moved there, ADR-0013, so
 # tests/evals/test_retrieval_plumbing.py can share it) — not imported here,
 # just used by name like any other pytest fixture.
 from fake_embeddings import FakeEmbeddings
