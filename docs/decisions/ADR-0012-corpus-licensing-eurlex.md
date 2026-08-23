@@ -29,3 +29,12 @@ The chunking-by-article/recital strategy and metadata schema are corpus-agnostic
 - Project brief statement of scope and reuse premise: task brief (this ADR set's originating instructions) — "EU reuse policy allows it"
 - **Open item, not yet independently verified**: the live EUR-Lex reuse/legal-notice page should be fetched and its exact URL/terms recorded here before ingestion code ships — flagged in `docs/handoffs/phase1-architecture/writer.md`
 - Regulation identifiers: EU AI Act = Regulation (EU) 2024/1689; GDPR = Regulation (EU) 2016/679 (as stated in the project brief)
+
+## Verification — 2026-08-23 (planner, R1)
+**Licence, read from https://eur-lex.europa.eu/content/legal-notice/legal-notice.html (via browser; the page blocks scripted HTTP with an empty HTTP 202):**
+- "The Commission's document reuse policy is based on Decision 2011/833/EU. Unless otherwise specified, you can re-use the legal documents published in EUR-Lex for commercial or non-commercial purposes."
+- Editorial content / summaries / consolidated texts: CC BY 4.0 — "you can re-use the content provided you acknowledge the source and indicate any changes you have made."
+- "EUR-Lex metadata is dedicated to the public domain … CC0 1.0."
+- Authenticity: "Only European Union documents published in the Official Journal of the European Union are deemed authentic." → the app must display a disclaimer that answers are not legal advice and cite the OJ.
+**Source-of-truth decision:** fetch from the Publications Office **Cellar** REST endpoint, not eur-lex.europa.eu HTML (WAF returns empty 202 to non-browser clients):
+`GET https://publications.europa.eu/resource/celex/32024R1689` with `Accept: application/xhtml+xml`, `Accept-Language: eng` → HTTP 200, 1.26 MB XHTML (AI Act); `…/celex/32016R0679` → 0.8 MB (GDPR). Verified 2026-08-23 with curl. Structure: `id="art_N"` for articles (AI Act 113, GDPR 99) and `id="rct_N"` for recitals (180 / 173); CSS classes `oj-*`, `eli-*`. Set a descriptive User-Agent with contact email (polite-crawler norm) and cache raw files on disk.
