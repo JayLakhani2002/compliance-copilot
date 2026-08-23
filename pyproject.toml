@@ -1,0 +1,44 @@
+# pyproject.toml — single source of truth for this project's packaging,
+# dependencies, and tool config. Managed by uv (https://docs.astral.sh/uv/).
+# `uv sync` reads this file and writes/updates uv.lock (pinned, reproducible deps).
+
+[project]
+name = "compliance-copilot"
+version = "0.1.0"
+description = "Agentic RAG over EU AI Act + GDPR with eval-gated CI"
+requires-python = ">=3.12"
+# No runtime dependencies yet — added feature-by-feature per docs/CURRICULUM.md.
+dependencies = []
+
+# Dev-only tools (test runner, linter/formatter, git hook manager).
+# uv's special-cased "dev" group installs automatically on `uv sync` / `uv run`.
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "ruff>=0.16",
+    "pre-commit>=4.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/compliance_copilot"]
+
+# Ruff: linter + formatter (replaces flake8/isort/black). Config docs:
+# https://docs.astral.sh/ruff/configuration/
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+# E = pycodestyle errors, F = pyflakes, I = import sorting (isort),
+# B = flake8-bugbear (common bug patterns), UP = pyupgrade (modern syntax).
+select = ["E", "F", "I", "B", "UP"]
+
+# Pytest config. Docs: https://docs.pytest.org/en/stable/reference/reference.html#ini-options-ref
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: hits a real network service (LLM API, DB) — excluded from CI's default run",
+]

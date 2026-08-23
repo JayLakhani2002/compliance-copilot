@@ -1,0 +1,35 @@
+# .gitignore — tells git which files/folders never to track.
+# chathistory/ is deliberately NOT listed here: CLAUDE.md requires it stay tracked
+# so a new session can resume from the last handoff.
+
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*.pyc
+
+# Test / lint caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# uv / venv
+.venv/
+venv/
+uv.lock.bak
+
+# Environment secrets — never commit real keys, only .env.example
+.env
+.env.*
+!.env.example
+
+# Local data + databases
+data/raw/
+*.db
+*.sqlite3
+
+# OS cruft
+.DS_Store
+
+# Editors
+.vscode/
+.idea/

@@ -1,0 +1,14 @@
+# .pre-commit-config.yaml — runs ruff (lint + format) automatically before
+# every commit, so style/lint issues never reach CI. Install with `make setup`
+# (or `pre-commit install`), then it runs on `git commit`.
+# Docs: https://pre-commit.com/  |  https://docs.astral.sh/ruff/integrations/#pre-commit
+
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.4
+    hooks:
+      # Lint + autofix (import sorting, unused vars, etc.).
+      - id: ruff-check
+        args: [--fix]
+      # Formatter (replaces black).
+      - id: ruff-format
