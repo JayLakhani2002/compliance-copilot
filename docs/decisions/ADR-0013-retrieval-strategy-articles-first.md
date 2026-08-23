@@ -27,3 +27,11 @@ One default parameter. The eval harness re-measures any change: `python -m evals
 
 ## References
 Golden set + runner in `evals/`; measured 2026-08-23 with text-embedding-3-small on the full 576-chunk corpus.
+
+## Amendment — 2026-08-23 (definition sub-chunking)
+The residual gap is closed. Definition articles (AI Act Art. 3, GDPR Art. 4) are now split at definition boundaries (regex `(?=\(\d{1,3}\)\s+‘)`, verified 68/68 + 26/26 matches, zero false positives corpus-wide, lossless re-join). Corpus 576 → 587 chunks. Re-measured on the same golden set:
+| variant | hit@5 | MRR |
+|---|---|---|
+| plain | 0.633 → 0.900 | 0.332 → 0.509 |
+| **articles-only (default)** | 0.867 → **1.000** | 0.696 → **0.881** |
+All 4 previously-missing definition questions now hit under the default retriever. Articles-first remains the decision; the golden set will grow with agent-era failures, so 1.000 is a snapshot, not a claim.
