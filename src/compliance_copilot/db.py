@@ -156,23 +156,39 @@ def get_session() -> Generator[Session, None, None]:
         yield session
 
 
-def init_db(engine, *, reset: bool = False) -> None:  # engine explicit — tests pass a throwaway one
+def init_db(engine, *, reset: bool = False, force: bool = False) -> None:  # engine: tests pass one
     """Creates the `vector` extension, then all tables/indexes. Idempotent —
     safe to call against a DB that already has the schema (CREATE EXTENSION
     IF NOT EXISTS / create_all both no-op on existing objects).
 
     `reset=True` DROPS every table this app owns first (document, chunk —
-    NOT the `vector` extension itself) and recreates them empty. Only safe
-    because the DB is dev-only and nothing has shipped against this schema
-    (ponytail: no Alembic yet — see the module docstring above; add it the
-    *next* time this schema changes, since a `reset` flag stops being
-    acceptable the moment a real user's data could be sitting in these
-    tables). Never call this against anything but a local/dev database.
+    NOT the `vector` extension itself) and recreates them empty (ponytail:
+    no Alembic yet — see the module docstring above; add it the *next* time
+    this schema changes, since a `reset` flag stops being acceptable the
+    moment a real user's data could be sitting in these tables).
+
+    GUARD: `reset=True` is refused unless the target database's name ends
+    in "_test" (so it can only ever hit a disposable test DB by default) or
+    the caller explicitly passes `force=True` (the CLI's `--reset` flag does
+    this, after printing the DB name — a deliberate, visible operator
+    action, not something a test suite or default code path can trigger by
+    accident). This exists because a `reset=True` call with no such guard
+    DROPped a real 576-chunk ingested corpus when an earlier version of the
+    integration test suite ran it against DATABASE_URL directly — a
+    shared-DB reset is exactly how you lose data.
     """
+    if reset and not force and not engine.url.database.endswith("_test"):
+        raise ValueError(
+            f"init_db(reset=True) refused: database {engine.url.database!r} doesn't end in "
+            "'_test' and force=True wasn't passed. This guard exists because reset=True DROPS "
+            "document/chunk — pass force=True only for a deliberate, printed-first operator "
+            "action (see cli.py's `init-db --reset`), never from a test fixture or default path."
+        )
     if reset:
-        # DESTRUCTIVE: drops document/chunk and everything in them. This is
-        # only reachable via the CLI's `init-db --reset` flag (opt-in, never
-        # the default) — see cli.py.
+        # DESTRUCTIVE: drops document/chunk and everything in them. Guarded
+        # above — reachable only via the CLI's `init-db --reset` flag (a
+        # deliberate operator action, force=True) or a "_test"-named DB
+        # (tests/conftest.py's disposable test database).
         Base.metadata.drop_all(engine)
     with engine.begin() as conn:
         # Must run before create_all: the Vector column type doesn't exist

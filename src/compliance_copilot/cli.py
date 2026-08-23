@@ -60,7 +60,19 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.command == "init-db":
-        init_db(get_engine(), reset=args.reset)
+        engine = get_engine()
+        if args.reset:
+            # Loud confirmation before the destructive call — db.py's
+            # init_db(reset=True) guard would refuse this against a
+            # non-"_test" DB without force=True, so this print is the
+            # operator's one chance to notice they're about to drop
+            # `document`/`chunk` on the DB named below.
+            print(
+                f"--reset: dropping+recreating document/chunk on database {engine.url.database!r}"
+            )
+            init_db(engine, reset=True, force=True)
+        else:
+            init_db(engine)
         print("Database initialised.")
     elif args.command == "ingest":
         keys = list(REGULATIONS) if args.regulation == "all" else [args.regulation]

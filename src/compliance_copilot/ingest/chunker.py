@@ -1,7 +1,8 @@
 # src/compliance_copilot/ingest/chunker.py — splits an oversize ArticleChunk
-# (eurlex.py) into embeddable-sized parts (ADR-0004's "long articles" note,
-# docs/lessons/04_embeddings_and_hnsw.md). Pure function, no DB/network, so
-# it's unit-testable against fixture-sized strings alone.
+# (eurlex.py) into embeddable-sized parts (ADR-0004's re-ingestion/
+# consistency notes on why chunk-level identity has to be stable). Pure
+# function, no DB/network, so it's unit-testable against fixture-sized
+# strings alone.
 #
 # Why 6000 chars, not a token count: OpenAI's text-embedding-3-small input
 # limit is 8191 *tokens*; counting tokens exactly means importing tiktoken
@@ -24,10 +25,22 @@
 # plus greedy packing is the whole job.
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass
 
 from compliance_copilot.ingest.eurlex import ArticleChunk
+
+
+def _hash(text: str) -> str:
+    # sha256 of THIS PART's own text, not the parent article's content_hash —
+    # the pipeline's skip-if-unchanged check (pipeline.py) is keyed per part,
+    # so two parts of the same oversize article must never share a hash: a
+    # shared hash would make the skip check blind to the chunker's own
+    # splitting logic changing (e.g. re-tuning max_chars) while the source
+    # article text stays the same.
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
 
 # Splits text right before a numbered-paragraph marker — either "12. " style
 # (used by most articles' numbered paragraphs) or "(1) " style (used by
@@ -90,9 +103,9 @@ def split_article(chunk: ArticleChunk, max_chars: int = 6000) -> list[ChunkPart]
     max_chars per part, so a part is never smaller than it needs to be just
     because a paragraph landed near the cap.
 
-    Recitals are never split (ADR-0004/lesson 04): a recital is short prose,
-    one idea, and repeated across a regulation like the AI Act's 180 of them
-    — splitting them would multiply row count for no retrieval benefit.
+    Recitals are never split (ADR-0004): a recital is short prose, one idea,
+    and repeated across a regulation like the AI Act's 180 of them —
+    splitting them would multiply row count for no retrieval benefit.
     """
     if chunk.kind == "recital" or len(chunk.text) <= max_chars:
         return [
@@ -104,7 +117,7 @@ def split_article(chunk: ArticleChunk, max_chars: int = 6000) -> list[ChunkPart]
                 title=chunk.title,
                 anchor_id=chunk.anchor_id,
                 text=chunk.text,
-                content_hash=chunk.content_hash,
+                content_hash=_hash(chunk.text),
                 part=0,
                 part_count=1,
             )
@@ -121,7 +134,7 @@ def split_article(chunk: ArticleChunk, max_chars: int = 6000) -> list[ChunkPart]
             title=chunk.title,
             anchor_id=chunk.anchor_id,
             text=text,
-            content_hash=chunk.content_hash,
+            content_hash=_hash(text),
             part=i,
             part_count=len(texts),
         )

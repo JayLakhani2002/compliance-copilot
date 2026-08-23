@@ -51,6 +51,13 @@ def test_oversize_article_splits_into_multiple_contiguous_parts():
     # over-cap paragraph is allowed to stand alone; packed multi-paragraph
     # parts must respect it)
     assert all(len(p.text) <= 1500 or paragraphs.count(p.text) for p in parts)
+    # each part's content_hash is of ITS OWN text, not the parent article's
+    # — every part here has different text, so every hash must differ too
+    # (a shared/parent hash would make the pipeline's skip-if-unchanged
+    # check blind to the chunker's own splitting changing).
+    hashes = [p.content_hash for p in parts]
+    assert len(set(hashes)) == len(parts)
+    assert all(h != "deadbeef" for h in hashes)  # not the parent ArticleChunk's own hash
 
 
 def test_recital_never_split_even_if_oversize():
@@ -63,10 +70,10 @@ def test_recital_never_split_even_if_oversize():
 
 
 def test_article_3_realistic_size_splits_into_about_three_parts():
-    # ~17k chars, matching the lesson's "Art. 3 at 17k chars -> ~3 parts"
-    # heuristic, with "(N) " definition-list numbering like the real
-    # Article 3 (see tests/fixtures/eurlex_sample.xhtml for the actual
-    # "(1) 'AI system' means..." style this mirrors).
+    # ~17k chars (Art. 3, AI Act, is ~17k chars in reality — ADR-0004),
+    # expecting ~3 parts at the 6000-char cap, with "(N) " definition-list
+    # numbering like the real Article 3 (see tests/fixtures/eurlex_sample.xhtml
+    # for the actual "(1) 'AI system' means..." style this mirrors).
     paragraphs = [f"({i}) " + ("term definition text " * 11).strip() for i in range(1, 68)]
     text = " ".join(paragraphs)
     assert len(text) > 15000
