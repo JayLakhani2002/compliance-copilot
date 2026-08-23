@@ -9,9 +9,11 @@ description = "Agentic RAG over EU AI Act + GDPR with eval-gated CI"
 requires-python = ">=3.12"
 # No runtime dependencies yet — added feature-by-feature per docs/CURRICULUM.md.
 dependencies = [
+    "httpx>=0.28.1",
     "pgvector>=0.5.0",
     "psycopg[binary]>=3.3.4",
     "pydantic-settings>=2.15.0",
+    "selectolax>=0.4.11",
     "sqlalchemy>=2.0.52",
 ]
 
