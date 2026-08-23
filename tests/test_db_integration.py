@@ -32,7 +32,8 @@ def test_init_db_insert_and_nearest_neighbour_query():
 
     with Session() as session:
         doc = Document(
-            regulation="AI_ACT",
+            regulation="ai_act",
+            celex="32024R1689",
             title="Test Regulation",
             source_url="https://example.com/ai-act",
             fetched_at=datetime.now(UTC),
@@ -45,12 +46,14 @@ def test_init_db_insert_and_nearest_neighbour_query():
         vector = [random.random() for _ in range(1536)]
         chunk = Chunk(
             document_id=doc.id,
-            article="Article 5",
-            recital=None,
+            kind="article",
+            number=5,
+            anchor_id="art_5",
             title="Prohibited practices",
             text="Some article text.",
+            content_hash="0" * 64,
             embedding=vector,
-            chunk_metadata={"source": "test"},
+            embedding_model="text-embedding-3-small",
         )
         session.add(chunk)
         session.commit()

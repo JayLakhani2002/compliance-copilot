@@ -26,8 +26,18 @@ from datetime import datetime
 from functools import lru_cache
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import DateTime, Engine, ForeignKey, Index, String, Text, create_engine, text
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy import (
+    DateTime,
+    Engine,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    create_engine,
+    text,
+)
 from sqlalchemy.orm import (
     DeclarativeBase,
     Mapped,
@@ -50,7 +60,8 @@ class Document(Base):
     __tablename__ = "document"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    regulation: Mapped[str] = mapped_column(String(50))  # e.g. "AI_ACT", "GDPR"
+    regulation: Mapped[str] = mapped_column(String(50))  # REGULATIONS key, e.g. "ai_act"
+    celex: Mapped[str] = mapped_column(String(20))  # e.g. "32024R1689" (eurlex.py's CELEX id)
     title: Mapped[str] = mapped_column(Text)
     source_url: Mapped[str] = mapped_column(Text)
     fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
@@ -59,24 +70,53 @@ class Document(Base):
 
 
 class Chunk(Base):
-    """One row per article/recital-sized piece of text plus its embedding —
-    the unit the vector search actually ranks (docs/ARCHITECTURE.md §1)."""
+    """One row per article/recital *part* (ingest/chunker.py — most articles
+    are one whole part; oversize ones like Art. 3 split into several) plus
+    its embedding — the unit the vector search actually ranks
+    (docs/ARCHITECTURE.md §1).
+
+    ponytail: this replaces the old `article`/`recital` string columns with
+    `kind`+`number`+`anchor_id`, which is the same identity ChunkPart already
+    carries — keeping both would just be two ways to say the same thing.
+    Safe to do as a plain column rename/reshape (not an Alembic migration)
+    because the DB is dev-only and nothing has shipped against this schema
+    yet (see init_db's `reset` flag below).
+    """
 
     __tablename__ = "chunk"
+    __table_args__ = (
+        # One row per (document, anchor, part) — this is what the ingest
+        # pipeline's upsert (ingest/pipeline.py) keys off of: re-running
+        # ingest on unchanged text must update the same row, not insert a
+        # duplicate.
+        UniqueConstraint("document_id", "anchor_id", "part", name="uq_chunk_document_anchor_part"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     document_id: Mapped[int] = mapped_column(ForeignKey("document.id"))
-    article: Mapped[str | None] = mapped_column(String(50), nullable=True)
-    recital: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    kind: Mapped[str] = mapped_column(String(10))  # "article" | "recital"
+    number: Mapped[int] = mapped_column(Integer)  # article/recital number, e.g. 3
+    anchor_id: Mapped[str] = mapped_column(String(20))  # e.g. "art_3", "rct_12"
     title: Mapped[str | None] = mapped_column(Text, nullable=True)
     text: Mapped[str] = mapped_column(Text)
+    # part/part_count: this chunk's position among its parent article's parts
+    # (ingest/chunker.py's split_article) — 0/1 for the common whole-article
+    # case, 0..N-1 of N for an oversize article split on paragraph boundaries.
+    part: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    part_count: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    # sha256(text) of *this part's* text — lets the ingest pipeline skip
+    # re-embedding a part whose text hasn't changed since the last ingest
+    # (lesson 04's idempotency point).
+    content_hash: Mapped[str] = mapped_column(String(64))
     # 1536 = text-embedding-3-small's output dimension (ADR-0004). Fixed (not
     # variable) dimension so a mismatched embedding model fails loudly at
     # insert time instead of silently corrupting the nearest-neighbour index.
     embedding: Mapped[list[float]] = mapped_column(Vector(1536))
-    # JSONB (binary JSON, Postgres-specific, indexable/queryable) for
-    # loosely-structured metadata that doesn't need its own column yet.
-    chunk_metadata: Mapped[dict] = mapped_column(JSONB, default=dict)
+    # Which model produced `embedding` — ADR-0004's consistency requirement
+    # (ingestion and query-time embedding must use the same model) means this
+    # is worth recording per-row, not just assuming from settings: it's the
+    # signal that would catch a future re-ingest-with-a-different-model bug.
+    embedding_model: Mapped[str] = mapped_column(String(100))
 
     document: Mapped["Document"] = relationship(back_populates="chunks")
 
@@ -116,10 +156,24 @@ def get_session() -> Generator[Session, None, None]:
         yield session
 
 
-def init_db(engine) -> None:  # takes engine explicitly so tests can pass a throwaway one
+def init_db(engine, *, reset: bool = False) -> None:  # engine explicit — tests pass a throwaway one
     """Creates the `vector` extension, then all tables/indexes. Idempotent —
     safe to call against a DB that already has the schema (CREATE EXTENSION
-    IF NOT EXISTS / create_all both no-op on existing objects)."""
+    IF NOT EXISTS / create_all both no-op on existing objects).
+
+    `reset=True` DROPS every table this app owns first (document, chunk —
+    NOT the `vector` extension itself) and recreates them empty. Only safe
+    because the DB is dev-only and nothing has shipped against this schema
+    (ponytail: no Alembic yet — see the module docstring above; add it the
+    *next* time this schema changes, since a `reset` flag stops being
+    acceptable the moment a real user's data could be sitting in these
+    tables). Never call this against anything but a local/dev database.
+    """
+    if reset:
+        # DESTRUCTIVE: drops document/chunk and everything in them. This is
+        # only reachable via the CLI's `init-db --reset` flag (opt-in, never
+        # the default) — see cli.py.
+        Base.metadata.drop_all(engine)
     with engine.begin() as conn:
         # Must run before create_all: the Vector column type doesn't exist
         # in Postgres until this extension is installed.

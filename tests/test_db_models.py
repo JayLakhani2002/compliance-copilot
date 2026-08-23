@@ -13,7 +13,7 @@ from compliance_copilot.db import Chunk, Document, chunk_embedding_hnsw_idx
 
 def test_document_columns():
     columns = {c.name for c in Document.__table__.columns}
-    assert columns == {"id", "regulation", "title", "source_url", "fetched_at"}
+    assert columns == {"id", "regulation", "celex", "title", "source_url", "fetched_at"}
 
 
 def test_chunk_columns():
@@ -21,18 +21,31 @@ def test_chunk_columns():
     assert columns == {
         "id",
         "document_id",
-        "article",
-        "recital",
+        "kind",
+        "number",
+        "anchor_id",
         "title",
         "text",
+        "part",
+        "part_count",
+        "content_hash",
         "embedding",
-        "chunk_metadata",
+        "embedding_model",
     }
 
 
 def test_chunk_document_id_is_foreign_key():
     fk_targets = {fk.target_fullname for fk in Chunk.__table__.foreign_keys}
     assert fk_targets == {"document.id"}
+
+
+def test_chunk_has_unique_document_anchor_part_constraint():
+    unique_cols = {
+        tuple(c.name for c in constraint.columns)
+        for constraint in Chunk.__table__.constraints
+        if constraint.__class__.__name__ == "UniqueConstraint"
+    }
+    assert ("document_id", "anchor_id", "part") in unique_cols
 
 
 def test_chunk_embedding_is_vector_1536():
