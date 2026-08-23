@@ -1,0 +1,30 @@
+{"id": "d01", "question": "What is the definition of an 'AI system' under the AI Act?", "regulation": "ai_act", "expected_anchors": ["art_3"], "category": "definition"}
+{"id": "d02", "question": "How does the AI Act define a 'provider' of an AI system?", "regulation": "ai_act", "expected_anchors": ["art_3"], "category": "definition"}
+{"id": "d03", "question": "How does the AI Act define a 'deployer' of an AI system?", "regulation": "ai_act", "expected_anchors": ["art_3"], "category": "definition"}
+{"id": "d04", "question": "What is the AI Act's definition of a 'general-purpose AI model'?", "regulation": "ai_act", "expected_anchors": ["art_3"], "category": "definition"}
+{"id": "d05", "question": "How does the AI Act define 'biometric data'?", "regulation": "ai_act", "expected_anchors": ["art_3"], "category": "definition"}
+{"id": "d06", "question": "What is the definition of 'personal data' under GDPR?", "regulation": "gdpr", "expected_anchors": ["art_4"], "category": "definition"}
+{"id": "d07", "question": "How does GDPR define 'processing' of personal data?", "regulation": "gdpr", "expected_anchors": ["art_4"], "category": "definition"}
+{"id": "d08", "question": "What is a 'controller' under GDPR?", "regulation": "gdpr", "expected_anchors": ["art_4"], "category": "definition"}
+{"id": "d09", "question": "How does GDPR define a 'personal data breach'?", "regulation": "gdpr", "expected_anchors": ["art_4"], "category": "definition"}
+{"id": "d10", "question": "How does GDPR define the 'consent' of a data subject?", "regulation": "gdpr", "expected_anchors": ["art_4"], "category": "definition"}
+{"id": "o01", "question": "What must providers of high-risk AI systems do to comply with the AI Act?", "regulation": "ai_act", "expected_anchors": ["art_16"], "category": "obligation"}
+{"id": "o02", "question": "What obligations do deployers of high-risk AI systems have under the AI Act?", "regulation": "ai_act", "expected_anchors": ["art_26"], "category": "obligation"}
+{"id": "o03", "question": "What must a provider's risk management system for a high-risk AI system include under the AI Act?", "regulation": "ai_act", "expected_anchors": ["art_9"], "category": "obligation"}
+{"id": "o04", "question": "What must providers of general-purpose AI models do to comply with the AI Act?", "regulation": "ai_act", "expected_anchors": ["art_53"], "category": "obligation"}
+{"id": "o05", "question": "What technical and organisational measures must a controller and processor implement to ensure security of processing under GDPR?", "regulation": "gdpr", "expected_anchors": ["art_32"], "category": "obligation"}
+{"id": "o06", "question": "What must a controller do when there is a personal data breach, and within what time limit must it notify the supervisory authority?", "regulation": "gdpr", "expected_anchors": ["art_33"], "category": "obligation"}
+{"id": "o07", "question": "When must a controller carry out a data protection impact assessment under GDPR?", "regulation": "gdpr", "expected_anchors": ["art_35"], "category": "obligation"}
+{"id": "o08", "question": "What is the controller's responsibility for demonstrating compliance with GDPR's principles?", "regulation": "gdpr", "expected_anchors": ["art_24"], "category": "obligation"}
+{"id": "s01", "question": "Does the AI Act apply to AI systems used exclusively for military, defence or national security purposes?", "regulation": "ai_act", "expected_anchors": ["art_2"], "category": "scope"}
+{"id": "s02", "question": "What AI practices does the AI Act prohibit?", "regulation": "ai_act", "expected_anchors": ["art_5"], "category": "scope"}
+{"id": "s03", "question": "When is an AI system classified as high-risk under the AI Act?", "regulation": "ai_act", "expected_anchors": ["art_6"], "category": "scope"}
+{"id": "s04", "question": "Does GDPR apply to the processing of personal data by a natural person in the course of a purely personal or household activity?", "regulation": "gdpr", "expected_anchors": ["art_2"], "category": "scope"}
+{"id": "s05", "question": "Does GDPR apply to a controller not established in the EU that offers goods or services to data subjects in the EU?", "regulation": "gdpr", "expected_anchors": ["art_3"], "category": "scope"}
+{"id": "s06", "question": "What is the purpose and subject matter of the AI Act?", "regulation": "ai_act", "expected_anchors": ["art_1"], "category": "scope"}
+{"id": "c01", "question": "What must a provider of a high-risk AI system under the AI Act do to ensure human oversight, and what right does GDPR give a data subject over automated decision-making that produces legal effects concerning them?", "regulation": "any", "expected_anchors": ["art_14", "art_22"], "category": "cross"}
+{"id": "c02", "question": "What obligations does the AI Act place on providers of general-purpose AI models with systemic risk, and how does this compare to GDPR's security-of-processing obligations for controllers and processors?", "regulation": "any", "expected_anchors": ["art_55", "art_32"], "category": "cross"}
+{"id": "c03", "question": "How does the AI Act's prohibition on certain AI practices treat biometric categorisation, and how does GDPR treat biometric data used to uniquely identify a person as a special category of personal data?", "regulation": "any", "expected_anchors": ["art_5", "art_9"], "category": "cross"}
+{"id": "g01", "question": "Wann wird ein KI-System nach dem AI Act als hochriskant eingestuft?", "regulation": "ai_act", "expected_anchors": ["art_6"], "category": "german"}
+{"id": "g02", "question": "Was muss ein Verantwortlicher bei einer Verletzung des Schutzes personenbezogener Daten tun und innerhalb welcher Frist muss er die Aufsichtsbehörde benachrichtigen?", "regulation": "gdpr", "expected_anchors": ["art_33"], "category": "german"}
+{"id": "g03", "question": "Wie definiert die DSGVO 'personenbezogene Daten'?", "regulation": "gdpr", "expected_anchors": ["art_4"], "category": "german"}

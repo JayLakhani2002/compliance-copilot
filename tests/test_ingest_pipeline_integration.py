@@ -12,26 +12,18 @@ import pytest
 # No tests/__init__.py in this project (see test_ingest_eurlex.py etc.) —
 # pytest's default "prepend" import mode puts tests/ itself on sys.path, so
 # sibling test modules import as top-level names, not `tests.<name>`.
+#
+# `fixture_regulations` is a conftest.py fixture (moved there, ADR-0005, so
+# tests/evals/test_retrieval_plumbing.py can share it) — not imported here,
+# just used by name like any other pytest fixture.
 from fake_embeddings import FakeEmbeddings
 from sqlalchemy import select
 from sqlalchemy.orm import Session
-from test_ingest_eurlex import FIXTURE
 
 from compliance_copilot.db import Chunk
-from compliance_copilot.ingest import eurlex, pipeline
+from compliance_copilot.ingest import pipeline
 
 pytestmark = pytest.mark.integration
-
-
-@pytest.fixture
-def fixture_regulations(monkeypatch):
-    """Fixture XHTML has 3 articles + 2 recitals (Art. 1-3, Rct. 1-2) — patch
-    the expected counts so ingest_regulation's sanity check doesn't fire, and
-    patch fetch_xhtml so no network call happens."""
-    xhtml = FIXTURE.read_text(encoding="utf-8")
-    monkeypatch.setattr(pipeline, "fetch_xhtml", lambda celex, cache_dir=None: xhtml)
-    monkeypatch.setitem(eurlex.REGULATIONS["ai_act"], "expected_articles", 3)
-    monkeypatch.setitem(eurlex.REGULATIONS["ai_act"], "expected_recitals", 2)
 
 
 def test_ingest_twice_second_run_embeds_zero(test_engine, fixture_regulations):
