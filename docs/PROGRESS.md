@@ -1,15 +1,15 @@
 # Progress
 
-## Status: Phase 1 — Architecture & Curriculum (ready to start). Project = Option 1 Compliance Copilot.
-Started 2026-08-23. Defaults in use: 3–4 h/day · 6 weeks · EU deploy.
+## Status: Phase 1 DONE (tag v0.0-phase1). Next: Phase 2, Week 1 Day 2.
+Project: Compliance Copilot (Option 1). Defaults: 3–4 h/day · 6 weeks · EU deploy. Repo: github.com/JayLakhani2002/compliance-copilot (private for now).
 
 ## Done
-- PROMPT.md, CLAUDE.md, GLOSSARY.md, folder layout.
-- 50 ads collected by 3 researcher agents; tally + top-3 options written to `docs/research/market_research.md`.
-- 3 researcher agents dispatched (Indeed+StepStone / LinkedIn+careers / aggregators) → `docs/research/raw/*.md`.
+- Phase 0: 50 ads → docs/research/market_research.md, Option 1 chosen.
+- Phase 1: docs/ARCHITECTURE.md, 12 ADRs (ADR-0009/0010 amended → Langfuse Cloud EU for v1.0), docs/CURRICULUM.md (30 days), repo scaffold (uv, ruff, pytest, CI, pre-commit, Python 3.12 pinned), teacher/builder two-screen workflow (TEACHER.md, docs/INBOX.md, docs/SETUP_SCREENS.md).
+- Day 1 of curriculum = read ARCHITECTURE + ADRs with the teacher (Jay does this in VS Code).
 
-## Next
-- Phase 1: ARCHITECTURE.md, ADRs, CURRICULUM.md, repo+CI.
+## Next (builder)
+- Week 1 Day 2: docker-compose (postgres+pgvector), db.py, migration, integration test. Branch `feature/db-pgvector`. Teacher lesson first (docs/lessons/02_postgres_pgvector.md).
 
 ## Open questions
-- Defaults (3–4 h/day, 6 weeks, EU deploy) not explicitly confirmed — proceeding with them.
+- none blocking. See docs/INBOX.md.
