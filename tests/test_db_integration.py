@@ -1,6 +1,6 @@
 # tests/test_db_integration.py — integration test against a real
 # Postgres+pgvector instance. Skipped locally (no DATABASE_URL set — Docker
-# isn't installed on this dev machine yet, docs/INBOX.md); runs in GitHub
+# may not be installed locally); runs in GitHub
 # CI's `integration` job (.github/workflows/ci.yml) against a
 # pgvector/pgvector:pg16 service container. Marked `integration` per
 # pyproject.toml's pytest marker, so `pytest -m "not integration"` (the

@@ -85,7 +85,7 @@ class Chunk(Base):
 # graph index — sub-linear query time instead of scanning every row's vector.
 # vector_cosine_ops = the operator class pgvector needs to build the index
 # for cosine distance specifically, matching OpenAI embeddings, which are
-# normalised so cosine similarity is the intended metric (docs/lessons/02).
+# normalised so cosine similarity is the intended metric (ADR-0003).
 # m/ef_construction are pgvector's documented HNSW build parameters (higher =
 # better recall, slower build/more memory); 16/64 are pgvector's own defaults.
 chunk_embedding_hnsw_idx = Index(

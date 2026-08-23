@@ -1,8 +1,8 @@
 # tests/test_ingest_eurlex_integration.py — real fetch against the live
 # Cellar endpoint for both regulations. Gated behind RUN_NETWORK_TESTS=1
-# (module-level skip below) and NOT wired into CI yet (docs/handoffs/
-# week1-day3-ingest/coder.md): CLAUDE.md's "pytest green before the next
-# feature starts" means CI's default run must stay deterministic and
+# (module-level skip below) and NOT wired into CI yet: the project rule
+# "pytest green before the next feature starts" means CI's default run
+# must stay deterministic and
 # offline — a flaky third-party endpoint failing CI on an unrelated PR is
 # exactly the kind of noise that makes people start ignoring red CI.
 import os

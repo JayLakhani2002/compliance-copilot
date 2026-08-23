@@ -14,7 +14,7 @@ lint:  ## Lint + check formatting with ruff.
 test:  ## Run the non-integration test suite.
 	uv run pytest -m "not integration"
 
-db-up:  ## Start local Postgres+pgvector (needs Docker — see docs/INBOX.md).
+db-up:  ## Start local Postgres+pgvector (needs Docker).
 	docker compose up -d postgres
 
 db-init:  ## Create the vector extension, tables, and HNSW index.

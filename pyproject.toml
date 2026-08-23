@@ -7,7 +7,7 @@ name = "compliance-copilot"
 version = "0.1.0"
 description = "Agentic RAG over EU AI Act + GDPR with eval-gated CI"
 requires-python = ">=3.12"
-# No runtime dependencies yet — added feature-by-feature per docs/CURRICULUM.md.
+# No runtime dependencies yet — added feature-by-feature (see docs/decisions/).
 dependencies = [
     "httpx>=0.28.1",
     "pgvector>=0.5.0",

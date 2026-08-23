@@ -1,10 +1,10 @@
 # tests/test_db_models.py — unit tests for the ORM schema in db.py. No real
 # DB connection (Docker isn't installed on this dev machine yet, see
-# docs/INBOX.md) — these only check that the models/DDL are shaped right by
+# CI runs the real DB) — these only check that the models/DDL are shaped right by
 # inspecting SQLAlchemy's in-memory metadata and compiling DDL to a string,
 # never executing it. Real-DB behavior is covered by test_db_integration.py
 # in CI (a pgvector service container), per the same "unit vs integration"
-# split CLAUDE.md/ADR-0011 already use for the rest of the test suite.
+# split ADR-0011 already uses for the rest of the test suite.
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.schema import CreateIndex
 

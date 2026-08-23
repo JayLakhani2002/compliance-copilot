@@ -1,6 +1,6 @@
 # src/compliance_copilot/ingest/eurlex.py — fetch + parse the EU AI Act and
 # GDPR from the Publications Office's Cellar API into article/recital-level
-# chunks (ADR-0012, docs/lessons/03_corpus_and_chunking.md). This module is
+# chunks (ADR-0012). This module is
 # pure: no DB writes, no embeddings (that's Day 4's `embeddings.py`) — it
 # only turns "a CELEX id" into "a list of ArticleChunk objects" so it can be
 # unit-tested with a fixture file and no network.
@@ -47,7 +47,7 @@ REQUEST_HEADERS = {
 _MIN_CACHE_BYTES = 1024
 
 # The two regulations this portfolio project answers questions about
-# (docs/CURRICULUM.md Day 3). expected_articles/expected_recitals are sanity
+# (ADR-0012). expected_articles/expected_recitals are sanity
 # checks, not magic numbers: EUR-Lex's own consolidated-text counts for each
 # regulation, verified via ADR-0012 — if a parse doesn't match, either the
 # fetch got the wrong/partial document or the HTML structure changed under
@@ -156,9 +156,8 @@ def parse_articles(xhtml: str, regulation_key: str) -> list[ArticleChunk]:
     """Parse a regulation's XHTML into one ArticleChunk per article and
     per recital.
 
-    Structure (inspected directly from the real AI Act XHTML — see
-    docs/handoffs/week1-day3-ingest/coder.md for the raw snippets this is
-    based on): each article/recital is a
+    Structure (inspected directly from the real AI Act XHTML, see ADR-0012
+    for the endpoint and counts): each article/recital is a
     `<div class="eli-subdivision" id="art_N">` / `id="rct_N"`. An article's
     div additionally contains a `<p class="oj-ti-art">Article N</p>` label
     and a `<div class="eli-title"><p class="oj-sti-art">Title</p></div>` —
@@ -221,7 +220,7 @@ def ingest_regulation(key: str) -> list[ArticleChunk]:
     recital counts against REGULATIONS[key]'s expected_articles/expected_recitals.
 
     Why assert here and not just trust the parser: this is the "count
-    sanity" check docs/lessons/03 calls out by name — if EUR-Lex changes its
+    sanity" check ADR-0012 calls out — if EUR-Lex changes its
     HTML structure, a naive parser would silently return 0 (or a partial)
     list instead of failing loudly. A count mismatch is the cheapest
     possible signal that something upstream broke. Recitals get the same

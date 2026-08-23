@@ -1,12 +1,12 @@
 # .github/workflows/ci.yml — CI gate. Runs on every push/PR to main or
 # develop: installs deps with uv, lints, checks formatting, and runs the
-# non-integration test suite. Must be green before a PR merges (R2 in CLAUDE.md).
+# non-integration test suite. Must be green before a PR merges (project rule).
 # setup-uv docs: https://github.com/astral-sh/setup-uv
 #
 # `integration` job runs the DB tests that need a real Postgres+pgvector
 # (tests/test_db_integration.py) against a GitHub Actions `services:`
 # container — this is why those tests can be skipped everywhere Docker
-# isn't installed locally (docs/INBOX.md) and still get run somewhere before
+# isn't installed locally and still get run somewhere before
 # merge. services: postgres + health-check options syntax verified against
 # GitHub's own docs, 2026-08-23:
 # https://docs.github.com/en/actions/using-containerized-services/creating-postgresql-service-containers

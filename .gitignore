@@ -33,3 +33,15 @@ data/raw/
 # Editors
 .vscode/
 .idea/
+
+# Local-only workflow/teaching files (kept on disk, never published)
+TEACHER.md
+PROMPT.md
+CLAUDE.md
+docs/CURRICULUM.md
+docs/lessons/
+docs/INBOX.md
+docs/SETUP_SCREENS.md
+docs/PROGRESS.md
+chathistory/
+docs/handoffs/
