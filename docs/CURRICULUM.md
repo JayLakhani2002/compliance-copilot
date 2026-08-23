@@ -7,7 +7,7 @@ Each day = **Learn** (teacher lesson, `docs/lessons/`) → **Build** (feature br
 |---|---|---|---|
 | 1 | Repo hygiene: uv, ruff, pytest, branches, CI as a gate. Why ADRs. | Scaffold (done in Phase 1). Read ARCHITECTURE + ADRs with teacher. | `make test` green in CI |
 | 2 | Docker Compose; Postgres + pgvector; why one DB (ADR-0003). SQLAlchemy basics. | `docker-compose.yml` (postgres/pgvector), `db.py` connection + migration for `documents`, `chunks(embedding vector)` | integration test connects, creates tables |
-| 3 | Corpus + chunking strategy for legal text (by article/recital, metadata). Why not fixed-size windows. | `ingest/eurlex.py`: fetch AI Act + GDPR, parse to article-level chunks with metadata | unit test: known article count, sample article text |
+| 3 | Corpus + chunking strategy for legal text (by article/recital, metadata). Why not fixed-size windows. | **First** fetch + record the EUR-Lex legal-notice/reuse URL in ADR-0012 (R1). Then `ingest/eurlex.py`: fetch AI Act + GDPR, parse to article-level chunks with metadata | unit test: known article count, sample article text |
 | 4 | Embeddings: what a vector is, cosine vs L2, HNSW index, multilingual models (ADR-0004). | `embeddings.py` + `ingest` CLI writes chunks+vectors; HNSW index | integration: top-1 for "What is a high-risk AI system?" is Art. 6 AI Act |
 | 5 | Evals, part 1: golden datasets, retrieval metrics (hit@k, MRR), why CI must block. | `evals/golden_retrieval.jsonl` (30 Q→article pairs), `tests/evals/test_retrieval.py` with threshold | hit@5 ≥ 0.8 in CI |
 **Post #1:** "Week 1: I turned the EU AI Act + GDPR into a vector index and made CI fail if retrieval quality drops. Here's why I chunk by article, not by tokens."
