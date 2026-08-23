@@ -71,8 +71,8 @@ _DEFINITION_PART_MAX_CHARS = 2000
 
 # Matches right before a definition entry: "(N) '<term>'" — verified against
 # the real ingested chunk text (SELECT text FROM chunk WHERE anchor_id =
-# 'art_3' / 'art_4', see docs/handoffs/week2-day6a-defchunks/coder.md for the
-# query + full evidence). Real examples pulled from that inspection:
+# 'art_3' / 'art_4'; measured impact recorded in ADR-0013's amendment).
+# Real examples pulled from that inspection:
 #   AI Act art_3: "(4) ‘deployer’ means a natural or legal person, ..."
 #   GDPR   art_4: "(7) ‘controller’ means the natural or legal person, ..."
 #   GDPR   art_4: "(11) ‘consent’ of the data subject means any freely ..."

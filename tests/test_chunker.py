@@ -80,8 +80,8 @@ def test_article_3_realistic_size_splits_into_about_ten_parts():
     # ~17k chars (Art. 3, AI Act, is ~17k chars in reality), with "(N) " +
     # curly-quote definition-list numbering like the real Article 3.
     #
-    # WHY THIS CHANGED (Day 6a — docs/handoffs/week2-day6a-defchunks/
-    # coder.md): before definition-aware splitting, ("ai_act", "art_3") was
+    # WHY THIS CHANGED (definition-aware splitting, ADR-0013 amendment):
+    # before it, ("ai_act", "art_3") was
     # just another oversize article, packed ~3 parts at the 6000-char cap
     # (this test's old name/expectation). Now that exact (regulation,
     # anchor_id) pair is one of chunker.py's two designated definitions
