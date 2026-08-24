@@ -19,10 +19,10 @@
 import os
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from compliance_copilot.db import Chunk
+from compliance_copilot.db import Chunk, get_engine
 from compliance_copilot.embeddings import get_embeddings
 from compliance_copilot.graph import AnswerSchema
 from compliance_copilot.graph.build import ask
@@ -33,6 +33,17 @@ from compliance_copilot.settings import settings
 pytestmark = pytest.mark.integration
 
 _PROVIDER_KEY_VAR = "OPENAI_API_KEY" if settings.llm_provider == "openai" else "ANTHROPIC_API_KEY"
+
+
+def _prod_chunk_count() -> int:
+    """Row count in whatever DATABASE_URL points at — used only to gate the
+    full-corpus test below, so an empty/unreachable DB (CI, a fresh clone,
+    no Postgres running) skips quietly at collection instead of erroring."""
+    try:
+        with Session(get_engine()) as session:
+            return session.scalar(select(func.count()).select_from(Chunk)) or 0
+    except Exception:
+        return 0
 
 
 @pytest.mark.skipif(
@@ -80,3 +91,35 @@ def test_ask_returns_validated_answer_against_real_llm_and_db(test_engine, fixtu
         assert result.citations[0].anchor == "art_3"
         for citation in result.citations:
             assert citation.anchor in known_anchors
+
+
+@pytest.mark.skipif(
+    not os.environ.get(_PROVIDER_KEY_VAR) or _prod_chunk_count() < 100,
+    reason=f"{_PROVIDER_KEY_VAR} not set, or DATABASE_URL's chunk table has "
+    "fewer than 100 rows (not the full ingested corpus) — skipping the "
+    "full-corpus retry test",
+)
+def test_high_risk_question_does_not_raise_after_retry_against_full_corpus(capsys):
+    """Reproduces a live finding against the real, already-ingested
+    576-chunk corpus: gpt-4.1-mini cited Recital 52 for this exact question
+    and got a hard CitationError under the pre-retry (ADR-0014-only) graph.
+    ADR-0015's retry-once loop must turn that into either a validated
+    citation or an honest zero-citation answer — never an uncaught
+    CitationError.
+
+    Uses the real prod DB via `Session(get_engine())`, NOT `test_engine` —
+    this DB is read-only here: no `init_db`/`reset` call, ever."""
+    embeddings = get_embeddings()
+    with Session(get_engine()) as session:
+        result = ask(
+            "What is a high-risk AI system?",
+            session=session,
+            embeddings=embeddings,
+            llm=make_llm(),
+        )
+
+    print(result.answer)
+    for citation in result.citations:
+        print(f"  [{citation.regulation} {citation.anchor}] {citation.quote!r}")
+    captured = capsys.readouterr()
+    assert result.answer.strip() in captured.out

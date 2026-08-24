@@ -13,7 +13,35 @@ from langgraph.graph import END, START, StateGraph
 from sqlalchemy.orm import Session
 
 from compliance_copilot.graph.nodes import answer_node, retrieve_node
-from compliance_copilot.graph.state import AnswerSchema, GraphContext, GraphState
+from compliance_copilot.graph.state import AnswerSchema, CitationError, GraphContext, GraphState
+
+# 2 = one retry (the initial attempt + one self-correction) — ADR-0015. One
+# place, read by `route_after_answer` only; `answer_node` doesn't need to
+# know the cap, it just increments `attempts` each time it runs.
+MAX_ATTEMPTS = 2
+
+
+def route_after_answer(state: GraphState) -> str:
+    """Conditional edge after `answer` — a plain state check, no `runtime`
+    param needed (routing only reads two `GraphState` keys; `path` callables
+    passed to `add_conditional_edges` support a `runtime` param the same way
+    nodes do, via LangGraph's `RunnableCallable` wrapping, but this routing
+    decision doesn't need one). Success -> END; a citation failure with a
+    retry left -> back to `answer` with the failed draft now in state; out
+    of retries -> `fail`."""
+    if state.get("answer") is not None:
+        return END
+    if state.get("attempts", 0) < MAX_ATTEMPTS:
+        return "answer"
+    return "fail"
+
+
+def fail_node(state: GraphState) -> dict:
+    """Reached only after MAX_ATTEMPTS failed citation checks. Re-raises so
+    `ask()`/`cli.py` see the same hard `CitationError` as before Day 7 —
+    the retry loop gives the model one extra chance, it doesn't soften the
+    "guard blocks, never swaps" rule ADR-0014 already established."""
+    raise CitationError(state["citation_error"])
 
 
 @lru_cache(maxsize=1)
@@ -28,9 +56,13 @@ def build_graph():
     builder = StateGraph(GraphState, context_schema=GraphContext)
     builder.add_node("retrieve", retrieve_node)
     builder.add_node("answer", answer_node)
+    builder.add_node("fail", fail_node)
     builder.add_edge(START, "retrieve")
     builder.add_edge("retrieve", "answer")
-    builder.add_edge("answer", END)
+    builder.add_conditional_edges(
+        "answer", route_after_answer, {"answer": "answer", "fail": "fail", END: END}
+    )
+    builder.add_edge("fail", END)
     return builder.compile()
 
 
