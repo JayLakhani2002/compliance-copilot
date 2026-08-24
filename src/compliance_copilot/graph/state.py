@@ -97,11 +97,21 @@ class GraphContext:
 
 
 class GraphState(TypedDict):
-    """Shared state threaded through `retrieve` -> `answer`. Keys nodes don't
-    fill in until they run are `NotRequired` so the initial `{"question": ...}`
-    dict passed to `.invoke()` is still valid input."""
+    """Shared state threaded through `retrieve` -> `answer` -> (`answer` |
+    `fail`). Keys nodes don't fill in until they run are `NotRequired` so the
+    initial `{"question": ...}` dict passed to `.invoke()` is still valid
+    input.
+
+    `draft`/`citation_error`/`attempts` back the Day 7 retry-once loop
+    (ADR-0015): a failed `answer_node` call stores its rejected `AnswerSchema`
+    and the validation error here instead of raising immediately, so
+    `route_after_answer` (build.py) can send the graph back to `answer` once
+    with that context appended as extra message turns."""
 
     question: str
     articles: NotRequired[list[RetrievedChunk]]
     recitals: NotRequired[list[RetrievedChunk]]
     answer: NotRequired[AnswerSchema | None]
+    draft: NotRequired[AnswerSchema | None]
+    citation_error: NotRequired[str | None]
+    attempts: NotRequired[int]
