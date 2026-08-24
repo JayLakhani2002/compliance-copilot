@@ -15,6 +15,7 @@ import sys
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from compliance_copilot import tracing
 from compliance_copilot.db import Chunk, get_engine, init_db
 from compliance_copilot.embeddings import get_embeddings
 from compliance_copilot.graph import CitationError
@@ -115,18 +116,34 @@ def main() -> None:
     elif args.command == "ask":
         embeddings = get_embeddings()
         llm = make_llm()
+        # ADR-0009 amendment: a no-op config (empty callbacks list) when no
+        # Langfuse keys are set — `tracing.run_config()` is a fresh function
+        # call per invocation, no different from calling `ask_graph` with no
+        # config= at all in that case.
+        config = tracing.run_config()
         with Session(get_engine()) as session:
             try:
-                result = ask_graph(args.question, session=session, embeddings=embeddings, llm=llm)
+                result = ask_graph(
+                    args.question, session=session, embeddings=embeddings, llm=llm, config=config
+                )
             except CitationError as exc:
                 # Never print a half-validated answer alongside a refusal —
                 # the answer text and citations are simply not printed at
                 # all here (ADR-0014's hard-error path).
                 print(f"REFUSED: {exc}", file=sys.stderr)
                 sys.exit(2)
+            finally:
+                # Flush (not shutdown): the CLI process exits right after
+                # this command anyway, but a blocking flush is what
+                # guarantees this one trace is actually sent before that
+                # happens (tracing.py) — a no-op when tracing is disabled.
+                tracing.flush()
             print(result.answer)
             for citation in result.citations:
                 print(f"  [{citation.regulation} {citation.anchor}] {citation.quote!r}")
+            trace_id = tracing.current_trace_id(config)
+            if trace_id is not None:
+                print(f"trace: {trace_id}", file=sys.stderr)
 
 
 if __name__ == "__main__":
