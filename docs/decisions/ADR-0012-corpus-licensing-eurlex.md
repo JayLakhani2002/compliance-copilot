@@ -13,7 +13,7 @@ The system needs an actual, correctly-licensed source text for the EU AI Act (Re
 ## Decision
 **EUR-Lex HTML/XML** as the sole source for both the AI Act and GDPR text. **Chunking strategy: by article/recital**, not by fixed token/character windows — each chunk carries **metadata** (`regulation` — "AI Act" or "GDPR"; `article` — the article or recital number; `title` — the article's heading, where the source provides one). This directly serves two other ADRs: ADR-0003's storage schema (metadata columns alongside the embedding) and ADR-0006's citation-must-exist guardrail check (a citation is only valid if it names a `regulation` + `article` pair that actually exists in the ingested metadata, not just a plausible-looking reference).
 
-**Note on what was and wasn't independently re-verified in this research pass:** this ADR's licensing/reuse-policy framing was **not** re-fetched from a live EUR-Lex reuse-policy page during this pass (the research focus was library/API verification, per the task scope) — it restates the reuse-policy premise already given in the project brief. Before ingestion code is written, the actual EUR-Lex reuse/legal-notice page should be fetched and read directly (not summarized from memory) and that URL added to this ADR's References, since "the EU's reuse policy allows it" is exactly the kind of claim this project's own standards (`CLAUDE.md`: "Verify every library API against Context7 MCP + official docs before writing it. Never guess.") would require checking before relying on it for something the project publishes.
+**Note on what was and wasn't independently re-verified in this research pass:** this ADR's licensing/reuse-policy framing was **not** re-fetched from a live EUR-Lex reuse-policy page during this pass (the research focus was library/API verification, per the task scope) — it restates the reuse-policy premise already given in the project brief. Before ingestion code is written, the actual EUR-Lex reuse/legal-notice page should be fetched and read directly (not summarized from memory) and that URL added to this ADR's References, since "the EU's reuse policy allows it" is exactly the kind of claim this project's own standards ("Verify every library API against Context7 MCP + official docs before writing it. Never guess.") would require checking before relying on it for something the project publishes.
 
 ## Why not the others
 - **Secondary/mirrored sources**: not seriously considered — using anything other than the canonical EUR-Lex text for a project whose entire value proposition is "accurately cites the actual regulation" would be self-undermining regardless of any licensing convenience a mirror might offer.
@@ -27,7 +27,7 @@ The chunking-by-article/recital strategy and metadata schema are corpus-agnostic
 
 ## References
 - Project brief statement of scope and reuse premise: task brief (this ADR set's originating instructions) — "EU reuse policy allows it"
-- **Open item, not yet independently verified**: the live EUR-Lex reuse/legal-notice page should be fetched and its exact URL/terms recorded here before ingestion code ships — flagged in `docs/handoffs/phase1-architecture/writer.md`
+- **Open item, not yet independently verified**: the live EUR-Lex reuse/legal-notice page should be fetched and its exact URL/terms recorded here before ingestion code ships
 - Regulation identifiers: EU AI Act = Regulation (EU) 2024/1689; GDPR = Regulation (EU) 2016/679 (as stated in the project brief)
 
 ## Verification — 2026-08-23 (planner, R1)

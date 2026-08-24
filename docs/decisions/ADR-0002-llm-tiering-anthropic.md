@@ -35,4 +35,4 @@ Because the model calls go through LangChain's chat-model interface (`ChatAnthro
 - `langchain-anthropic`, PyPI: 1.6.1 — https://pypi.org/project/langchain-anthropic/ (verified 2026-08-23)
 - `langchain-openai` (alternative/reference for interface parity), PyPI: 1.6.0 — https://pypi.org/project/langchain-openai/ (verified 2026-08-23)
 - Current Claude model ids and pricing table: `claude-api` skill (cached 2026-06-24; Haiku `claude-haiku-4-5`, Sonnet `claude-sonnet-5`), cross-checked 2026-08-23
-- Bedrock model-id prefix convention (`anthropic.<model-id>`): `claude-api` skill, "Provider Clients" section (verified 2026-08-23) — exact `eu-central-1` inference-profile id **not verified**, flagged as an open item in `docs/handoffs/phase1-architecture/writer.md`
+- Bedrock model-id prefix convention (`anthropic.<model-id>`): `claude-api` skill, "Provider Clients" section (verified 2026-08-23) — exact `eu-central-1` inference-profile id **not verified**, open item

@@ -4,7 +4,7 @@
 Accepted. 2026-08-23.
 
 ## Context
-The system needs to actually run somewhere reachable over the internet, with TLS, for the API (ADR-0008), the MCP server (ADR-0007), Postgres (ADR-0003), and now — per ADR-0009's finding — a five-service Langfuse observability stack. EU data residency (`docs/ARCHITECTURE.md` §8) is a named project goal, and the project's default constraints (`CLAUDE.md`) are 3–4h/day over 6 weeks, solo — meaning the hosting choice needs to be operable by one person in spare time, not a platform requiring a dedicated ops rotation.
+The system needs to actually run somewhere reachable over the internet, with TLS, for the API (ADR-0008), the MCP server (ADR-0007), Postgres (ADR-0003), and now — per ADR-0009's finding — a five-service Langfuse observability stack. EU data residency (`docs/ARCHITECTURE.md` §8) is a named project goal, and the project's default constraints are 3–4h/day over 6 weeks, solo — meaning the hosting choice needs to be operable by one person in spare time, not a platform requiring a dedicated ops rotation.
 
 ## Options considered
 1. **Docker Compose on a single Hetzner Cloud VPS, physically in Germany**, all services (`api`, `postgres`, `langfuse` + its dependencies, `mcp-server`) as containers behind **Caddy** (a reverse proxy that automates TLS certificate issuance/renewal via Let's Encrypt with minimal config) — with a **Terraform stub for AWS `eu-central-1`** as a stretch goal (not a full production migration, just infrastructure-as-code groundwork showing the path).
@@ -28,7 +28,7 @@ The system needs to actually run somewhere reachable over the internet, with TLS
 Docker Compose service definitions translate reasonably directly to Kubernetes manifests/Helm charts (each Compose service becomes roughly one Deployment + Service) if the project ever needs to scale beyond one box — this is the documented upgrade path rather than a full rewrite. Moving from Hetzner to AWS `eu-central-1` is the explicit purpose of the Terraform stub — it exists specifically so that migration path is partially pre-built rather than starting from zero if/when it's needed.
 
 ## References
-- Project defaults (3–4h/day, 6 weeks, solo, EU deploy): `CLAUDE.md`
+- Project defaults (3–4h/day, 6 weeks, solo, EU deploy): project brief (README)
 - Hosting options ranked against market signal (Kubernetes 38%, Docker 34%, Terraform 18% named in ads — infra is "table stakes," per the research read): `docs/research/market_research.md`
 - Langfuse self-host service count driving VPS sizing: see ADR-0009 references
 

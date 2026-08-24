@@ -7,14 +7,19 @@
 # committing), and `search` (embed a question, print the top-k nearest
 # chunks by cosine distance — the first retrieval smoke test, ADR-0004).
 # `python -m compliance_copilot.cli init-db --reset` / `... ingest
-# --regulation all` / `... search "What is a high-risk AI system?"`.
+# --regulation all` / `... search "What is a high-risk AI system?"` /
+# `... ask "What is a high-risk AI system?"`.
 import argparse
+import sys
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from compliance_copilot.db import Chunk, get_engine, init_db
 from compliance_copilot.embeddings import get_embeddings
+from compliance_copilot.graph import CitationError
+from compliance_copilot.graph import ask as ask_graph
+from compliance_copilot.graph.nodes import make_llm
 from compliance_copilot.ingest.eurlex import REGULATIONS
 from compliance_copilot.ingest.pipeline import ingest
 
@@ -56,6 +61,11 @@ def main() -> None:
     )
     search_parser.add_argument("question")
     search_parser.add_argument("--k", type=int, default=5)
+
+    ask_parser = subparsers.add_parser(
+        "ask", help="Run the retrieve -> answer graph and print a cited answer."
+    )
+    ask_parser.add_argument("question")
 
     args = parser.parse_args()
 
@@ -102,6 +112,21 @@ def main() -> None:
                     f"{chunk.document.regulation} {chunk.anchor_id} "
                     f"{chunk.title or ''!r} dist={dist:.4f} — {preview!r}"
                 )
+    elif args.command == "ask":
+        embeddings = get_embeddings()
+        llm = make_llm()
+        with Session(get_engine()) as session:
+            try:
+                result = ask_graph(args.question, session=session, embeddings=embeddings, llm=llm)
+            except CitationError as exc:
+                # Never print a half-validated answer alongside a refusal —
+                # the answer text and citations are simply not printed at
+                # all here (ADR-0014's hard-error path).
+                print(f"REFUSED: {exc}", file=sys.stderr)
+                sys.exit(2)
+            print(result.answer)
+            for citation in result.citations:
+                print(f"  [{citation.regulation} {citation.anchor}] {citation.quote!r}")
 
 
 if __name__ == "__main__":
