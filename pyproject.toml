@@ -9,6 +9,7 @@ description = "Agentic RAG over EU AI Act + GDPR with eval-gated CI"
 requires-python = ">=3.12"
 # No runtime dependencies yet — added feature-by-feature (see docs/decisions/).
 dependencies = [
+    "fastapi>=0.141.1",
     "httpx>=0.28.1",
     "langchain-anthropic>=1.6.1",
     "langchain-core>=1.6.0",
@@ -18,7 +19,9 @@ dependencies = [
     "psycopg[binary]>=3.3.4",
     "pydantic-settings>=2.15.0",
     "selectolax>=0.4.11",
+    "slowapi>=0.1.10",
     "sqlalchemy>=2.0.52",
+    "uvicorn[standard]>=0.52.4",
 ]
 
 # Dev-only tools (test runner, linter/formatter, git hook manager).
@@ -46,6 +49,13 @@ line-length = 100
 # E = pycodestyle errors, F = pyflakes, I = import sorting (isort),
 # B = flake8-bugbear (common bug patterns), UP = pyupgrade (modern syntax).
 select = ["E", "F", "I", "B", "UP"]
+
+# FastAPI's own `Depends(...)`/`Security(...)` calls as parameter defaults
+# are the documented dependency-injection pattern (api.py), not the mutable-
+# default-argument bug B008 exists to catch — FastAPI's own docs recommend
+# this exact ruff config to stop flagging it.
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = ["fastapi.Depends", "fastapi.Security"]
 
 # Pytest config. Docs: https://docs.pytest.org/en/stable/reference/reference.html#ini-options-ref
 [tool.pytest.ini_options]

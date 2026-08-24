@@ -23,3 +23,12 @@ DB integration tests (`tests/test_db_integration.py`) need a real Postgres —
 they're skipped automatically unless `DATABASE_URL` is set, and run in
 GitHub CI's `integration` job against a `pgvector/pgvector:pg16` service
 container regardless of what's set up locally.
+
+## Run the API
+
+```bash
+# set API_KEY in .env first (see .env.example)
+make api  # uvicorn on http://127.0.0.1:8000, auto-reload
+curl -sN -X POST localhost:8000/ask -H "Content-Type: application/json" \
+  -H "X-API-Key: $API_KEY" -d '{"question":"When is an AI system high-risk?"}'
+```

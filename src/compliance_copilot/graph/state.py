@@ -48,8 +48,9 @@ class Citation(BaseModel):
         "present in the provided excerpts."
     )
     quote: str = Field(
-        description="A verbatim excerpt copied word-for-word from the text of "
-        "the cited article's excerpt — no paraphrasing, no summarising."
+        description="A SHORT verbatim excerpt (one sentence or clause, at most "
+        "~300 characters) copied word-for-word from the cited article's "
+        "excerpt — no paraphrasing, no summarising, no whole paragraphs."
     )
 
 
