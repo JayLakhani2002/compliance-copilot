@@ -7,8 +7,10 @@
 from __future__ import annotations
 
 import re
+from typing import Any
 
 from langchain_anthropic import ChatAnthropic
+from langchain_openai import ChatOpenAI
 from langgraph.runtime import Runtime
 
 from compliance_copilot.graph.state import (
@@ -161,12 +163,39 @@ def answer_node(state: GraphState, runtime: Runtime[GraphContext]) -> dict:
     return {"answer": result}
 
 
-def make_llm(model: str | None = None) -> ChatAnthropic:
-    """The one place `ChatAnthropic` is constructed (ADR-0002 "how to
-    reverse"). `method="json_schema"` is pinned explicitly rather than left
-    to default: reading `with_structured_output`'s signature in the
-    installed `langchain_anthropic` package shows its own default is
-    `"function_calling"`, not `"json_schema"` — pinning avoids depending on
-    that default silently changing later."""
-    llm = ChatAnthropic(model=model or settings.answer_model, temperature=0, max_tokens=1024)
+# ADR-0002: the target tier is Sonnet; its 2026-08-24 amendment makes
+# gpt-4.1-mini the interim default while only an OpenAI key exists.
+_DEFAULT_MODELS = {"openai": "gpt-4.1-mini", "anthropic": "claude-sonnet-5"}
+
+
+def make_llm(model: str | None = None) -> Any:
+    """The one place an LLM client is constructed (ADR-0002 "how to
+    reverse", exercised by its 2026-08-24 amendment: OpenAI is the interim
+    provider until an Anthropic key exists). `settings.llm_provider` picks
+    the branch; everything past construction is identical — both providers'
+    `.with_structured_output(AnswerSchema, method="json_schema")` return a
+    `Runnable` whose `.invoke(messages) -> AnswerSchema`, the only contract
+    `answer_node` depends on (see `GraphContext.llm`'s `Any` comment).
+
+    Return type `Any`, not `Runnable`: the two providers' `with_structured_
+    output` return different concrete `Runnable` specialisations, and typing
+    this any more precisely than "has `.invoke`" would be the same leak
+    `GraphContext.llm: Any` already avoids.
+
+    `method="json_schema"` is pinned explicitly for `ChatAnthropic` — its
+    installed package's own default is `"function_calling"`, not
+    `"json_schema"` — pinning avoids depending on that default silently
+    changing later. `ChatOpenAI.with_structured_output` already defaults to
+    `"json_schema"` (and `strict=True` under that method), so pinning it
+    here is redundant but keeps both branches visibly symmetric."""
+    provider = settings.llm_provider
+    if provider not in _DEFAULT_MODELS:
+        raise ValueError(f"Unknown llm_provider: {provider!r}. Expected 'openai' or 'anthropic'.")
+    # Per-provider default so LLM_PROVIDER alone is a complete switch — an
+    # explicit ANSWER_MODEL (or `model` arg) still wins.
+    model = model or settings.answer_model or _DEFAULT_MODELS[provider]
+    if provider == "openai":
+        llm = ChatOpenAI(model=model, temperature=0, max_tokens=1024)
+    else:
+        llm = ChatAnthropic(model=model, temperature=0, max_tokens=1024)
     return llm.with_structured_output(AnswerSchema, method="json_schema")

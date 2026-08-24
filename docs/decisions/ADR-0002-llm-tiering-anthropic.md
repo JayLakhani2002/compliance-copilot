@@ -31,6 +31,18 @@ The graph (ADR-0001) makes several LLM calls per request with different accuracy
 ## How to reverse
 Because the model calls go through LangChain's chat-model interface (`ChatAnthropic`, and equivalently `ChatOpenAI` from `langchain-openai` or any other LangChain chat-model integration), swapping providers or tiers is a constructor-argument change in one place (wherever the graph builds its LLM clients), not a rewrite of node logic — node functions call `.invoke()`/`.ainvoke()` on whatever model object they're given. Moving from direct API to Bedrock is the same kind of swap: a different `ChatAnthropic` construction (or Bedrock-specific client) passed into the same node code.
 
+## Amendment (2026-08-24) — interim provider: OpenAI
+
+**Context:** ANTHROPIC_API_KEY doesn't exist yet (not purchased); OPENAI_API_KEY already does (it's used for embeddings, ADR-0004). Week 2 Day 6's graph needs a working `answer` node now, not once a key is bought.
+
+**Decision:** `settings.llm_provider` ("openai" | "anthropic", default `"openai"`) gates a branch in `make_llm()` (`src/compliance_copilot/graph/nodes.py`) — the single place either provider's chat client is constructed, exactly as this ADR's own "how to reverse" section anticipated. `make_llm()` defaults the model per provider (`gpt-4.1-mini` for openai, `claude-sonnet-5` for anthropic; `ANSWER_MODEL` overrides) — `gpt-4.1-mini` because it is the cheapest current OpenAI model that supports `with_structured_output(method="json_schema")` and isn't a reasoning-only model — gpt-5.x-class models silently drop `temperature=0` (`langchain_openai`'s `validate_temperature`), which this project needs for deterministic citation-checked answers. Candidates seen via `client.models.list()` (2026-08-24, key from `.env`): `gpt-4.1`, `gpt-4.1-mini`, `gpt-4.1-nano`, `gpt-4o`, `gpt-4o-mini`, `gpt-5`-through-`gpt-5.6`-family (all reasoning-restricted on temperature). `gpt-4.1-nano` is cheaper still but rejected here — this is the node that drafts the answer a user reads and that gets citation-validated against verbatim quotes, the same "don't underspend on the one call that matters" reasoning this ADR already applies to Sonnet vs. Haiku.
+
+**What stays:** Anthropic/Bedrock `eu-central-1` remains the documented EU-residency production target; the Haiku/Sonnet tiering plan (router/critic vs. answer) is unchanged and applies unmodified once `LLM_PROVIDER=anthropic`.
+
+**Cost:** `gpt-4.1-mini`: $0.40/$1.60 per MTok in/out (verified `platform.openai.com/docs/pricing` → `developers.openai.com/api/docs/pricing`, 2026-08-24) — cheaper per-token than Sonnet's $3/$15 (intro $2/$10), though not the same model quality; acceptable for an interim/portfolio build.
+
+**How to reverse:** buy an Anthropic key, set `LLM_PROVIDER=anthropic` and `ANTHROPIC_API_KEY` in `.env`. No code change: `make_llm()` then constructs `ChatAnthropic(model="claude-sonnet-5")` via its per-provider default table (unit-tested in `tests/test_graph.py`, constructor-only, no network).
+
 ## References
 - `langchain-anthropic`, PyPI: 1.6.1 — https://pypi.org/project/langchain-anthropic/ (verified 2026-08-23)
 - `langchain-openai` (alternative/reference for interface parity), PyPI: 1.6.0 — https://pypi.org/project/langchain-openai/ (verified 2026-08-23)
