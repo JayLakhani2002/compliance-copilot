@@ -83,5 +83,13 @@ class Settings(BaseSettings):
     # plus JSON overhead — a real request is a few hundred bytes.
     max_body_bytes: int = 16_384
 
+    # ADR-0009 amendment: tags every Langfuse trace (tracing.py's
+    # `run_config()`) so "did a deploy cause this quality drop" is a filter,
+    # not a guess. No LANGFUSE_* fields here — tracing.py reads those two
+    # keys straight from the environment (same reasoning as
+    # OPENAI_API_KEY/ANTHROPIC_API_KEY above: a secret has no business in a
+    # `Settings()` repr/log).
+    env: str = "dev"
+
 
 settings = Settings()

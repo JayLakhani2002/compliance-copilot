@@ -12,10 +12,12 @@
 # docs/ARCHITECTURE.md §5 sketches) actually lands.
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import secrets
 import time
+import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from functools import lru_cache
@@ -36,6 +38,7 @@ from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoin
 from starlette.responses import Response
 
 from compliance_copilot import embeddings as embeddings_module
+from compliance_copilot import tracing
 from compliance_copilot.db import get_session
 from compliance_copilot.graph import CitationError, GraphContext
 from compliance_copilot.graph.build import build_graph
@@ -200,9 +203,15 @@ async def _stream_answer(
     graph = build_graph()
     context = GraphContext(session=session, embeddings=embeddings, llm=llm)
     started = time.monotonic()
+    # One config per request: `run_config()` builds a fresh CallbackHandler
+    # (or `[]` when tracing is disabled, tracing.py) and a request-scoped
+    # session id, so concurrent `/ask` calls never share a handler instance
+    # (see tracing.current_trace_id's docstring on why that matters).
+    config = tracing.run_config(session_id=uuid.uuid4().hex)
+    trace_emitted = False
     try:
         async for update in graph.astream(
-            {"question": question}, context=context, stream_mode="updates"
+            {"question": question}, context=context, config=config, stream_mode="updates"
         ):
             for node_name, node_update in update.items():
                 elapsed_ms = int((time.monotonic() - started) * 1000)
@@ -224,6 +233,19 @@ async def _stream_answer(
                             "recitals": [r.anchor for r in recitals],
                         },
                     )
+                    # Emitted once, right after the first node: this is the
+                    # earliest point `tracing.current_trace_id` can have a
+                    # value (the handler's `last_trace_id` is set at that
+                    # node's `on_chain_start`, verified in tracing.py) — a
+                    # user reporting a bad answer needs this id to find the
+                    # trace, so it goes out before `final`, not bundled with
+                    # it (only emitted when non-None: disabled tracing must
+                    # not add a new event to the stream, see test_api.py).
+                    if not trace_emitted:
+                        trace_id = tracing.current_trace_id(config)
+                        if trace_id is not None:
+                            yield _sse("trace", {"trace_id": trace_id})
+                        trace_emitted = True
                 elif node_name == "answer":
                     attempts = node_update.get("attempts")
                     citation_error = node_update.get("citation_error") is not None
@@ -241,6 +263,10 @@ async def _stream_answer(
                     answer = node_update.get("answer")
                     if answer is not None:
                         yield _sse("final", answer.model_dump())
+                        # First quality signal on the dashboard (ADR-0009
+                        # amendment, Day 10 builds eval scores on top of
+                        # this): a validated answer scores 1.0.
+                        tracing.score("citation_valid", 1.0, tracing.current_trace_id(config))
     except CitationError as exc:
         # Reached only after `fail_node` (build.py) raises — the retry
         # loop's two attempts both failed citation validation. `str(exc)`
@@ -248,6 +274,7 @@ async def _stream_answer(
         # citation/anchor data, never the question (state.py's docstring).
         logger.info("citation_error elapsed_ms=%d", int((time.monotonic() - started) * 1000))
         yield _sse("error", {"type": "citation_error", "message": str(exc)})
+        tracing.score("citation_valid", 0.0, tracing.current_trace_id(config))
     except Exception:
         # Anything else (LLM/DB failure, a bug) — log server-side with a
         # stack trace but tell the client nothing beyond "something broke".
@@ -268,6 +295,12 @@ async def lifespan(app: FastAPI):
     # already triggered it first.
     build_graph()
     yield
+    # `shutdown()`, not `flush()`: this runs once as the process exits, so it
+    # should also stop Langfuse's background consumer threads (tracing.py) —
+    # a no-op when tracing is disabled.
+    # to_thread: shutdown() flushes over the network with bounded retries —
+    # keep that off the event loop so other in-flight responses can finish.
+    await asyncio.to_thread(tracing.shutdown)
 
 
 # docs_url/redoc_url=None: no public API docs surface yet (ADR-0016) — this

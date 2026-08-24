@@ -77,6 +77,11 @@ def _fakes(monkeypatch):
     monkeypatch.setattr("compliance_copilot.graph.nodes.retrieve", _fake_retrieve)
     monkeypatch.setattr(settings, "api_key", API_KEY)
     monkeypatch.setattr(settings, "rate_limit", "20/minute")
+    # Tracing disabled by default (ADR-0009 amendment, no Langfuse account
+    # yet) — pin this explicitly rather than relying on the ambient test
+    # environment happening to have no LANGFUSE_* vars set.
+    monkeypatch.delenv("LANGFUSE_PUBLIC_KEY", raising=False)
+    monkeypatch.delenv("LANGFUSE_SECRET_KEY", raising=False)
 
     app.dependency_overrides[get_session] = _override_get_session
     app.dependency_overrides[get_embeddings_dependency] = lambda: None
@@ -179,11 +184,41 @@ def test_happy_path_streams_retrieve_then_answer_then_final(client):
         body = "".join(resp.iter_text())
 
     events = _parse_sse(body)
+    # ADR-0009 amendment: with tracing disabled (the `_fakes` fixture unsets
+    # LANGFUSE_*), `tracing.current_trace_id` always returns None, so no
+    # `trace` event is emitted — the stream shape is exactly what it was
+    # before this feature, not "node", "trace", "node", "final".
     assert [e[0] for e in events] == ["node", "node", "final"]
     assert events[0][1] == {"node": "retrieve", "articles": ["art_6"], "recitals": []}
     assert events[1][1] == {"node": "answer", "attempt": 1, "citation_error": False}
     final = AnswerSchema.model_validate(events[2][1])
     assert final.citations[0].anchor == "art_6"
+
+
+# --- (h) tracing SSE event (ADR-0009 amendment) -----------------------------
+def test_trace_event_emitted_when_tracing_enabled(client, monkeypatch):
+    """`tracing.get_callbacks` stays `[]` (still no real Langfuse account —
+    only `current_trace_id` is monkeypatched) to prove the `trace` event's
+    presence depends on `current_trace_id`'s return value alone, with zero
+    network/real callback involved."""
+    from compliance_copilot import tracing
+
+    monkeypatch.setattr(tracing, "get_callbacks", lambda: [])
+    monkeypatch.setattr(tracing, "current_trace_id", lambda config: "abc")
+    answer = AnswerSchema(answer="...", citations=[])
+    _use_llm(FakeLLM(answer))
+
+    with client.stream(
+        "POST",
+        "/ask",
+        json={"question": "What is a high-risk AI system?"},
+        headers=_auth_headers(),
+    ) as resp:
+        body = "".join(resp.iter_text())
+
+    events = _parse_sse(body)
+    assert [e[0] for e in events] == ["node", "trace", "node", "final"]
+    assert events[1] == ("trace", {"trace_id": "abc"})
 
 
 # --- (e) fail-twice --------------------------------------------------------

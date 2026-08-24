@@ -66,11 +66,25 @@ def build_graph():
     return builder.compile()
 
 
-def ask(question: str, *, session: Session, embeddings: Embeddings, llm: Any) -> AnswerSchema:
+def ask(
+    question: str,
+    *,
+    session: Session,
+    embeddings: Embeddings,
+    llm: Any,
+    config: dict | None = None,
+) -> AnswerSchema:
     """Convenience entry point: runs the compiled graph for one question and
     returns just the final `AnswerSchema` (rather than making every caller —
-    cli.py, tests — reach into the raw state dict)."""
+    cli.py, tests — reach into the raw state dict).
+
+    `config`: optional LangChain `RunnableConfig` dict (ADR-0009 amendment —
+    `tracing.run_config()` builds one carrying a Langfuse callback when
+    enabled). `None` here just means "no callbacks" — `graph.invoke()`
+    already defaults to that with no `config=` kwarg at all, so this is
+    additive, not a behaviour change for existing callers/tests that don't
+    pass one."""
     graph = build_graph()
     context = GraphContext(session=session, embeddings=embeddings, llm=llm)
-    state = graph.invoke({"question": question}, context=context)
+    state = graph.invoke({"question": question}, context=context, config=config)
     return state["answer"]

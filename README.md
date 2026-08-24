@@ -32,3 +32,5 @@ make api  # uvicorn on http://127.0.0.1:8000, auto-reload
 curl -sN -X POST localhost:8000/ask -H "Content-Type: application/json" \
   -H "X-API-Key: $API_KEY" -d '{"question":"When is an AI system high-risk?"}'
 ```
+
+Set `LANGFUSE_PUBLIC_KEY`/`LANGFUSE_SECRET_KEY`/`LANGFUSE_BASE_URL` to enable tracing (Langfuse Cloud, EU) — unset by default, so the app runs with zero tracing until you do.
