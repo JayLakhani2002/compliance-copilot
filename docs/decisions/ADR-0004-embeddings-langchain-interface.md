@@ -29,5 +29,5 @@ Same mechanism as ADR-0002: the embedding provider is constructed once and passe
 
 ## References
 - `langchain-openai` (Embeddings interface + OpenAI implementation), PyPI: 1.6.0 — https://pypi.org/project/langchain-openai/ (verified 2026-08-23)
-- Cohere `embed-multilingual-v3` via Bedrock: referenced as the documented production option per project brief; exact Bedrock model id/region availability to be confirmed at deploy time the same way as ADR-0002's inference-profile caveat — flagged in `docs/handoffs/phase1-architecture/writer.md`
+- Cohere `embed-multilingual-v3` via Bedrock: referenced as the documented production option per project brief; exact Bedrock model id/region availability to be confirmed at deploy time the same way as ADR-0002's inference-profile caveat
 - Market data on `vector-db`/multilingual relevance: `docs/research/market_research.md` (German-language requirement in 46% of ads, informing the multilingual embedding choice)
