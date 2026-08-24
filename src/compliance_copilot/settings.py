@@ -35,5 +35,15 @@ class Settings(BaseSettings):
     # embeddings.py). Declaring it as a field would just duplicate that and
     # risk it ending up in a log/repr of `settings`.
 
+    # ADR-0002: Sonnet is the answer-node model tier. Dateless id
+    # "claude-sonnet-5" is itself a pinned snapshot for this model
+    # generation (verified against the live Anthropic model table,
+    # 2026-08-24), not an evergreen alias that moves underneath us.
+    answer_model: str = "claude-sonnet-5"
+
+    # ANTHROPIC_API_KEY isn't read here directly — same reasoning as
+    # OPENAI_API_KEY above: langchain-anthropic's ChatAnthropic reads it
+    # from the environment itself (see graph/nodes.py's make_llm()).
+
 
 settings = Settings()
