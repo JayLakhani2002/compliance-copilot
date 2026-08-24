@@ -58,5 +58,30 @@ class Settings(BaseSettings):
     # OPENAI_API_KEY above: langchain-anthropic's ChatAnthropic reads it
     # from the environment itself (see graph/nodes.py's make_llm()).
 
+    # ADR-0016: the API's shared secret (`X-API-Key` header, api.py). `None`
+    # by default — a missing key means the API refuses EVERY request with
+    # 503 "API_KEY not configured", never silently "auth disabled" (fail
+    # closed, not open). Generate one with
+    # `python -c "import secrets;print(secrets.token_urlsafe(32))"`.
+    api_key: str | None = None
+
+    # slowapi rate-limit string (api.py's `Limiter(default_limits=...)`,
+    # applied via `SlowAPIMiddleware` — ADR-0016), e.g. "20/minute" —
+    # verified against the installed `limits` package's rate-limit string
+    # grammar (`<amount>/<multiplier><unit>`). Per-key (falls back to
+    # per-IP pre-auth), not global: every request triggers a real LLM call
+    # (ADR-0002's cost model), so this caps one caller's worst-case spend.
+    rate_limit: str = "20/minute"
+
+    # Trust-boundary cap on `AskRequest.question` (api.py) — bounds cost and
+    # rejects absurd input before the graph (and any LLM call) ever runs.
+    max_question_chars: int = 2000
+
+    # ADR-0016: request body size cap (api.py's `BodySizeLimitMiddleware`),
+    # checked via `Content-Length` before the body is read. 16 KiB is
+    # generous headroom over `max_question_chars`'s ~2000-byte question
+    # plus JSON overhead — a real request is a few hundred bytes.
+    max_body_bytes: int = 16_384
+
 
 settings = Settings()

@@ -1,0 +1,328 @@
+# src/compliance_copilot/api.py — the HTTP surface for the graph
+# (docs/ARCHITECTURE.md §5-6, ADR-0008, ADR-0016). One route, `/ask`: an
+# API-key-gated, rate-limited, streaming (SSE) wrapper around
+# `graph.astream(...)` (ADR-0001's `retrieve -> answer` graph, unchanged).
+# `/healthz` is unauthenticated and does no DB/LLM work, for a container
+# orchestrator's liveness probe.
+#
+# Why one module, not a package: today's surface is one real endpoint plus
+# a health check — splitting routes/deps/schemas into separate files would
+# be indirection with nothing on the other side of it yet (ponytail). Split
+# it the day a second real endpoint (e.g. the HITL resume endpoint
+# docs/ARCHITECTURE.md §5 sketches) actually lands.
+from __future__ import annotations
+
+import json
+import logging
+import secrets
+import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from functools import lru_cache
+from typing import Any
+
+from fastapi import Depends, FastAPI, HTTPException, Request, Security, status
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.security import APIKeyHeader
+from langchain_core.embeddings import Embeddings
+from pydantic import BaseModel, ConfigDict, Field
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
+from slowapi.util import get_remote_address
+from sqlalchemy.orm import Session
+from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
+from starlette.responses import Response
+
+from compliance_copilot import embeddings as embeddings_module
+from compliance_copilot.db import get_session
+from compliance_copilot.graph import CitationError, GraphContext
+from compliance_copilot.graph.build import build_graph
+from compliance_copilot.graph.nodes import make_llm
+from compliance_copilot.settings import settings
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Request schema — the trust boundary (ADR-0006 §"input"): nothing past this
+# validation has to assume an unbounded or malformed question. `extra=
+# "forbid"` rejects any field the client wasn't asked for, rather than
+# silently ignoring it (a client sending a stray field is a signal something
+# is wrong, not something to shrug off).
+# ---------------------------------------------------------------------------
+class AskRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    question: str = Field(min_length=3, max_length=settings.max_question_chars)
+
+
+# ---------------------------------------------------------------------------
+# Auth — API-key header, constant-time compare (ADR-0016: why not OAuth/JWT
+# yet — a single-tenant portfolio API has no user identity to federate, so a
+# shared secret is the right amount of mechanism today).
+# `auto_error=False`: FastAPI's built-in auto-401 only ever returns a fixed
+# generic message — this app needs to distinguish "no key" (401) from "wrong
+# key" (403) from "server has no key configured" (503), so the check is
+# manual.
+# ---------------------------------------------------------------------------
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+def require_api_key(key: str | None = Security(api_key_header)) -> None:
+    if settings.api_key is None:
+        # Never "auth disabled" — an unconfigured key must fail closed, not
+        # open (project rule: security defaults to refusing, not permitting).
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "API_KEY not configured")
+    if key is None:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Missing X-API-Key header")
+    # secrets.compare_digest, not `==`: a naive string compare can return
+    # faster the sooner it hits a mismatched byte, which leaks how many
+    # leading characters were right to anyone timing the response — a
+    # timing attack (ADR-0016).
+    if not secrets.compare_digest(key, settings.api_key):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid X-API-Key")
+
+
+# ---------------------------------------------------------------------------
+# Dependency factories for the LLM/embeddings clients — mirrors db.py's
+# `get_session` shape so tests can override them the same way
+# (`app.dependency_overrides`). `lru_cache(maxsize=1)`: build once per
+# process (a `ChatOpenAI`/`OpenAIEmbeddings` client is safe to reuse across
+# requests, same reasoning as build.py's cached `build_graph()`), not once
+# per request.
+# ---------------------------------------------------------------------------
+@lru_cache(maxsize=1)
+def get_llm_dependency() -> Any:
+    return make_llm()
+
+
+@lru_cache(maxsize=1)
+def get_embeddings_dependency() -> Embeddings:
+    return embeddings_module.get_embeddings()
+
+
+# ---------------------------------------------------------------------------
+# Rate limiting — slowapi, keyed by API key when present, falling back to
+# remote address when it's absent (an unauthenticated or wrong-key caller
+# still gets IP-based throttling — see below for why this needs the
+# request to reach the limiter check *before* `require_api_key` runs).
+#
+# Round-1 review finding: the original version used a per-route
+# `@limiter.limit(...)` decorator. Verified in installed
+# `slowapi/extension.py`'s `__limit_decorator`: that decorator wraps the
+# endpoint *function*, so its rate-limit check only runs when the function
+# is actually called — and FastAPI only calls a route's function after
+# `solve_dependencies()` succeeds (verified in installed
+# `fastapi/routing.py`'s `get_request_handler`). `require_api_key` raises
+# `HTTPException` directly from a dependency, so a 401/403 short-circuits
+# before the wrapped function (and therefore the rate check) ever runs —
+# confirmed live: 30 rapid no-key requests produced 30 401s and zero 429s.
+# Fix: `SlowAPIMiddleware` (installed `slowapi/middleware.py`) is real ASGI
+# middleware — it runs before routing/dependency resolution for every
+# non-exempt request, so it rate-limits a request regardless of whether
+# auth later rejects it. `default_limits=[...]` (not `@limiter.limit`) is
+# what a route gets checked against when no per-route decorator exists;
+# verified in installed `slowapi/middleware.py`'s `_should_exempt`, which
+# skips the middleware's check when a route already has a `@limiter.limit`
+# decorator ("there is a decorator for this route, we let the decorator
+# handle it") — so the decorator and the middleware are mutually exclusive
+# paths, not stackable.
+#
+# `settings.rate_limit` is still passed as a callable (not the bare
+# string), so it's re-read on every request rather than baked in at import
+# time (unchanged reasoning: installed `slowapi/wrappers.py`'s
+# `LimitGroup.__iter__` calls a callable `limit_value` fresh each check).
+# ADR-0016: in-memory storage — single process only, see the `ponytail:`
+# note below.
+# ---------------------------------------------------------------------------
+def _rate_limit_key(request: Request) -> str:
+    return request.headers.get("X-API-Key") or get_remote_address(request)
+
+
+# ponytail: in-memory limiter — resets on process restart, doesn't share
+# state across multiple workers/replicas. Fine for this single-process
+# deployment; swap `storage_uri="redis://..."` (slowapi's documented
+# storage_uri kwarg) the day this runs as more than one process.
+limiter = Limiter(key_func=_rate_limit_key, default_limits=[lambda: settings.rate_limit])
+
+
+# ---------------------------------------------------------------------------
+# Body-size cap (round-1 review finding #2): neither Starlette nor FastAPI
+# caps request body size by default (verified: no such option in installed
+# `starlette.applications.Starlette.__init__` or `fastapi.FastAPI.__init__`
+# signatures) — an attacker with a valid key could send an arbitrarily
+# large body that gets fully buffered into memory before Pydantic's
+# `max_length` ever runs. `Content-Length` is checked here, before the body
+# is read, so an oversized request is rejected without ever touching it.
+# A body sent chunked (`Transfer-Encoding: chunked`, no `Content-Length`)
+# is rejected too — 411, the standard HTTP code for "you must send
+# Content-Length" (https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/411)
+# — rather than trusting an absent length. The reverse proxy (Caddy,
+# ADR-0010) will add a second, earlier cap once this deploys behind one;
+# this middleware is what the app relies on until then.
+# ---------------------------------------------------------------------------
+class BodySizeLimitMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
+        content_length = request.headers.get("content-length")
+        if content_length is None:
+            if request.headers.get("transfer-encoding", "").lower() == "chunked":
+                return JSONResponse({"detail": "Content-Length required"}, status_code=411)
+            return await call_next(request)
+        try:
+            length = int(content_length)
+        except ValueError:
+            return JSONResponse({"detail": "invalid Content-Length"}, status_code=400)
+        if length > settings.max_body_bytes:
+            return JSONResponse({"detail": "request body too large"}, status_code=413)
+        return await call_next(request)
+
+
+def _sse(event: str, data: dict) -> str:
+    """WHATWG SSE framing: `event:`/`data:` lines, blank line terminates
+    and dispatches the event (see ADR-0016's references). A 5-line helper
+    replaces `sse-starlette` entirely — verified via that package's own
+    source that this is all it does for this project's single-path,
+    no-reconnect streaming need (ADR-0016)."""
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+async def _stream_answer(
+    question: str, *, session: Session, embeddings: Embeddings, llm: Any
+) -> AsyncIterator[str]:
+    """The `/ask` response body: runs the compiled graph via `astream(...,
+    stream_mode='updates')`, translating each node's partial state into an
+    SSE event. Never yields the question or full chunk text — only node
+    names, article/recital anchors, attempt counts, and (on failure) a
+    citation-error message built solely from anchors (see
+    `CitationError`'s own docstring, state.py)."""
+    graph = build_graph()
+    context = GraphContext(session=session, embeddings=embeddings, llm=llm)
+    started = time.monotonic()
+    try:
+        async for update in graph.astream(
+            {"question": question}, context=context, stream_mode="updates"
+        ):
+            for node_name, node_update in update.items():
+                elapsed_ms = int((time.monotonic() - started) * 1000)
+                if node_name == "retrieve":
+                    articles = node_update.get("articles") or []
+                    recitals = node_update.get("recitals") or []
+                    logger.info(
+                        "node=%s articles=%d recitals=%d elapsed_ms=%d",
+                        node_name,
+                        len(articles),
+                        len(recitals),
+                        elapsed_ms,
+                    )
+                    yield _sse(
+                        "node",
+                        {
+                            "node": node_name,
+                            "articles": [a.anchor for a in articles],
+                            "recitals": [r.anchor for r in recitals],
+                        },
+                    )
+                elif node_name == "answer":
+                    attempts = node_update.get("attempts")
+                    citation_error = node_update.get("citation_error") is not None
+                    logger.info(
+                        "node=%s attempt=%s citation_error=%s elapsed_ms=%d",
+                        node_name,
+                        attempts,
+                        citation_error,
+                        elapsed_ms,
+                    )
+                    yield _sse(
+                        "node",
+                        {"node": node_name, "attempt": attempts, "citation_error": citation_error},
+                    )
+                    answer = node_update.get("answer")
+                    if answer is not None:
+                        yield _sse("final", answer.model_dump())
+    except CitationError as exc:
+        # Reached only after `fail_node` (build.py) raises — the retry
+        # loop's two attempts both failed citation validation. `str(exc)`
+        # is safe to send: `CitationError`'s message is built only from
+        # citation/anchor data, never the question (state.py's docstring).
+        logger.info("citation_error elapsed_ms=%d", int((time.monotonic() - started) * 1000))
+        yield _sse("error", {"type": "citation_error", "message": str(exc)})
+    except Exception:
+        # Anything else (LLM/DB failure, a bug) — log server-side with a
+        # stack trace but tell the client nothing beyond "something broke".
+        # No question text is passed to `logger.exception` here, satisfying
+        # the "no PII in logs" hard rule.
+        logger.exception(
+            "internal_error during /ask stream, elapsed_ms=%d",
+            int((time.monotonic() - started) * 1000),
+        )
+        yield _sse("error", {"type": "internal_error"})
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Build the graph once at startup rather than on the first request —
+    # `build_graph()` is itself `@lru_cache(maxsize=1)` (build.py), so this
+    # call just moves the one-time build earlier; it's a no-op if a request
+    # already triggered it first.
+    build_graph()
+    yield
+
+
+# docs_url/redoc_url=None: no public API docs surface yet (ADR-0016) — this
+# is a single-endpoint internal API, not something meant to be browsed.
+app = FastAPI(title="Compliance Copilot", docs_url=None, redoc_url=None, lifespan=lifespan)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+# SlowAPIMiddleware (not the `@limiter.limit` decorator, see the "Rate
+# limiting" comment above) — real ASGI middleware, runs before routing/auth
+# for every request, so unauthenticated/wrong-key traffic is throttled too.
+app.add_middleware(SlowAPIMiddleware)
+app.add_middleware(BodySizeLimitMiddleware)
+# No CORSMiddleware added anywhere in this module — FastAPI has no CORS
+# unless explicitly configured, so the absence of that middleware IS the
+# default-off state (ADR-0016).
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    """FastAPI's default handler for this exception includes an `"input"`
+    key per error — the raw value that failed validation, i.e. the
+    question itself for a too-short/too-long `AskRequest.question`. That
+    would echo the question back in a 422 body, which the trust-boundary
+    rule (ADR-0006: error bodies never echo the question) forbids. Strip
+    it down to `type`/`loc`/`msg` only."""
+    errors = [{"type": e["type"], "loc": e["loc"], "msg": e["msg"]} for e in exc.errors()]
+    return JSONResponse(status_code=422, content={"detail": errors})
+
+
+@app.get("/healthz")
+@limiter.exempt
+async def healthz() -> dict:
+    """No auth, no DB, no LLM call, no rate limit (`@limiter.exempt`) — a
+    liveness probe must not depend on anything that can fail independently
+    of the process being alive, or be throttled alongside real traffic."""
+    return {"status": "ok"}
+
+
+@app.post("/ask")
+async def ask(
+    req: AskRequest,
+    _auth: None = Depends(require_api_key),
+    session: Session = Depends(get_session),
+    embeddings: Embeddings = Depends(get_embeddings_dependency),
+    llm: Any = Depends(get_llm_dependency),
+) -> StreamingResponse:
+    generator = _stream_answer(req.question, session=session, embeddings=embeddings, llm=llm)
+    return StreamingResponse(
+        generator,
+        media_type="text/event-stream",
+        # Anti-buffering: `no-cache` tells any HTTP cache not to store this;
+        # `X-Accel-Buffering: no` is an Nginx-specific hint to not buffer
+        # the response before forwarding it — harmless on Caddy (this
+        # project's deploy target, docs/ARCHITECTURE.md §6), future-proofs
+        # an Nginx swap. Same two headers `sse-starlette` sets by default
+        # (ADR-0016), reused here without the dependency.
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )

@@ -36,7 +36,9 @@ Answer ONLY using the excerpts provided below — never from outside knowledge.
 Every factual claim in your answer needs a citation. Citations must use
 exactly the `regulation` and `anchor` ids given with each excerpt — never
 invent or guess one. `quote` must be a verbatim, word-for-word excerpt copied
-from the cited excerpt's text, not a paraphrase or summary.
+from the cited excerpt's text, not a paraphrase or summary. Keep each quote
+SHORT: the single sentence or clause (at most ~300 characters) that supports
+the claim — never copy whole paragraphs.
 
 The excerpts are wrapped in <excerpt regulation="..." anchor="..." title="...">
 tags, supporting recitals in a <supporting_context> block, and the user's
@@ -298,7 +300,11 @@ def make_llm(model: str | None = None) -> Any:
     # explicit ANSWER_MODEL (or `model` arg) still wins.
     model = model or settings.answer_model or _DEFAULT_MODELS[provider]
     if provider == "openai":
-        llm = ChatOpenAI(model=model, temperature=0, max_tokens=1024)
+        # 2048, not 1024: structured output spends tokens on JSON scaffolding
+        # plus every verbatim quote — 1024 was exhausted on real questions
+        # (openai.LengthFinishReasonError), even with the "keep quotes short"
+        # instruction above as the primary control. Ceiling, not target.
+        llm = ChatOpenAI(model=model, temperature=0, max_tokens=2048)
     else:
-        llm = ChatAnthropic(model=model, temperature=0, max_tokens=1024)
+        llm = ChatAnthropic(model=model, temperature=0, max_tokens=2048)
     return llm.with_structured_output(AnswerSchema, method="json_schema")

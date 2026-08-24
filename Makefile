@@ -1,7 +1,7 @@
 # Makefile — shortcuts for the commands you'll run most while developing.
 # Run `make <target>` from the repo root.
 
-.PHONY: setup lint test db-up db-init
+.PHONY: setup lint test db-up db-init api
 
 setup:  ## Install deps (incl. dev tools) and enable the pre-commit git hook.
 	uv sync
@@ -19,3 +19,6 @@ db-up:  ## Start local Postgres+pgvector (needs Docker).
 
 db-init:  ## Create the vector extension, tables, and HNSW index.
 	uv run python -m compliance_copilot.cli init-db
+
+api:  ## Run the FastAPI app locally (needs API_KEY set in .env).
+	uv run uvicorn compliance_copilot.api:app --host 127.0.0.1 --port 8000 --reload
