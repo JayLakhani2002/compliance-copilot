@@ -44,3 +44,9 @@ manual dispatch, or on a PR labelled `quality-gate`. Refresh the committed
 embedding cache after changing the golden sets, the corpus, or the embedding
 model with `make eval-cache` (needs `OPENAI_API_KEY`); run the gates locally
 with `make quality-gate` and `uv run python -m evals.run_answer_eval`.
+
+A third gate, the **red-team ASR/FPR check** (ADR-0022), runs 40 original attacks
+against the full guard stack: a no-key heuristics subset (`make redteam-fast`) is a
+plain pytest test that runs on every PR for free, and the full-pipeline run
+(`make redteam`, needs `OPENAI_API_KEY`) folds into the same `answer-quality` CI job.
+Gate: ASR ≤ 5%, FPR ≤ 10%.

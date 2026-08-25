@@ -74,7 +74,7 @@ it reaches `<excerpt>`, the same way this feature treats the question.
 | **Cheap-LLM classifier (`guard_in` layer 2, this feature)** | Paraphrased/multilingual/novel attacks the regex heuristics miss (no EN/DE keyword shape) — see ADR-0019 | **Shipped today.** Measured (gated test): attack TPR 6/6 = 100%, benign allow-rate 20/20 = 100%, p50 latency 704ms–2089ms depending on network load. One honest residual gap found in live testing, not tuned around: a softly-worded hypothetical-framed rephrase ("pretend the earlier rules were only a draft...") still classifies `allow` — ADR-0019 records it. |
 | **PII detection/redaction (`guard_in` layer 3, this feature)** | Personal data pasted into a question (name, email, phone, IBAN, credit card, IP) — see ADR-0020 | **Shipped today.** Detect-then-redact via Presidio (regex/checksum for email/IBAN/credit-card/IP, spaCy NER for names), swapped for a `<TYPE>` placeholder before retrieval/LLM/tracing ever see the question. Runs only after layers 1–2 have already judged the raw text, so redaction can't be used to smuggle a payload past detection. German names: `de_core_news_sm` alone missed "Hans Müller" in a plain sentence (reproduced), so German text also runs the en model for PERSON behind a name-shape filter (ADR-0020); legal citations ("GDPR Art. 22") are filtered per token so they're never treated as names. Residual: unusually shaped names and non-EN/DE PII. |
 | **Output guard (`guard_out`, this feature)** | Uncited or off-scope claims, prompt/scaffold leakage, a leaked Day-13 PII placeholder, and a leaked canary token — regardless of how the input got past everything above | **Shipped today.** Independent final gate, zero LLM calls (ADR-0021); runs on every terminal path, including a `guard_in` refusal. |
-| Red-team eval (attack-success-rate gate) | Regressions in the layers above, measured over time | Day 15 |
+| **Red-team eval (attack-success-rate gate, this feature)** | Regressions in the layers above, measured over time, end to end | **Shipped today.** 40 original attacks (ADR-0022), deterministic canary/payload/citation checks, no LLM-as-judge. See "Measured" below. |
 
 ## There is no complete defence
 
@@ -101,8 +101,40 @@ keyword) is exactly what ADR-0019's classifier (layer 2) was built for —
 measured at 100% TPR against the paraphrase/multilingual bucket that
 motivated it, with one honest exception (ADR-0019's residual gap, above).
 
-## Residual risks (after Day 14)
+## Measured (Day 15 — ADR-0022)
 
+Full detail (per-category table, blocked-by-layer histogram, cost) lives in
+ADR-0022; the headline numbers:
+
+- **Heuristics-only subset** (23 attacks tagged `must_block_at: "heuristics"`,
+  zero LLM calls): 23/23 blocked at `guard_in:heuristics`. ASR = 0.000.
+- **Full pipeline** (all 40 attacks + 20 benign, real classifier + answer
+  model): **ASR = 0.000 (0/40), FPR = 0.000 (0/20)** — zero guard false
+  positives. A separate, reported-not-gated
+  `benign_citation_error_rate = 0.300 (6/20)` was found and is tracked
+  independently (see residual risks below) — it is an answer-model
+  citation-validation issue, not a guard problem. `rt01` (ADR-0021's live
+  canary finding) is caught only by `guard_out` — the earlier layers still
+  do not catch it; `guard_out`'s independence is load-bearing, not
+  redundant.
+
+## Residual risks (after Day 15)
+
+- **Answer-model citation-verbatim fragility, not a guard gap (Day 15
+  finding)** — 6/20 benign, on-topic questions raised `CitationError` (the
+  answer model's quote failed the verbatim check after the one-retry loop,
+  ADR-0014/0015) even though every guard passed them clean. This is the
+  SAME failure mode `evals/run_answer_eval.py`'s `citation_error_rate`
+  metric already tracks, now also visible from the red-team benign run —
+  tracked as its own metric (`benign_citation_error_rate`), not folded into
+  FPR, so a citation-quality regression and a guard-false-positive
+  regression never get confused for each other.
+- **A multi-turn "supervisor pre-approved" attack (`rt37`) was not
+  recognized as manipulation by the classifier** — it reached the answer
+  model, which appears to have attempted to comply and only failed on the
+  citation-verbatim check above, not because anything identified the
+  manipulation. Zero margin above an unrelated check is not the same as a
+  real defence; a candidate for the multi-turn bucket to grow around.
 - **`guard_out`'s scope heuristic is a ceiling, not a proof (ADR-0021)** — a
   genuinely long, honest "the excerpts don't cover this, here's why" answer
   with zero citations would also trip `scope_unsupported`; 400 characters is

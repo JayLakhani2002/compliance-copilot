@@ -224,3 +224,21 @@ jobs:
 
       - name: Answer-quality gate (real LLM + LLM-as-judge)
         run: uv run python -m evals.run_answer_eval --faithfulness-min 0.8
+
+      # Red-team ASR/FPR gate (ADR-0022): folded into this job, not a new
+      # one — same reasoning as the answer-quality step above (real key,
+      # ingested DB, and same nightly/dispatch/label trigger already here).
+      # The no-key heuristics subset runs on every PR as a plain pytest test
+      # (tests/evals/test_redteam.py) — this is the paid, full-pipeline tier.
+      - name: Red-team gate (ASR/FPR, real LLM)
+        run: >-
+          uv run python -m evals.run_redteam
+          --subset all --asr-max 0.05 --fpr-max 0.10 --json redteam.json
+
+      - name: Upload red-team report
+        # always(): the report is exactly what you need when the gate fails.
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: redteam-report
+          path: redteam.json
