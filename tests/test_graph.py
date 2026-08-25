@@ -552,3 +552,56 @@ def test_flagged_question_stream_visits_guard_in_then_refuse_never_answer():
         )
     ]
     assert nodes_visited == ["guard_in", "refuse"]
+
+
+# --- ADR-0020: the guard_in -> PII redaction path -----------------------
+def test_pii_in_question_is_redacted_before_retrieve_and_llm(monkeypatch):
+    """The retriever and the answer LLM must both see the REDACTED question
+    — never "Anna Schmidt"/"anna@x.de" — proving `guard_in_node`'s
+    `question`-overwrite (nodes.py) actually reaches both downstream
+    nodes, not just state."""
+    retrieve_questions: list[str] = []
+
+    def spying_retrieve(question, k, *, kinds, session, embeddings):
+        retrieve_questions.append(question)
+        return _fake_retrieve(question, k, kinds=kinds, session=session, embeddings=embeddings)
+
+    monkeypatch.setattr("compliance_copilot.graph.nodes.retrieve", spying_retrieve)
+
+    answer = AnswerSchema(answer="...", citations=[])
+    llm = FakeLLM(answer)
+    question = "My client Anna Schmidt, anna@x.de, asks: is she a deployer under the AI Act?"
+    state = _run(llm, question=question)
+
+    assert retrieve_questions  # retrieve() was actually called
+    for q in retrieve_questions:
+        assert "Anna Schmidt" not in q
+        assert "anna@x.de" not in q
+    human_content = llm.messages[1][1]
+    assert "Anna Schmidt" not in human_content
+    assert "anna@x.de" not in human_content
+    assert "&lt;PERSON&gt;" in human_content
+    assert "&lt;EMAIL&gt;" in human_content
+    assert set(state["pii_entities"]) >= {"PERSON", "EMAIL_ADDRESS"}
+    assert state.get("refused") is not True
+
+
+def test_pii_only_question_is_refused_with_pii_only_reason(monkeypatch):
+    """Nothing answerable survives redacting a question that's nothing but
+    an email and a phone number — refused via the same guard_in -> refuse
+    route heuristics/the classifier already use (build.py), never reaching
+    retrieve/the LLM."""
+    retrieve_calls = []
+    monkeypatch.setattr(
+        "compliance_copilot.graph.nodes.retrieve",
+        lambda *a, **kw: retrieve_calls.append(1) or [],
+    )
+    llm = FakeLLM(AnswerSchema(answer="should never be returned", citations=[]))
+
+    state = _run(llm, question="hans@firma.de +49 151 23456789")
+
+    assert state["refused"] is True
+    assert state["guard"].flagged is True
+    assert state["guard"].reasons == ("pii_only",)
+    assert retrieve_calls == []
+    assert llm.messages is None

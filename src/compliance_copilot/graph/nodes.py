@@ -25,10 +25,17 @@ from compliance_copilot.graph.state import (
 )
 from compliance_copilot.guards.classifier import classify
 from compliance_copilot.guards.injection import GuardResult, detect
+from compliance_copilot.guards.pii import redact
 from compliance_copilot.retriever import RetrievedChunk, retrieve
 from compliance_copilot.settings import settings
 
 logger = logging.getLogger(__name__)
+
+# Matches a redaction placeholder token (`<PERSON>`, `<EMAIL>`, ...,
+# guards/pii.py's `_OPERATORS`) — used only to decide whether anything
+# ANSWERABLE survives redaction (see `guard_in_node`'s "pii_only" check
+# below), never to detect PII itself (that's `redact()`'s job).
+_PLACEHOLDER_RE = re.compile(r"<[A-Z_]+>")
 
 # Fixed refusal text (ADR-0018) — never built from the question, so a
 # refusal can't be used to fish out which words the question got flagged
@@ -117,7 +124,14 @@ def guard_in_node(state: GraphState, runtime: Runtime[GraphContext]) -> dict:
 
     Logs category names + score only on a flag — never the question or the
     matched text (`GuardResult.reasons` is built that way already, see
-    guards/injection.py)."""
+    guards/injection.py).
+
+    Layer 3 (ADR-0020, PII redaction) only runs past this point, once
+    heuristics AND the classifier have both judged the question allowed —
+    both ran on the RAW text above, so an attacker can't dodge either check
+    by wrapping a payload in PII-looking text and hoping redaction erases
+    it before detection sees it. A question that's already refusing never
+    needs redacting: `refuse_node` never reads `state['question']`."""
     result = detect(state["question"], threshold=settings.guard_threshold)
     if result.flagged:
         logger.info("guard_in flagged reasons=%s score=%s", result.reasons, result.score)
@@ -142,7 +156,24 @@ def guard_in_node(state: GraphState, runtime: Runtime[GraphContext]) -> dict:
             result = GuardResult(
                 flagged=True, score=verdict.confidence, reasons=(f"classifier:{verdict.category}",)
             )
-    return {"guard": result}
+    if result.flagged or not settings.pii_redaction_enabled:
+        return {"guard": result}
+
+    redaction = redact(state["question"])
+    if not redaction.entities:
+        return {"guard": result}
+    logger.info("guard_in pii redacted entities=%s", redaction.entities)
+    # Everything downstream (retrieve/answer/tracing) reads `state["question"]`
+    # — returning it here overwrites the raw text, so the redacted version is
+    # the ONLY version any later node, LLM call, or trace ever sees. Nothing
+    # answerable survives when the whole question was PII (e.g. a bare email
+    # + phone number): refuse via the SAME guard_in -> refuse route
+    # heuristics/the classifier already use (build.py's route_after_guard),
+    # not a new node or branch.
+    stripped = _PLACEHOLDER_RE.sub("", redaction.text).strip()
+    if len(redaction.text) < 10 or not stripped:
+        result = GuardResult(flagged=True, score=1.0, reasons=("pii_only",))
+    return {"guard": result, "question": redaction.text, "pii_entities": redaction.entities}
 
 
 def refuse_node(state: GraphState) -> dict:

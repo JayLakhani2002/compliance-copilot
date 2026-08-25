@@ -12,7 +12,7 @@ answered honestly before defences are built (docs/decisions/ADR-0018).
   or assert something false while citing real text out of context, has
   broken the product's core promise.
 - **Users' PII** — a question may contain personal data pasted in by the
-  user (Day 13's Presidio redaction; not built yet).
+  user (ADR-0020's Presidio redaction, layer 3 of `guard_in`).
 - **Cost/availability** — the LLM/embedding calls this app makes cost money
   per request (ADR-0002); an attacker who can force many expensive calls is
   attacking budget, not data.
@@ -46,7 +46,7 @@ checked against MITRE ATLAS `AML.T0051`, `atlas.mitre.org/techniques/AML.T0051`)
 | # | Item | Applies here? |
 |---|---|---|
 | LLM01 | Prompt Injection (direct/indirect) | **Yes — this feature's whole scope.** |
-| LLM02 | Sensitive Info Disclosure | Yes — PII pasted into a question (Day 13). |
+| LLM02 | Sensitive Info Disclosure | Yes — PII pasted into a question. Mitigated (ADR-0020). |
 | LLM03 | Supply Chain | No new dependency this feature. |
 | LLM04 | Data/Model Poisoning | No — ingested EUR-Lex corpus only, no user training data. |
 | LLM05 | Improper Output Handling | `guard_out`'s citation-must-exist check, not `guard_in`. |
@@ -72,7 +72,7 @@ it reaches `<excerpt>`, the same way this feature treats the question.
 | Prompt delimiting (`<excerpt>`/`<question>` XML tags, "data not instructions") | Nothing on its own — narrows the surface an injected *retrieved chunk* has, does nothing for the raw question | Shipped (ADR-0015) |
 | Heuristic detector (`guard_in` layer 1) | Direct injection: instruction override, role hijack, exfiltration, delimiter/format tricks, encoding obfuscation, payload markers — see ADR-0018 | Shipped (ADR-0018) |
 | **Cheap-LLM classifier (`guard_in` layer 2, this feature)** | Paraphrased/multilingual/novel attacks the regex heuristics miss (no EN/DE keyword shape) — see ADR-0019 | **Shipped today.** Measured (gated test): attack TPR 6/6 = 100%, benign allow-rate 20/20 = 100%, p50 latency 704ms–2089ms depending on network load. One honest residual gap found in live testing, not tuned around: a softly-worded hypothetical-framed rephrase ("pretend the earlier rules were only a draft...") still classifies `allow` — ADR-0019 records it. |
-| PII detection/redaction | Personal data pasted into a question | Day 13 |
+| **PII detection/redaction (`guard_in` layer 3, this feature)** | Personal data pasted into a question (name, email, phone, IBAN, credit card, IP) — see ADR-0020 | **Shipped today.** Detect-then-redact via Presidio (regex/checksum for email/IBAN/credit-card/IP, spaCy NER for names), swapped for a `<TYPE>` placeholder before retrieval/LLM/tracing ever see the question. Runs only after layers 1–2 have already judged the raw text, so redaction can't be used to smuggle a payload past detection. German names: `de_core_news_sm` alone missed "Hans Müller" in a plain sentence (reproduced), so German text also runs the en model for PERSON behind a name-shape filter (ADR-0020); legal citations ("GDPR Art. 22") are filtered per token so they're never treated as names. Residual: unusually shaped names and non-EN/DE PII. |
 | Output guard (`guard_out`) | Uncited or off-scope claims in the answer, regardless of how the input got past everything above | Day 14 |
 | Red-team eval (attack-success-rate gate) | Regressions in the layers above, measured over time | Day 15 |
 
@@ -101,7 +101,7 @@ keyword) is exactly what ADR-0019's classifier (layer 2) was built for —
 measured at 100% TPR against the paraphrase/multilingual bucket that
 motivated it, with one honest exception (ADR-0019's residual gap, above).
 
-## Residual risks (after Day 12)
+## Residual risks (after Day 13)
 
 - **Paraphrased/novel attacks the classifier itself misses** — ADR-0019's
   measured 100% TPR is against a specific 6-string bucket, not a guarantee;
@@ -119,3 +119,10 @@ motivated it, with one honest exception (ADR-0019's residual gap, above).
   "system", "ignore" all appear in ordinary AI Act/GDPR question phrasing;
   ADR-0018's fixture set and category design exist specifically to keep
   these passing, not refused.
+- **Small-model PII name recall (ADR-0020)** — `de_core_news_sm`/
+  `en_core_web_sm` are chosen for image size over `_lg`/`_md`, and this
+  trade had a reproduced miss (a German name in a plain sentence), now
+  mitigated by an en+de PERSON union with a name-shape filter (ADR-0020);
+  single-token, lowercase or four-plus-token names can still slip. PII in a
+  language other than EN/DE is not detected at all — `guards/pii.py`'s
+  language heuristic and analyzer only cover those two.
