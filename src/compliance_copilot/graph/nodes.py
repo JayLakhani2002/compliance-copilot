@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import html
+import logging
 import re
 from typing import Any
 
@@ -21,8 +22,20 @@ from compliance_copilot.graph.state import (
     GraphContext,
     GraphState,
 )
+from compliance_copilot.guards.injection import detect
 from compliance_copilot.retriever import RetrievedChunk, retrieve
 from compliance_copilot.settings import settings
+
+logger = logging.getLogger(__name__)
+
+# Fixed refusal text (ADR-0018) — never built from the question, so a
+# refusal can't be used to fish out which words the question got flagged
+# for (same "never echo the question" rule as `CitationError`'s message,
+# state.py's docstring).
+REFUSAL_TEXT = (
+    "I can only answer questions about the EU AI Act and GDPR based on their "
+    "text. This request was declined by the input safety check."
+)
 
 # Module constant, not built inline in `answer()`: stable text across every
 # call is what lets prompt caching kick in without touching this string
@@ -77,6 +90,33 @@ def _system_message() -> tuple[str, str] | SystemMessage:
         block = {"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}
         return SystemMessage(content=[block])
     return ("system", SYSTEM_PROMPT)
+
+
+def guard_in_node(state: GraphState) -> dict:
+    """Node 0: runs before `retrieve`/`answer` ever touch the question
+    (docs/THREAT_MODEL.md, ADR-0018). No `runtime` param — unlike
+    `retrieve_node`/`answer_node`, this doesn't need `GraphContext` (no DB,
+    no LLM), same reasoning `build.py`'s `route_after_answer` already gives
+    for skipping it on a callable that doesn't need it.
+
+    Logs category names + score only on a flag — never the question or the
+    matched text (`GuardResult.reasons` is built that way already, see
+    guards/injection.py)."""
+    result = detect(state["question"], threshold=settings.guard_threshold)
+    if result.flagged:
+        logger.info("guard_in flagged reasons=%s score=%s", result.reasons, result.score)
+    return {"guard": result}
+
+
+def refuse_node(state: GraphState) -> dict:
+    """Reached only when `route_after_guard` (build.py) sends the graph
+    here — a refusal is a normal answer with zero citations flowing through
+    the same `AnswerSchema` shape every other answer uses, not a raised
+    exception (ADR-0018: `guard_in` blocks by returning a value, the same
+    "guard blocks, never swaps" posture ADR-0014/0015 already established
+    for citation failures, just via a different mechanism since there's no
+    LLM draft to reject here)."""
+    return {"answer": AnswerSchema(answer=REFUSAL_TEXT, citations=[]), "refused": True}
 
 
 def retrieve_node(state: GraphState, runtime: Runtime[GraphContext]) -> dict:

@@ -4,9 +4,11 @@
 # directly, so the retrieve/answer/state split can change without breaking
 # callers.
 from compliance_copilot.graph.build import ask, build_graph
+from compliance_copilot.graph.nodes import REFUSAL_TEXT
 from compliance_copilot.graph.state import AnswerSchema, Citation, CitationError, GraphContext
 
 __all__ = [
+    "REFUSAL_TEXT",
     "AnswerSchema",
     "Citation",
     "CitationError",
