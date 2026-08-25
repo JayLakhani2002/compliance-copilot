@@ -44,6 +44,7 @@ from compliance_copilot.graph import CitationError, GraphContext
 from compliance_copilot.graph.build import build_graph
 from compliance_copilot.graph.nodes import make_llm
 from compliance_copilot.guards.classifier import make_classifier_llm
+from compliance_copilot.guards.output import OutputGuardError
 from compliance_copilot.logging_filter import install_pii_scrub
 from compliance_copilot.settings import settings
 
@@ -221,7 +222,16 @@ async def _stream_answer(
     `CitationError`'s own docstring, state.py).
 
     `classifier`: ADR-0019's layer-2 guard, `None` when disabled
-    (`get_classifier_dependency` above)."""
+    (`get_classifier_dependency` above).
+
+    ADR-0021: `guard_out` now runs on every path AFTER `refuse`/`answer`
+    (build.py), so the `final` event — and which `answer`/`refused` it
+    carries — has to reflect whatever `guard_out` decided, not the state at
+    the moment `refuse`/`answer` fired. `current_answer`/`current_refused`
+    track the latest values across node updates (`stream_mode='updates'`
+    only ever hands this loop the KEYS one node changed, not the full
+    state); `final` is emitted once, at `guard_out`, using whichever values
+    are current by then."""
     graph = build_graph()
     context = GraphContext(session=session, embeddings=embeddings, llm=llm, classifier=classifier)
     started = time.monotonic()
@@ -231,6 +241,8 @@ async def _stream_answer(
     # (see tracing.current_trace_id's docstring on why that matters).
     config = tracing.run_config(session_id=uuid.uuid4().hex)
     trace_emitted = False
+    current_answer = None
+    current_refused = False
     try:
         async for update in graph.astream(
             {"question": question}, context=context, config=config, stream_mode="updates"
@@ -277,11 +289,12 @@ async def _stream_answer(
                 elif node_name == "refuse":
                     # No preceding "node" event for `refuse` itself — the
                     # `guard_in` event above already told the client this
-                    # was flagged; `final` (with `refused: true`) is the
-                    # only other event a refusal produces (ADR-0018).
-                    answer = node_update["answer"]
+                    # was flagged. `final` no longer fires here (ADR-0021):
+                    # `guard_out` runs next on this same path and is what
+                    # actually emits it, once it's had its say.
+                    current_answer = node_update["answer"]
+                    current_refused = True
                     logger.info("node=%s elapsed_ms=%d", node_name, elapsed_ms)
-                    yield _sse("final", {**answer.model_dump(), "refused": True})
                     tracing.score("refused", 1.0, tracing.current_trace_id(config))
                 elif node_name == "retrieve":
                     articles = node_update.get("articles") or []
@@ -317,16 +330,53 @@ async def _stream_answer(
                     )
                     answer = node_update.get("answer")
                     if answer is not None:
-                        # NIT (round-1 review): `refused` is always present
-                        # in `final` — `False` here, `True` on the `refuse`
-                        # branch below — so a client can check
-                        # `event.refused` without a schema-shape special
-                        # case for the normal-answer path.
-                        yield _sse("final", {**answer.model_dump(), "refused": False})
+                        # `final` no longer fires here either (ADR-0021,
+                        # same reasoning as the `refuse` branch above) —
+                        # `guard_out` runs next and emits it.
+                        current_answer = answer
+                        current_refused = False
                         # First quality signal on the dashboard (ADR-0009
                         # amendment, Day 10 builds eval scores on top of
                         # this): a validated answer scores 1.0.
                         tracing.score("citation_valid", 1.0, tracing.current_trace_id(config))
+                elif node_name == "guard_out":
+                    # ADR-0021: the final gate, reached on every path. Its
+                    # own update only carries "answer"/"refused" when it
+                    # REWROTE them (a policy-violation block) — otherwise
+                    # `current_answer`/`current_refused` are already
+                    # whatever `refuse`/`answer` set above, which is exactly
+                    # "pass through unchanged".
+                    verdict = node_update["output_guard"]
+                    if node_update.get("answer") is not None:
+                        current_answer = node_update["answer"]
+                        current_refused = node_update.get("refused", True)
+                    logger.info(
+                        "node=%s ok=%s reason=%s elapsed_ms=%d",
+                        node_name,
+                        verdict.ok,
+                        verdict.reason,
+                        elapsed_ms,
+                    )
+                    yield _sse(
+                        "node", {"node": node_name, "ok": verdict.ok, "reason": verdict.reason}
+                    )
+                    if not verdict.ok:
+                        tracing.score("output_blocked", 1.0, tracing.current_trace_id(config))
+                    yield _sse("final", {**current_answer.model_dump(), "refused": current_refused})
+    except OutputGuardError as exc:
+        # `guard_out_node` (graph/nodes.py) raised — an internal invariant
+        # broke (a citation `answer_node` claims it already validated, or a
+        # refusal that somehow fails its own fixed-text checks), not a
+        # policy violation. `str(exc)` is the reason code only (guards/
+        # output.py's `OutputGuardError` docstring) — safe to send, never
+        # the answer text.
+        logger.error(
+            "guard_out invariant failed reason=%s elapsed_ms=%d",
+            str(exc),
+            int((time.monotonic() - started) * 1000),
+        )
+        yield _sse("error", {"type": "output_guard_error", "reason": str(exc)})
+        tracing.score("output_guard_error", 1.0, tracing.current_trace_id(config))
     except CitationError as exc:
         # Reached only after `fail_node` (build.py) raises — the retry
         # loop's two attempts both failed citation validation. `str(exc)`

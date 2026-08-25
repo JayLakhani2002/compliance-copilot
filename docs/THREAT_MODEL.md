@@ -73,7 +73,7 @@ it reaches `<excerpt>`, the same way this feature treats the question.
 | Heuristic detector (`guard_in` layer 1) | Direct injection: instruction override, role hijack, exfiltration, delimiter/format tricks, encoding obfuscation, payload markers — see ADR-0018 | Shipped (ADR-0018) |
 | **Cheap-LLM classifier (`guard_in` layer 2, this feature)** | Paraphrased/multilingual/novel attacks the regex heuristics miss (no EN/DE keyword shape) — see ADR-0019 | **Shipped today.** Measured (gated test): attack TPR 6/6 = 100%, benign allow-rate 20/20 = 100%, p50 latency 704ms–2089ms depending on network load. One honest residual gap found in live testing, not tuned around: a softly-worded hypothetical-framed rephrase ("pretend the earlier rules were only a draft...") still classifies `allow` — ADR-0019 records it. |
 | **PII detection/redaction (`guard_in` layer 3, this feature)** | Personal data pasted into a question (name, email, phone, IBAN, credit card, IP) — see ADR-0020 | **Shipped today.** Detect-then-redact via Presidio (regex/checksum for email/IBAN/credit-card/IP, spaCy NER for names), swapped for a `<TYPE>` placeholder before retrieval/LLM/tracing ever see the question. Runs only after layers 1–2 have already judged the raw text, so redaction can't be used to smuggle a payload past detection. German names: `de_core_news_sm` alone missed "Hans Müller" in a plain sentence (reproduced), so German text also runs the en model for PERSON behind a name-shape filter (ADR-0020); legal citations ("GDPR Art. 22") are filtered per token so they're never treated as names. Residual: unusually shaped names and non-EN/DE PII. |
-| Output guard (`guard_out`) | Uncited or off-scope claims in the answer, regardless of how the input got past everything above | Day 14 |
+| **Output guard (`guard_out`, this feature)** | Uncited or off-scope claims, prompt/scaffold leakage, a leaked Day-13 PII placeholder, and a leaked canary token — regardless of how the input got past everything above | **Shipped today.** Independent final gate, zero LLM calls (ADR-0021); runs on every terminal path, including a `guard_in` refusal. |
 | Red-team eval (attack-success-rate gate) | Regressions in the layers above, measured over time | Day 15 |
 
 ## There is no complete defence
@@ -101,8 +101,14 @@ keyword) is exactly what ADR-0019's classifier (layer 2) was built for —
 measured at 100% TPR against the paraphrase/multilingual bucket that
 motivated it, with one honest exception (ADR-0019's residual gap, above).
 
-## Residual risks (after Day 13)
+## Residual risks (after Day 14)
 
+- **`guard_out`'s scope heuristic is a ceiling, not a proof (ADR-0021)** — a
+  genuinely long, honest "the excerpts don't cover this, here's why" answer
+  with zero citations would also trip `scope_unsupported`; 400 characters is
+  a starting point from red-team research, not a tuned value. Day 15's
+  red-team eval is what gives this a real false-positive/false-negative
+  measurement to tune against.
 - **Paraphrased/novel attacks the classifier itself misses** — ADR-0019's
   measured 100% TPR is against a specific 6-string bucket, not a guarantee;
   the recorded exception (a softly-worded hypothetical rephrase) proves the

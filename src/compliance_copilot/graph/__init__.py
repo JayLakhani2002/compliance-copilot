@@ -6,6 +6,7 @@
 from compliance_copilot.graph.build import ask, build_graph
 from compliance_copilot.graph.nodes import REFUSAL_TEXT
 from compliance_copilot.graph.state import AnswerSchema, Citation, CitationError, GraphContext
+from compliance_copilot.guards.output import OutputGuardError
 
 __all__ = [
     "REFUSAL_TEXT",
@@ -13,6 +14,7 @@ __all__ = [
     "Citation",
     "CitationError",
     "GraphContext",
+    "OutputGuardError",
     "ask",
     "build_graph",
 ]

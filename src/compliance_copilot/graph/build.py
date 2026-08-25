@@ -12,7 +12,13 @@ from langchain_core.embeddings import Embeddings
 from langgraph.graph import END, START, StateGraph
 from sqlalchemy.orm import Session
 
-from compliance_copilot.graph.nodes import answer_node, guard_in_node, refuse_node, retrieve_node
+from compliance_copilot.graph.nodes import (
+    answer_node,
+    guard_in_node,
+    guard_out_node,
+    refuse_node,
+    retrieve_node,
+)
 from compliance_copilot.graph.state import AnswerSchema, CitationError, GraphContext, GraphState
 
 # 2 = one retry (the initial attempt + one self-correction) — ADR-0015. One
@@ -33,11 +39,13 @@ def route_after_answer(state: GraphState) -> str:
     param needed (routing only reads two `GraphState` keys; `path` callables
     passed to `add_conditional_edges` support a `runtime` param the same way
     nodes do, via LangGraph's `RunnableCallable` wrapping, but this routing
-    decision doesn't need one). Success -> END; a citation failure with a
-    retry left -> back to `answer` with the failed draft now in state; out
-    of retries -> `fail`."""
+    decision doesn't need one). Success -> `guard_out` (ADR-0021: the final
+    output-side gate runs on every path, including a good answer — it's no
+    longer a direct route to END); a citation failure with a retry left ->
+    back to `answer` with the failed draft now in state; out of retries ->
+    `fail` (which raises, never reaching `guard_out`)."""
     if state.get("answer") is not None:
-        return END
+        return "guard_out"
     if state.get("attempts", 0) < MAX_ATTEMPTS:
         return "answer"
     return "fail"
@@ -66,16 +74,23 @@ def build_graph():
     builder.add_node("retrieve", retrieve_node)
     builder.add_node("answer", answer_node)
     builder.add_node("fail", fail_node)
+    builder.add_node("guard_out", guard_out_node)
     builder.add_edge(START, "guard_in")
     builder.add_conditional_edges(
         "guard_in", route_after_guard, {"retrieve": "retrieve", "refuse": "refuse"}
     )
-    builder.add_edge("refuse", END)
+    # ADR-0021: `refuse` no longer goes straight to END — `guard_out` is the
+    # final gate on EVERY path, a `guard_in` refusal included.
+    builder.add_edge("refuse", "guard_out")
     builder.add_edge("retrieve", "answer")
     builder.add_conditional_edges(
-        "answer", route_after_answer, {"answer": "answer", "fail": "fail", END: END}
+        "answer", route_after_answer, {"answer": "answer", "fail": "fail", "guard_out": "guard_out"}
     )
+    # `fail_node` always raises (never returns), so this edge is unreachable
+    # in practice — kept for the same reason it always was: an explicit
+    # graph shape, not a dangling node.
     builder.add_edge("fail", END)
+    builder.add_edge("guard_out", END)
     return builder.compile()
 
 

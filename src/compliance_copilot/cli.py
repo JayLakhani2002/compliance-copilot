@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 from compliance_copilot import tracing
 from compliance_copilot.db import Chunk, get_engine, init_db
 from compliance_copilot.embeddings import get_embeddings
-from compliance_copilot.graph import REFUSAL_TEXT, CitationError, GraphContext
+from compliance_copilot.graph import REFUSAL_TEXT, CitationError, GraphContext, OutputGuardError
 from compliance_copilot.graph.build import build_graph
 from compliance_copilot.graph.nodes import make_llm
 from compliance_copilot.guards.classifier import make_classifier_llm
@@ -151,6 +151,14 @@ def main() -> None:
                 # all here (ADR-0014's hard-error path).
                 print(f"REFUSED: {exc}", file=sys.stderr)
                 sys.exit(2)
+            except OutputGuardError as exc:
+                # ADR-0021: `guard_out` found an INVARIANT broken (e.g. a
+                # citation `answer_node` claims it already validated), not a
+                # policy violation — this is a bug report, not a refusal,
+                # so it gets its own exit code and an "INTERNAL:" prefix
+                # rather than looking like an ordinary REFUSED response.
+                print(f"INTERNAL: output guard invariant failed ({exc})", file=sys.stderr)
+                sys.exit(4)
             finally:
                 # Flush (not shutdown): the CLI process exits right after
                 # this command anyway, but a blocking flush is what
@@ -170,7 +178,21 @@ def main() -> None:
             # citations" (there's no separate `refused` flag on
             # `AnswerSchema` itself, ADR-0018).
             if result.answer == REFUSAL_TEXT:
-                print(f"REFUSED (input guard): {REFUSAL_TEXT}", file=sys.stderr)
+                # ADR-0021: `guard_out` can ALSO produce this exact text (a
+                # policy-violation rewrite, e.g. a leaked canary). When
+                # `guard_in` was the layer that refused, `guard_out` then
+                # just passes that fixed refusal through clean, so
+                # `output_guard.ok` is True — `not output_guard.ok` here
+                # can therefore only mean `guard_out` itself did the
+                # rewriting, never `guard_in`.
+                output_guard = state.get("output_guard")
+                if output_guard is not None and not output_guard.ok:
+                    print(
+                        f"REFUSED (output guard: {output_guard.reason}): {REFUSAL_TEXT}",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(f"REFUSED (input guard): {REFUSAL_TEXT}", file=sys.stderr)
                 sys.exit(3)
             print(result.answer)
             for citation in result.citations:
