@@ -32,6 +32,7 @@ from langchain_core.embeddings import Embeddings
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from compliance_copilot.guards.injection import GuardResult
 from compliance_copilot.retriever import RetrievedChunk
 
 
@@ -98,10 +99,15 @@ class GraphContext:
 
 
 class GraphState(TypedDict):
-    """Shared state threaded through `retrieve` -> `answer` -> (`answer` |
-    `fail`). Keys nodes don't fill in until they run are `NotRequired` so the
-    initial `{"question": ...}` dict passed to `.invoke()` is still valid
-    input.
+    """Shared state threaded through `guard_in` -> (`retrieve` -> `answer` ->
+    (`answer` | `fail`)) | `refuse`. Keys nodes don't fill in until they run
+    are `NotRequired` so the initial `{"question": ...}` dict passed to
+    `.invoke()` is still valid input.
+
+    `guard`/`refused` back Day 11's input guard (ADR-0018): `guard_in_node`
+    (nodes.py) always fills `guard`; `refused` is only set `True` by
+    `refuse_node`, so its absence/`False` means the question passed the
+    heuristic check (or refusal never applies before that node runs).
 
     `draft`/`citation_error`/`attempts` back the Day 7 retry-once loop
     (ADR-0015): a failed `answer_node` call stores its rejected `AnswerSchema`
@@ -110,6 +116,8 @@ class GraphState(TypedDict):
     with that context appended as extra message turns."""
 
     question: str
+    guard: NotRequired[GuardResult]
+    refused: NotRequired[bool]
     articles: NotRequired[list[RetrievedChunk]]
     recitals: NotRequired[list[RetrievedChunk]]
     answer: NotRequired[AnswerSchema | None]

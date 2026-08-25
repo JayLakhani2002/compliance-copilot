@@ -91,5 +91,15 @@ class Settings(BaseSettings):
     # `Settings()` repr/log).
     env: str = "dev"
 
+    # ADR-0018: `guard_in_node`'s flag/allow cutoff — a question flags when
+    # `detect()`'s summed per-category score (guards/injection.py) is >=
+    # this. 1.0 matches every category's own ceiling weight, so any ONE
+    # matched category is enough to refuse; raising it would require two
+    # independent categories to agree before refusing (fewer false
+    # positives, more heuristics slip through) — a one-line env tweak, no
+    # code change, if the false-positive/false-negative balance needs
+    # retuning after real traffic.
+    guard_threshold: float = 1.0
+
 
 settings = Settings()

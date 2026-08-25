@@ -12,13 +12,20 @@ from langchain_core.embeddings import Embeddings
 from langgraph.graph import END, START, StateGraph
 from sqlalchemy.orm import Session
 
-from compliance_copilot.graph.nodes import answer_node, retrieve_node
+from compliance_copilot.graph.nodes import answer_node, guard_in_node, refuse_node, retrieve_node
 from compliance_copilot.graph.state import AnswerSchema, CitationError, GraphContext, GraphState
 
 # 2 = one retry (the initial attempt + one self-correction) — ADR-0015. One
 # place, read by `route_after_answer` only; `answer_node` doesn't need to
 # know the cap, it just increments `attempts` each time it runs.
 MAX_ATTEMPTS = 2
+
+
+def route_after_guard(state: GraphState) -> str:
+    """Conditional edge after `guard_in` — mirrors `route_after_answer`
+    below: a plain state check reading one `GraphState` key, no `runtime`
+    param needed (same precedent)."""
+    return "refuse" if state["guard"].flagged else "retrieve"
 
 
 def route_after_answer(state: GraphState) -> str:
@@ -54,10 +61,16 @@ def build_graph():
     resume step yet (ADR-0001 flags a Postgres checkpointer as needed once
     `interrupt()`-based human review lands, not before)."""
     builder = StateGraph(GraphState, context_schema=GraphContext)
+    builder.add_node("guard_in", guard_in_node)
+    builder.add_node("refuse", refuse_node)
     builder.add_node("retrieve", retrieve_node)
     builder.add_node("answer", answer_node)
     builder.add_node("fail", fail_node)
-    builder.add_edge(START, "retrieve")
+    builder.add_edge(START, "guard_in")
+    builder.add_conditional_edges(
+        "guard_in", route_after_guard, {"retrieve": "retrieve", "refuse": "refuse"}
+    )
+    builder.add_edge("refuse", END)
     builder.add_edge("retrieve", "answer")
     builder.add_conditional_edges(
         "answer", route_after_answer, {"answer": "answer", "fail": "fail", END: END}

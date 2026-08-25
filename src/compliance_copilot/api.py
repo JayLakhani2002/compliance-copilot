@@ -215,7 +215,44 @@ async def _stream_answer(
         ):
             for node_name, node_update in update.items():
                 elapsed_ms = int((time.monotonic() - started) * 1000)
-                if node_name == "retrieve":
+                if node_name == "guard_in":
+                    guard = node_update["guard"]
+                    logger.info(
+                        "node=%s flagged=%s score=%s elapsed_ms=%d",
+                        node_name,
+                        guard.flagged,
+                        guard.score,
+                        elapsed_ms,
+                    )
+                    yield _sse(
+                        "node",
+                        {
+                            "node": node_name,
+                            "flagged": guard.flagged,
+                            "score": guard.score,
+                            "reasons": list(guard.reasons),
+                        },
+                    )
+                    # `guard_in` is the real first node now (ADR-0018) — the
+                    # earliest-trace-id emission (see the "retrieve" branch's
+                    # comment, unchanged below) moves here so a refused
+                    # request (which never reaches "retrieve") still gets a
+                    # `trace` event.
+                    if not trace_emitted:
+                        trace_id = tracing.current_trace_id(config)
+                        if trace_id is not None:
+                            yield _sse("trace", {"trace_id": trace_id})
+                        trace_emitted = True
+                elif node_name == "refuse":
+                    # No preceding "node" event for `refuse` itself — the
+                    # `guard_in` event above already told the client this
+                    # was flagged; `final` (with `refused: true`) is the
+                    # only other event a refusal produces (ADR-0018).
+                    answer = node_update["answer"]
+                    logger.info("node=%s elapsed_ms=%d", node_name, elapsed_ms)
+                    yield _sse("final", {**answer.model_dump(), "refused": True})
+                    tracing.score("refused", 1.0, tracing.current_trace_id(config))
+                elif node_name == "retrieve":
                     articles = node_update.get("articles") or []
                     recitals = node_update.get("recitals") or []
                     logger.info(
@@ -233,19 +270,6 @@ async def _stream_answer(
                             "recitals": [r.anchor for r in recitals],
                         },
                     )
-                    # Emitted once, right after the first node: this is the
-                    # earliest point `tracing.current_trace_id` can have a
-                    # value (the handler's `last_trace_id` is set at that
-                    # node's `on_chain_start`, verified in tracing.py) — a
-                    # user reporting a bad answer needs this id to find the
-                    # trace, so it goes out before `final`, not bundled with
-                    # it (only emitted when non-None: disabled tracing must
-                    # not add a new event to the stream, see test_api.py).
-                    if not trace_emitted:
-                        trace_id = tracing.current_trace_id(config)
-                        if trace_id is not None:
-                            yield _sse("trace", {"trace_id": trace_id})
-                        trace_emitted = True
                 elif node_name == "answer":
                     attempts = node_update.get("attempts")
                     citation_error = node_update.get("citation_error") is not None
@@ -262,7 +286,12 @@ async def _stream_answer(
                     )
                     answer = node_update.get("answer")
                     if answer is not None:
-                        yield _sse("final", answer.model_dump())
+                        # NIT (round-1 review): `refused` is always present
+                        # in `final` — `False` here, `True` on the `refuse`
+                        # branch below — so a client can check
+                        # `event.refused` without a schema-shape special
+                        # case for the normal-answer path.
+                        yield _sse("final", {**answer.model_dump(), "refused": False})
                         # First quality signal on the dashboard (ADR-0009
                         # amendment, Day 10 builds eval scores on top of
                         # this): a validated answer scores 1.0.

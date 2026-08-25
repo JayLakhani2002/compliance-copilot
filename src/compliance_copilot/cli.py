@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 from compliance_copilot import tracing
 from compliance_copilot.db import Chunk, get_engine, init_db
 from compliance_copilot.embeddings import get_embeddings
-from compliance_copilot.graph import CitationError
+from compliance_copilot.graph import REFUSAL_TEXT, CitationError
 from compliance_copilot.graph import ask as ask_graph
 from compliance_copilot.graph.nodes import make_llm
 from compliance_copilot.ingest.eurlex import REGULATIONS
@@ -138,6 +138,14 @@ def main() -> None:
                 # guarantees this one trace is actually sent before that
                 # happens (tracing.py) — a no-op when tracing is disabled.
                 tracing.flush()
+            # REFUSAL_TEXT is a fixed, module-level string (graph/nodes.py) —
+            # comparing against it is how the CLI tells "the input guard
+            # refused this" apart from "the model answered normally with no
+            # citations" (ask()'s signature stays `-> AnswerSchema` only, so
+            # there's no separate `refused` flag to check here, ADR-0018).
+            if result.answer == REFUSAL_TEXT:
+                print(f"REFUSED (input guard): {REFUSAL_TEXT}", file=sys.stderr)
+                sys.exit(3)
             print(result.answer)
             for citation in result.citations:
                 print(f"  [{citation.regulation} {citation.anchor}] {citation.quote!r}")
