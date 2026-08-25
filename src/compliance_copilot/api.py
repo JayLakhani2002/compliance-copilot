@@ -44,6 +44,7 @@ from compliance_copilot.graph import CitationError, GraphContext
 from compliance_copilot.graph.build import build_graph
 from compliance_copilot.graph.nodes import make_llm
 from compliance_copilot.guards.classifier import make_classifier_llm
+from compliance_copilot.logging_filter import install_pii_scrub
 from compliance_copilot.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -238,6 +239,14 @@ async def _stream_answer(
                 elapsed_ms = int((time.monotonic() - started) * 1000)
                 if node_name == "guard_in":
                     guard = node_update["guard"]
+                    # ADR-0020: entity TYPE names only, e.g. ["PERSON",
+                    # "EMAIL_ADDRESS"] — `node_update` only carries
+                    # `pii_entities` at all when `guard_in_node` actually
+                    # redacted something (state.py's NotRequired key), so
+                    # `.get(..., ())` is what makes this key ALWAYS present
+                    # in the event (empty list = nothing found), matching
+                    # `final`'s "refused" convention below.
+                    pii_entities = node_update.get("pii_entities", ())
                     logger.info(
                         "node=%s flagged=%s score=%s elapsed_ms=%d",
                         node_name,
@@ -252,6 +261,7 @@ async def _stream_answer(
                             "flagged": guard.flagged,
                             "score": guard.score,
                             "reasons": list(guard.reasons),
+                            "pii": list(pii_entities),
                         },
                     )
                     # `guard_in` is the real first node now (ADR-0018) — the
@@ -339,6 +349,11 @@ async def _stream_answer(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # ADR-0020: the logging backstop (defence-in-depth only — the primary
+    # PII control is guard_in's redaction, see logging_filter.py's module
+    # docstring) — installed once at process startup, before any request
+    # can log anything.
+    install_pii_scrub()
     # Build the graph once at startup rather than on the first request —
     # `build_graph()` is itself `@lru_cache(maxsize=1)` (build.py), so this
     # call just moves the one-time build earlier; it's a no-op if a request

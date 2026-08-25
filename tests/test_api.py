@@ -207,6 +207,7 @@ def test_happy_path_streams_retrieve_then_answer_then_final(client):
         "flagged": False,
         "score": 0.0,
         "reasons": [],
+        "pii": [],
     }
     assert events[1][1] == {"node": "retrieve", "articles": ["art_6"], "recitals": []}
     assert events[2][1] == {"node": "answer", "attempt": 1, "citation_error": False}
@@ -431,6 +432,7 @@ def test_flagged_question_emits_guard_in_node_then_final_refused(client):
     assert guard_event["flagged"] is True
     assert guard_event["score"] >= 1.0
     assert "instruction_override" in guard_event["reasons"]
+    assert guard_event["pii"] == []  # refused before redaction ever ran
 
     final_event = events[1][1]
     assert final_event["refused"] is True
@@ -477,6 +479,69 @@ def test_classifier_block_emits_guard_in_node_then_final_refused(client):
     assert guard_event["flagged"] is True
     assert guard_event["reasons"] == ["classifier:role_hijack"]
     assert guard_event["score"] == 0.9
+    assert guard_event["pii"] == []  # refused before redaction ever ran
+
+    final_event = events[1][1]
+    assert final_event["refused"] is True
+    assert final_event["answer"] == REFUSAL_TEXT
+
+
+# --- ADR-0020: PII redaction ---------------------------------------------
+def test_pii_question_emits_pii_types_in_guard_in_event_and_no_raw_pii_anywhere(client):
+    """A question with real PII must (a) not be refused, (b) carry entity
+    TYPE names in the `guard_in` SSE event's `pii` field, and (c) never
+    let the raw name/email/phone appear in ANY SSE payload — proving
+    redaction (not just detection) actually happened before the response
+    left the server."""
+    answer = AnswerSchema(answer="Answering about the redacted client.", citations=[])
+    _use_llm(FakeLLM(answer))
+
+    question = "My client Anna Schmidt, anna@x.de, +49 151 23456789, asks about the AI Act."
+    with client.stream(
+        "POST", "/ask", json={"question": question}, headers=_auth_headers()
+    ) as resp:
+        assert resp.status_code == 200
+        body = "".join(resp.iter_text())
+
+    assert "Anna Schmidt" not in body
+    assert "anna@x.de" not in body
+    assert "23456789" not in body
+
+    events = _parse_sse(body)
+    guard_event = next(e[1] for e in events if e[0] == "node" and e[1]["node"] == "guard_in")
+    assert guard_event["flagged"] is False
+    assert set(guard_event["pii"]) >= {"PERSON", "EMAIL_ADDRESS"}
+
+    final_event = next(e[1] for e in events if e[0] == "final")
+    assert final_event["refused"] is False
+
+
+def test_pii_only_question_is_refused_via_api(client):
+    """A question that's nothing but PII has no answerable content left
+    once redacted — refused the same way a heuristics/classifier block is,
+    never reaching the answer LLM."""
+    from compliance_copilot.graph import REFUSAL_TEXT
+
+    class _UnusedLLM:
+        def invoke(self, messages):
+            raise AssertionError("answer LLM must not be called on a PII-only question")
+
+    _use_llm(_UnusedLLM())
+
+    with client.stream(
+        "POST",
+        "/ask",
+        json={"question": "hans@firma.de +49 151 23456789"},
+        headers=_auth_headers(),
+    ) as resp:
+        assert resp.status_code == 200
+        body = "".join(resp.iter_text())
+
+    events = _parse_sse(body)
+    assert [e[0] for e in events] == ["node", "final"]
+    guard_event = events[0][1]
+    assert guard_event["flagged"] is True
+    assert guard_event["reasons"] == ["pii_only"]
 
     final_event = events[1][1]
     assert final_event["refused"] is True

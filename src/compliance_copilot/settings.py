@@ -123,5 +123,14 @@ class Settings(BaseSettings):
     # shows the balance needs adjusting.
     classifier_block_confidence: float = 0.6
 
+    # ADR-0020: `guard_in`'s layer-3 PII redaction (Presidio) — swaps
+    # names/emails/phones/IBANs/credit cards/IPs in the question for a
+    # `<TYPE>` placeholder before retrieval/LLM/tracing ever see it (GDPR
+    # Art. 5(1)(c)/Art. 25). `False` is the one-line "how to reverse" this
+    # feature's ADR names for a redaction-related incident — `guard_in_node`
+    # skips straight past `redact()` entirely, same "disabled means skip
+    # it" contract `classifier_enabled` above already gives layer 2.
+    pii_redaction_enabled: bool = True
+
 
 settings = Settings()

@@ -18,16 +18,21 @@ from sqlalchemy.orm import Session
 from compliance_copilot import tracing
 from compliance_copilot.db import Chunk, get_engine, init_db
 from compliance_copilot.embeddings import get_embeddings
-from compliance_copilot.graph import REFUSAL_TEXT, CitationError
-from compliance_copilot.graph import ask as ask_graph
+from compliance_copilot.graph import REFUSAL_TEXT, CitationError, GraphContext
+from compliance_copilot.graph.build import build_graph
 from compliance_copilot.graph.nodes import make_llm
 from compliance_copilot.guards.classifier import make_classifier_llm
 from compliance_copilot.ingest.eurlex import REGULATIONS
 from compliance_copilot.ingest.pipeline import ingest
+from compliance_copilot.logging_filter import install_pii_scrub
 from compliance_copilot.settings import settings
 
 
 def main() -> None:
+    # ADR-0020: logging backstop (defence-in-depth only, see
+    # logging_filter.py's module docstring) — installed before any command
+    # below can log anything.
+    install_pii_scrub()
     parser = argparse.ArgumentParser(prog="compliance_copilot")
     # argparse subcommands over a bigger framework (click/typer): stdlib
     # covers "a handful of subcommands with a couple of flags" fine, and a
@@ -119,24 +124,27 @@ def main() -> None:
         embeddings = get_embeddings()
         llm = make_llm()
         # ADR-0019: `None` when CLASSIFIER_ENABLED=false — same "disabled
-        # means skip it" contract `ask_graph()`/`guard_in_node` already give
-        # a `None` classifier, so this is a one-line off switch here too.
+        # means skip it" contract `guard_in_node` already gives a `None`
+        # classifier, so this is a one-line off switch here too.
         classifier = make_classifier_llm() if settings.classifier_enabled else None
         # ADR-0009 amendment: a no-op config (empty callbacks list) when no
         # Langfuse keys are set — `tracing.run_config()` is a fresh function
-        # call per invocation, no different from calling `ask_graph` with no
-        # config= at all in that case.
+        # call per invocation, no different from calling `graph.invoke` with
+        # no config= at all in that case.
         config = tracing.run_config()
         with Session(get_engine()) as session:
+            # ADR-0020: calls the compiled graph directly (not the `ask()`
+            # convenience wrapper) so this command can read `pii_entities`
+            # off the final state — `ask()` deliberately keeps returning
+            # just `AnswerSchema` for its other callers (tests,
+            # test_graph_real_integration.py), so widening its signature
+            # for this one extra field isn't worth it (ponytail).
+            graph = build_graph()
+            context = GraphContext(
+                session=session, embeddings=embeddings, llm=llm, classifier=classifier
+            )
             try:
-                result = ask_graph(
-                    args.question,
-                    session=session,
-                    embeddings=embeddings,
-                    llm=llm,
-                    classifier=classifier,
-                    config=config,
-                )
+                state = graph.invoke({"question": args.question}, context=context, config=config)
             except CitationError as exc:
                 # Never print a half-validated answer alongside a refusal —
                 # the answer text and citations are simply not printed at
@@ -149,11 +157,18 @@ def main() -> None:
                 # guarantees this one trace is actually sent before that
                 # happens (tracing.py) — a no-op when tracing is disabled.
                 tracing.flush()
+            result = state["answer"]
+            # Entity TYPE names only (guards/pii.py's `redact()`) — never
+            # the redacted values, same "never echo the payload" rule the
+            # SSE `pii` field (api.py) already follows.
+            pii_entities = state.get("pii_entities") or ()
+            if pii_entities:
+                print(f"note: PII redacted ({', '.join(pii_entities)})", file=sys.stderr)
             # REFUSAL_TEXT is a fixed, module-level string (graph/nodes.py) —
             # comparing against it is how the CLI tells "the input guard
             # refused this" apart from "the model answered normally with no
-            # citations" (ask()'s signature stays `-> AnswerSchema` only, so
-            # there's no separate `refused` flag to check here, ADR-0018).
+            # citations" (there's no separate `refused` flag on
+            # `AnswerSchema` itself, ADR-0018).
             if result.answer == REFUSAL_TEXT:
                 print(f"REFUSED (input guard): {REFUSAL_TEXT}", file=sys.stderr)
                 sys.exit(3)

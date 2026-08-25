@@ -25,8 +25,8 @@ from sqlalchemy.orm import Session
 
 from compliance_copilot.db import Chunk, get_engine
 from compliance_copilot.embeddings import get_embeddings
-from compliance_copilot.graph import REFUSAL_TEXT, AnswerSchema
-from compliance_copilot.graph.build import ask
+from compliance_copilot.graph import REFUSAL_TEXT, AnswerSchema, GraphContext
+from compliance_copilot.graph.build import ask, build_graph
 from compliance_copilot.graph.nodes import make_llm
 from compliance_copilot.ingest import pipeline
 from compliance_copilot.settings import settings
@@ -178,5 +178,45 @@ def test_benign_instructions_question_against_full_corpus_is_not_refused():
             llm=make_llm(),
         )
 
+    assert isinstance(result, AnswerSchema)
+    assert result.answer != REFUSAL_TEXT
+
+
+@pytest.mark.skipif(
+    not os.environ.get(_PROVIDER_KEY_VAR) or _prod_chunk_count() < 100,
+    reason=f"{_PROVIDER_KEY_VAR} not set, or DATABASE_URL's chunk table has "
+    "fewer than 100 rows (not the full ingested corpus) — skipping the "
+    "full-corpus PII-redaction test",
+)
+def test_pii_question_against_full_corpus_still_retrieves_relevant_articles():
+    """ADR-0020: proves redaction doesn't damage the legal MEANING of the
+    question — real embeddings on the REDACTED text ("My client <PERSON>,
+    <EMAIL>, asks: is she a deployer under the AI Act?") must still
+    retrieve a relevant article. No CitationError is required (the model
+    may honestly return zero citations for a question this open-ended) —
+    only that retrieval worked and no raw PII survived anywhere in state.
+    Calls `build_graph()`/`.invoke()` directly (not the `ask()` wrapper) to
+    read `pii_entities`/`articles` off the final state."""
+    embeddings = get_embeddings()
+    with Session(get_engine()) as session:
+        graph = build_graph()
+        context = GraphContext(session=session, embeddings=embeddings, llm=make_llm())
+        state = graph.invoke(
+            {
+                "question": (
+                    "My client Anna Schmidt, anna@x.de, asks: is she a deployer under the AI Act?"
+                )
+            },
+            context=context,
+        )
+
+    assert set(state["pii_entities"]) >= {"PERSON", "EMAIL_ADDRESS"}
+    assert "Anna Schmidt" not in state["question"]
+    assert "anna@x.de" not in state["question"]
+    retrieved_anchors = {a.anchor for a in state["articles"]}
+    assert retrieved_anchors & {"art_3", "art_26"}, (
+        f"expected art_3 or art_26 among retrieved articles, got {retrieved_anchors}"
+    )
+    result = state["answer"]
     assert isinstance(result, AnswerSchema)
     assert result.answer != REFUSAL_TEXT

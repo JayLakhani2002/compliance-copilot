@@ -120,11 +120,18 @@ class GraphState(TypedDict):
     (ADR-0015): a failed `answer_node` call stores its rejected `AnswerSchema`
     and the validation error here instead of raising immediately, so
     `route_after_answer` (build.py) can send the graph back to `answer` once
-    with that context appended as extra message turns."""
+    with that context appended as extra message turns.
+
+    `pii_entities` (ADR-0020): entity TYPE names only (e.g.
+    ("EMAIL_ADDRESS", "PERSON")), never present when nothing was found —
+    `guard_in_node` sets it in the SAME return dict that overwrites
+    `question` with the redacted text, so this key's presence always means
+    "the `question` you're reading has already been redacted"."""
 
     question: str
     guard: NotRequired[GuardResult]
     refused: NotRequired[bool]
+    pii_entities: NotRequired[tuple[str, ...]]
     articles: NotRequired[list[RetrievedChunk]]
     recitals: NotRequired[list[RetrievedChunk]]
     answer: NotRequired[AnswerSchema | None]
