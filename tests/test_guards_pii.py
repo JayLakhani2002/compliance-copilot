@@ -278,3 +278,9 @@ def test_german_lowercase_phrase_not_over_redacted():
     out = redact("Hans Müller betreibt ein KI-System zur Bewertung von Bewerbern.")
     assert "Hans Müller" not in out.text
     assert "zur Bewertung von Bewerbern" in out.text
+
+
+def test_capitalised_german_noun_not_a_person():
+    out = redact("DSGVO Art. 4 Nr. 1 definiert personenbezogene Daten.")
+    assert out.text == "DSGVO Art. 4 Nr. 1 definiert personenbezogene Daten."
+    assert out.entities == ()
