@@ -14,17 +14,27 @@
 # single-regulation ones, so the scorer never branches on entry.regulation —
 # one format, one comparison, always unambiguous (see run_variant() below).
 #
-# Real embeddings only, via get_embeddings() (ADR-0004) — costs a few cents
-# per run against OPENAI_API_KEY, so run it locally, once or twice, not in
-# a loop:
+# Real embeddings by default, via get_embeddings() (ADR-0004) — costs a few
+# cents per run against OPENAI_API_KEY, so run it locally, once or twice,
+# not in a loop:
 #     set -a && . ./.env && set +a
 #     uv run python -m evals.run_retrieval_eval --variant plain
 #     uv run python -m evals.run_retrieval_eval --variant articles
 #
-# `EVAL_HIT5_MIN` (default "0"): exits nonzero if overall hit@5 falls below
-# this threshold — the "eval as CI gate" mechanism ADR-0013 calls for. 0 by
-# default so a first/local run never fails before a real threshold is
-# chosen (lesson 05: "wired when the numbers stabilise").
+# `--embeddings cached` (ADR-0017): swaps in CachedEmbeddings, which reads
+# the 30 golden questions' REAL vectors from evals/embeddings_cache/queries.jsonl
+# instead of calling OpenAI — this is what CI's `quality-gate` job uses, so
+# the retrieval gate runs on every PR with no API key and no network call.
+# The corpus side needs no cache-awareness here: retrieve() only ever calls
+# embed_query() on the question, never embed_documents() — the corpus's own
+# vectors are already sitting in the DB from whatever ingested them.
+#
+# `--hit5-min`/`--mrr-min` (also settable via `EVAL_HIT5_MIN`/`EVAL_MRR_MIN`
+# env vars, for backward compatibility with the original mechanism): exits
+# nonzero if overall hit@5 or MRR falls below these thresholds — the "eval
+# as CI gate" mechanism ADR-0013 introduced and ADR-0017 extends with an MRR
+# gate. Both default to "0" so a first/local run never fails before a real
+# threshold is chosen (lesson 05: "wired when the numbers stabilise").
 from __future__ import annotations
 
 import argparse
@@ -35,6 +45,7 @@ from pathlib import Path
 
 from sqlalchemy.orm import Session
 
+from compliance_copilot.cached_embeddings import CachedEmbeddings
 from compliance_copilot.db import get_engine
 from compliance_copilot.embeddings import get_embeddings
 from compliance_copilot.retriever import retrieve
@@ -119,7 +130,7 @@ def _mrr(results: list[QuestionResult]) -> float:
     return sum((1 / r.rank) if r.rank else 0.0 for r in results) / len(results) if results else 0.0
 
 
-def print_report(results: list[QuestionResult], variant: str) -> float:
+def print_report(results: list[QuestionResult], variant: str) -> tuple[float, float]:
     print(f"\n=== retrieval eval — variant={variant!r} (k={K}) ===\n")
     print(f"{'id':<6} {'category':<11} {'expected':<26} {'result':<10} question")
     for r in results:
@@ -140,28 +151,46 @@ def print_report(results: list[QuestionResult], variant: str) -> float:
             f"MRR={_mrr(cat_results):.3f}  n={len(cat_results)}"
         )
 
-    return overall_hit5
+    return overall_hit5, overall_mrr
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--variant", choices=sorted(VARIANTS), required=True)
+    # Default "articles" (not required=True, as before): ADR-0013's decision
+    # is articles-first, so that's the variant the CI gate and any casual
+    # local run should exercise unless a comparison run explicitly asks for
+    # "plain".
+    parser.add_argument("--variant", choices=sorted(VARIANTS), default="articles")
+    parser.add_argument(
+        "--embeddings",
+        choices=("cached", "real"),
+        default="real",
+        help="'cached' uses CachedEmbeddings (ADR-0017) — no API key, no network.",
+    )
+    # str, not float, env default — os.environ values are always strings;
+    # "0" parses the same as 0 would, and keeps this one type all the way
+    # through. A --hit5-min/--mrr-min flag on the command line always wins
+    # over the env var (CI passes these explicitly).
+    parser.add_argument(
+        "--hit5-min", type=float, default=float(os.environ.get("EVAL_HIT5_MIN", "0"))
+    )
+    parser.add_argument("--mrr-min", type=float, default=float(os.environ.get("EVAL_MRR_MIN", "0")))
     args = parser.parse_args()
 
     entries = load_golden()
-    embeddings = get_embeddings()
+    embeddings = CachedEmbeddings() if args.embeddings == "cached" else get_embeddings()
     with Session(get_engine()) as session:
         results = run_variant(entries, VARIANTS[args.variant], session, embeddings)
 
-    overall_hit5 = print_report(results, args.variant)
+    overall_hit5, overall_mrr = print_report(results, args.variant)
 
-    # str, not float, default — os.environ values are always strings; "0"
-    # parses the same as 0 would, and keeps this one type all the way through.
-    threshold = float(os.environ.get("EVAL_HIT5_MIN", "0"))
-    if overall_hit5 < threshold:
-        raise SystemExit(
-            f"hit@{K}={overall_hit5:.3f} below EVAL_HIT5_MIN={threshold:.3f} — failing as a CI gate"
-        )
+    failures = []
+    if overall_hit5 < args.hit5_min:
+        failures.append(f"hit@{K}={overall_hit5:.3f} below --hit5-min={args.hit5_min:.3f}")
+    if overall_mrr < args.mrr_min:
+        failures.append(f"MRR={overall_mrr:.3f} below --mrr-min={args.mrr_min:.3f}")
+    if failures:
+        raise SystemExit("; ".join(failures) + " — failing as a CI gate")
 
 
 if __name__ == "__main__":

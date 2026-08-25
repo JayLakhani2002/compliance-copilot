@@ -34,3 +34,13 @@ curl -sN -X POST localhost:8000/ask -H "Content-Type: application/json" \
 ```
 
 Set `LANGFUSE_PUBLIC_KEY`/`LANGFUSE_SECRET_KEY`/`LANGFUSE_BASE_URL` to enable tracing (Langfuse Cloud, EU) — unset by default, so the app runs with zero tracing until you do.
+
+## Quality gates
+
+Two CI gates: **`quality-gate`** (retrieval hit@5/MRR) runs on every PR against
+committed, real, cached embeddings — no API key, no network call. **`answer-quality`**
+(LLM-as-judge faithfulness) needs a real key, so it only runs nightly, on
+manual dispatch, or on a PR labelled `quality-gate`. Refresh the committed
+embedding cache after changing the golden sets, the corpus, or the embedding
+model with `make eval-cache` (needs `OPENAI_API_KEY`); run the gates locally
+with `make quality-gate` and `uv run python -m evals.run_answer_eval`.
