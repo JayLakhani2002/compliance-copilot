@@ -9,6 +9,7 @@ from __future__ import annotations
 import html
 import logging
 import re
+import time
 from typing import Any
 
 from langchain_anthropic import ChatAnthropic
@@ -22,7 +23,8 @@ from compliance_copilot.graph.state import (
     GraphContext,
     GraphState,
 )
-from compliance_copilot.guards.injection import detect
+from compliance_copilot.guards.classifier import classify
+from compliance_copilot.guards.injection import GuardResult, detect
 from compliance_copilot.retriever import RetrievedChunk, retrieve
 from compliance_copilot.settings import settings
 
@@ -92,12 +94,26 @@ def _system_message() -> tuple[str, str] | SystemMessage:
     return ("system", SYSTEM_PROMPT)
 
 
-def guard_in_node(state: GraphState) -> dict:
+def guard_in_node(state: GraphState, runtime: Runtime[GraphContext]) -> dict:
     """Node 0: runs before `retrieve`/`answer` ever touch the question
-    (docs/THREAT_MODEL.md, ADR-0018). No `runtime` param — unlike
-    `retrieve_node`/`answer_node`, this doesn't need `GraphContext` (no DB,
-    no LLM), same reasoning `build.py`'s `route_after_answer` already gives
-    for skipping it on a callable that doesn't need it.
+    (docs/THREAT_MODEL.md, ADR-0018/0019). Takes `runtime` (unlike Day 11's
+    version) because layer 2 (the classifier) lives in `GraphContext` — the
+    heuristic layer alone needed no dependencies, the classifier does.
+
+    Heuristics run first, always: they're free (stdlib, sub-millisecond) and
+    catch known attack shapes. A heuristics flag refuses immediately —
+    `runtime.context.classifier` is never even consulted, so a
+    already-known-bad question never spends a model call (ADR-0019's cost
+    reasoning). Only a heuristics-CLEAN question reaches the classifier
+    (layer 2, catches paraphrased/multilingual attacks the regexes can't).
+
+    `classify()` (guards/classifier.py) returns `None` on any classifier
+    outage — that's fail-OPEN, so an outage never blocks the product,
+    heuristics keep running underneath regardless. A `block` verdict at or
+    above `settings.classifier_block_confidence` is fail-CLOSED: trusted,
+    refused, with `reasons=("classifier:<category>",)` and `score` set to
+    the verdict's confidence (`GuardResult` gains no new fields — reused
+    exactly as the heuristic layer already fills them).
 
     Logs category names + score only on a flag — never the question or the
     matched text (`GuardResult.reasons` is built that way already, see
@@ -105,6 +121,27 @@ def guard_in_node(state: GraphState) -> dict:
     result = detect(state["question"], threshold=settings.guard_threshold)
     if result.flagged:
         logger.info("guard_in flagged reasons=%s score=%s", result.reasons, result.score)
+        return {"guard": result}
+
+    classifier = runtime.context.classifier
+    if classifier is not None:
+        started = time.monotonic()
+        verdict = classify(state["question"], classifier)
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        if (
+            verdict is not None
+            and verdict.verdict == "block"
+            and verdict.confidence >= settings.classifier_block_confidence
+        ):
+            logger.info(
+                "guard_in classifier block category=%s confidence=%s elapsed_ms=%d",
+                verdict.category,
+                verdict.confidence,
+                elapsed_ms,
+            )
+            result = GuardResult(
+                flagged=True, score=verdict.confidence, reasons=(f"classifier:{verdict.category}",)
+            )
     return {"guard": result}
 
 

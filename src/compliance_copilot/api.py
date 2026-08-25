@@ -43,6 +43,7 @@ from compliance_copilot.db import get_session
 from compliance_copilot.graph import CitationError, GraphContext
 from compliance_copilot.graph.build import build_graph
 from compliance_copilot.graph.nodes import make_llm
+from compliance_copilot.guards.classifier import make_classifier_llm
 from compliance_copilot.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -104,6 +105,18 @@ def get_llm_dependency() -> Any:
 @lru_cache(maxsize=1)
 def get_embeddings_dependency() -> Embeddings:
     return embeddings_module.get_embeddings()
+
+
+@lru_cache(maxsize=1)
+def get_classifier_dependency() -> Any | None:
+    """ADR-0019: `None` when `settings.classifier_enabled` is `False` —
+    `guard_in_node` treats a `None` classifier as "layer 2 disabled",
+    skipping straight past it (same as before this feature existed). Built
+    once at `lifespan()` startup (below), same `lru_cache(maxsize=1)`
+    "build once per process" reasoning as `get_llm_dependency` above."""
+    if not settings.classifier_enabled:
+        return None
+    return make_classifier_llm()
 
 
 # ---------------------------------------------------------------------------
@@ -192,16 +205,24 @@ def _sse(event: str, data: dict) -> str:
 
 
 async def _stream_answer(
-    question: str, *, session: Session, embeddings: Embeddings, llm: Any
+    question: str,
+    *,
+    session: Session,
+    embeddings: Embeddings,
+    llm: Any,
+    classifier: Any | None,
 ) -> AsyncIterator[str]:
     """The `/ask` response body: runs the compiled graph via `astream(...,
     stream_mode='updates')`, translating each node's partial state into an
     SSE event. Never yields the question or full chunk text — only node
     names, article/recital anchors, attempt counts, and (on failure) a
     citation-error message built solely from anchors (see
-    `CitationError`'s own docstring, state.py)."""
+    `CitationError`'s own docstring, state.py).
+
+    `classifier`: ADR-0019's layer-2 guard, `None` when disabled
+    (`get_classifier_dependency` above)."""
     graph = build_graph()
-    context = GraphContext(session=session, embeddings=embeddings, llm=llm)
+    context = GraphContext(session=session, embeddings=embeddings, llm=llm, classifier=classifier)
     started = time.monotonic()
     # One config per request: `run_config()` builds a fresh CallbackHandler
     # (or `[]` when tracing is disabled, tracing.py) and a request-scoped
@@ -323,6 +344,11 @@ async def lifespan(app: FastAPI):
     # call just moves the one-time build earlier; it's a no-op if a request
     # already triggered it first.
     build_graph()
+    # Same reasoning for the classifier client (ADR-0019) — a request-time
+    # first-call cost would otherwise land on whichever caller happens to
+    # be first, instead of on startup where a slow LLM client construction
+    # belongs.
+    get_classifier_dependency()
     yield
     # `shutdown()`, not `flush()`: this runs once as the process exits, so it
     # should also stop Langfuse's background consumer threads (tracing.py) —
@@ -375,8 +401,11 @@ async def ask(
     session: Session = Depends(get_session),
     embeddings: Embeddings = Depends(get_embeddings_dependency),
     llm: Any = Depends(get_llm_dependency),
+    classifier: Any | None = Depends(get_classifier_dependency),
 ) -> StreamingResponse:
-    generator = _stream_answer(req.question, session=session, embeddings=embeddings, llm=llm)
+    generator = _stream_answer(
+        req.question, session=session, embeddings=embeddings, llm=llm, classifier=classifier
+    )
     return StreamingResponse(
         generator,
         media_type="text/event-stream",
