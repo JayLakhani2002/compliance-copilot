@@ -85,11 +85,17 @@ def ask(
     session: Session,
     embeddings: Embeddings,
     llm: Any,
+    classifier: Any | None = None,
     config: dict | None = None,
 ) -> AnswerSchema:
     """Convenience entry point: runs the compiled graph for one question and
     returns just the final `AnswerSchema` (rather than making every caller —
     cli.py, tests — reach into the raw state dict).
+
+    `classifier`: ADR-0019's layer-2 guard, forwarded into `GraphContext`.
+    `None` (the default) disables it — `guard_in_node` skips straight past
+    the classifier check, same as before this feature existed, so every
+    existing caller that doesn't pass one is unaffected.
 
     `config`: optional LangChain `RunnableConfig` dict (ADR-0009 amendment —
     `tracing.run_config()` builds one carrying a Langfuse callback when
@@ -98,6 +104,6 @@ def ask(
     additive, not a behaviour change for existing callers/tests that don't
     pass one."""
     graph = build_graph()
-    context = GraphContext(session=session, embeddings=embeddings, llm=llm)
+    context = GraphContext(session=session, embeddings=embeddings, llm=llm, classifier=classifier)
     state = graph.invoke({"question": question}, context=context, config=config)
     return state["answer"]

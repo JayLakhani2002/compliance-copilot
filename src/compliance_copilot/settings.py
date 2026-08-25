@@ -101,5 +101,27 @@ class Settings(BaseSettings):
     # retuning after real traffic.
     guard_threshold: float = 1.0
 
+    # ADR-0019: layer 2 of `guard_in` — a cheap-LLM classifier that catches
+    # paraphrased/multilingual attacks the heuristic layer's regexes can't.
+    # `False` skips constructing/calling it entirely (`get_classifier_
+    # dependency()` in api.py returns `None`, cli.py passes `None`) — the
+    # one-line reversal a classifier-outage incident would reach for first.
+    classifier_enabled: bool = True
+    # `None` = "use make_classifier_llm()'s per-provider default" (openai ->
+    # gpt-4.1-nano, anthropic -> claude-haiku-4-5), same "flip the provider,
+    # get the right model for free" reasoning as `answer_model` above. Set
+    # CLASSIFIER_MODEL only to override.
+    classifier_model: str | None = None
+    # Bounds one slow classifier call so it can't stall every request — a
+    # timeout here is one more input to `classify()`'s fail-open path
+    # (guards/classifier.py), not a hard failure.
+    classifier_timeout_s: float = 3.0
+    # `guard_in_node`'s cutoff for trusting a classifier "block" verdict
+    # (guards/classifier.py's `Verdict.confidence`, 0-1). Below this, the
+    # verdict is treated the same as "allow" — a low-confidence block isn't
+    # worth refusing a real user over. One-line tuning knob if real traffic
+    # shows the balance needs adjusting.
+    classifier_block_confidence: float = 0.6
+
 
 settings = Settings()

@@ -21,8 +21,10 @@ from compliance_copilot.embeddings import get_embeddings
 from compliance_copilot.graph import REFUSAL_TEXT, CitationError
 from compliance_copilot.graph import ask as ask_graph
 from compliance_copilot.graph.nodes import make_llm
+from compliance_copilot.guards.classifier import make_classifier_llm
 from compliance_copilot.ingest.eurlex import REGULATIONS
 from compliance_copilot.ingest.pipeline import ingest
+from compliance_copilot.settings import settings
 
 
 def main() -> None:
@@ -116,6 +118,10 @@ def main() -> None:
     elif args.command == "ask":
         embeddings = get_embeddings()
         llm = make_llm()
+        # ADR-0019: `None` when CLASSIFIER_ENABLED=false — same "disabled
+        # means skip it" contract `ask_graph()`/`guard_in_node` already give
+        # a `None` classifier, so this is a one-line off switch here too.
+        classifier = make_classifier_llm() if settings.classifier_enabled else None
         # ADR-0009 amendment: a no-op config (empty callbacks list) when no
         # Langfuse keys are set — `tracing.run_config()` is a fresh function
         # call per invocation, no different from calling `ask_graph` with no
@@ -124,7 +130,12 @@ def main() -> None:
         with Session(get_engine()) as session:
             try:
                 result = ask_graph(
-                    args.question, session=session, embeddings=embeddings, llm=llm, config=config
+                    args.question,
+                    session=session,
+                    embeddings=embeddings,
+                    llm=llm,
+                    classifier=classifier,
+                    config=config,
                 )
             except CitationError as exc:
                 # Never print a half-validated answer alongside a refusal —

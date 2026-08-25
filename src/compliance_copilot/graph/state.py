@@ -96,6 +96,13 @@ class GraphContext:
     # into the type nodes.py depends on, and would make the test fake in
     # tests/test_graph.py fail a strict type check for no real benefit.
     llm: Any
+    # ADR-0019: layer 2 of `guard_in` — an object with `.invoke(messages)
+    # -> Verdict` (guards/classifier.py's `make_classifier_llm()` return
+    # value), or `None` to disable the classifier entirely (settings.
+    # classifier_enabled=False). Defaults `None` so every existing caller
+    # that builds a `GraphContext` without it (tests, any code that hasn't
+    # been touched by this feature) keeps working unchanged.
+    classifier: Any | None = None
 
 
 class GraphState(TypedDict):
