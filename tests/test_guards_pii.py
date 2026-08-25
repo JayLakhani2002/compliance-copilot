@@ -170,7 +170,10 @@ class _PassLLM:
 
     def invoke(self, messages):
         self.messages = messages
-        return AnswerSchema(answer="ok", citations=[])
+        # >= 3 chars: ADR-0021's guard_out flags a shorter answer as
+        # empty_answer, which would refuse this test's otherwise-passing
+        # redaction path for an unrelated reason.
+        return AnswerSchema(answer="acknowledged", citations=[])
 
 
 class _UnusedLLM:

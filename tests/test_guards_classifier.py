@@ -177,7 +177,9 @@ def test_classifier_block_stream_visits_guard_in_then_refuse_never_retrieve():
             {"question": PARAPHRASED_QUESTION}, context=context, stream_mode="updates"
         )
     ]
-    assert nodes_visited == ["guard_in", "refuse"]
+    # ADR-0021: `guard_out` runs on every terminal path now, this
+    # classifier-block refusal included.
+    assert nodes_visited == ["guard_in", "refuse", "guard_out"]
 
 
 # --- classifier disabled (None) is a complete no-op ----------------------

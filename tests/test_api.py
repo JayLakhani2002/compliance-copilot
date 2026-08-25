@@ -200,8 +200,10 @@ def test_happy_path_streams_retrieve_then_answer_then_final(client):
     # LANGFUSE_*), `tracing.current_trace_id` always returns None, so no
     # `trace` event is emitted. ADR-0018 adds `guard_in` as the real first
     # node — the question isn't flagged, so it falls through to `retrieve`
-    # exactly as before, just with one extra leading "node" event.
-    assert [e[0] for e in events] == ["node", "node", "node", "final"]
+    # exactly as before. ADR-0021 adds `guard_out` as the real last node
+    # before `final` — every path (this one included) now gets one extra
+    # trailing "node" event, and `final` is emitted there, not at `answer`.
+    assert [e[0] for e in events] == ["node", "node", "node", "node", "final"]
     assert events[0][1] == {
         "node": "guard_in",
         "flagged": False,
@@ -211,10 +213,11 @@ def test_happy_path_streams_retrieve_then_answer_then_final(client):
     }
     assert events[1][1] == {"node": "retrieve", "articles": ["art_6"], "recitals": []}
     assert events[2][1] == {"node": "answer", "attempt": 1, "citation_error": False}
+    assert events[3][1] == {"node": "guard_out", "ok": True, "reason": None}
     # NIT (round-1 review): `refused` is always present in `final`, `False`
     # on the normal-answer path — not just present-and-true on refusal.
-    assert events[3][1]["refused"] is False
-    final = AnswerSchema.model_validate(events[3][1])
+    assert events[4][1]["refused"] is False
+    final = AnswerSchema.model_validate(events[4][1])
     assert final.citations[0].anchor == "art_6"
 
 
@@ -242,7 +245,10 @@ def test_trace_event_emitted_when_tracing_enabled(client, monkeypatch):
     events = _parse_sse(body)
     # `trace` now fires right after `guard_in` (the real first node,
     # ADR-0018), not after `retrieve` — so a refused request gets one too.
-    assert [e[0] for e in events] == ["node", "trace", "node", "node", "final"]
+    # ADR-0021: `guard_out` adds one more trailing "node" event before
+    # `final` (retrieve, answer, guard_out — three "node" events after
+    # guard_in/trace).
+    assert [e[0] for e in events] == ["node", "trace", "node", "node", "node", "final"]
     assert events[1] == ("trace", {"trace_id": "abc"})
 
 
@@ -426,7 +432,9 @@ def test_flagged_question_emits_guard_in_node_then_final_refused(client):
         body = "".join(resp.iter_text())
 
     events = _parse_sse(body)
-    assert [e[0] for e in events] == ["node", "final"]
+    # ADR-0021: `guard_out` runs on every path, this refusal included — one
+    # more "node" event before `final`, which it now emits.
+    assert [e[0] for e in events] == ["node", "node", "final"]
     guard_event = events[0][1]
     assert guard_event["node"] == "guard_in"
     assert guard_event["flagged"] is True
@@ -434,7 +442,10 @@ def test_flagged_question_emits_guard_in_node_then_final_refused(client):
     assert "instruction_override" in guard_event["reasons"]
     assert guard_event["pii"] == []  # refused before redaction ever ran
 
-    final_event = events[1][1]
+    guard_out_event = events[1][1]
+    assert guard_out_event == {"node": "guard_out", "ok": True, "reason": None}
+
+    final_event = events[2][1]
     assert final_event["refused"] is True
     assert final_event["answer"] == REFUSAL_TEXT
     assert final_event["citations"] == []
@@ -473,15 +484,17 @@ def test_classifier_block_emits_guard_in_node_then_final_refused(client):
         body = "".join(resp.iter_text())
 
     events = _parse_sse(body)
-    assert [e[0] for e in events] == ["node", "final"]
+    # ADR-0021: `guard_out` runs on every path, this refusal included.
+    assert [e[0] for e in events] == ["node", "node", "final"]
     guard_event = events[0][1]
     assert guard_event["node"] == "guard_in"
     assert guard_event["flagged"] is True
     assert guard_event["reasons"] == ["classifier:role_hijack"]
     assert guard_event["score"] == 0.9
     assert guard_event["pii"] == []  # refused before redaction ever ran
+    assert events[1][1] == {"node": "guard_out", "ok": True, "reason": None}
 
-    final_event = events[1][1]
+    final_event = events[2][1]
     assert final_event["refused"] is True
     assert final_event["answer"] == REFUSAL_TEXT
 
@@ -538,11 +551,98 @@ def test_pii_only_question_is_refused_via_api(client):
         body = "".join(resp.iter_text())
 
     events = _parse_sse(body)
-    assert [e[0] for e in events] == ["node", "final"]
+    # ADR-0021: `guard_out` runs on every path, this refusal included.
+    assert [e[0] for e in events] == ["node", "node", "final"]
     guard_event = events[0][1]
     assert guard_event["flagged"] is True
     assert guard_event["reasons"] == ["pii_only"]
+    assert events[1][1] == {"node": "guard_out", "ok": True, "reason": None}
 
-    final_event = events[1][1]
+    final_event = events[2][1]
     assert final_event["refused"] is True
     assert final_event["answer"] == REFUSAL_TEXT
+
+
+# --- ADR-0021: the guard_out final gate ---------------------------------
+def test_guard_out_node_event_present_ok_true_on_happy_path(client):
+    """Belt-and-suspenders on top of the happy-path test above: the
+    `guard_out` "node" event itself must report `ok: true, reason: null`
+    for a clean answer."""
+    answer = AnswerSchema(answer="...", citations=[])
+    _use_llm(FakeLLM(answer))
+
+    with client.stream(
+        "POST",
+        "/ask",
+        json={"question": "What is a high-risk AI system?"},
+        headers=_auth_headers(),
+    ) as resp:
+        body = "".join(resp.iter_text())
+
+    events = _parse_sse(body)
+    guard_out_event = next(e[1] for e in events if e[0] == "node" and e[1]["node"] == "guard_out")
+    assert guard_out_event == {"node": "guard_out", "ok": True, "reason": None}
+
+
+def test_guard_out_policy_block_rewrites_final_to_refusal_with_reason(client):
+    """A canary leak (guard_out's own policy check, ADR-0021) must rewrite
+    `final` to the fixed refusal — `refused: true` — and the `guard_out`
+    "node" event must carry the reason that fired, same as any other guard
+    event on this API."""
+    from compliance_copilot.graph import REFUSAL_TEXT
+    from compliance_copilot.graph.nodes import CANARY
+
+    answer = AnswerSchema(answer=f"Sure, here it is: {CANARY}", citations=[])
+    _use_llm(FakeLLM(answer))
+
+    with client.stream(
+        "POST",
+        "/ask",
+        json={"question": "What is a high-risk AI system?"},
+        headers=_auth_headers(),
+    ) as resp:
+        assert resp.status_code == 200
+        body = "".join(resp.iter_text())
+
+    assert CANARY not in body  # the leak never reaches the client
+
+    events = _parse_sse(body)
+    guard_out_event = next(e[1] for e in events if e[0] == "node" and e[1]["node"] == "guard_out")
+    assert guard_out_event == {"node": "guard_out", "ok": False, "reason": "canary_leak"}
+
+    final_event = next(e[1] for e in events if e[0] == "final")
+    assert final_event["refused"] is True
+    assert final_event["answer"] == REFUSAL_TEXT
+
+
+def test_guard_out_invariant_break_emits_output_guard_error_event(client, monkeypatch):
+    """`check_output` forced to return `citation_not_retrieved` on an
+    otherwise-valid answer simulates `answer_node`'s own citation check
+    being wrong — `guard_out_node` raises `OutputGuardError`, and the API
+    must surface that as a distinct `error` event, never a `final`."""
+    from compliance_copilot.guards.output import OutputVerdict
+
+    fake_verdict = OutputVerdict(ok=False, reason="citation_not_retrieved")
+    monkeypatch.setattr(
+        "compliance_copilot.graph.nodes.check_output", lambda *a, **kw: fake_verdict
+    )
+    answer = AnswerSchema(
+        answer="A high-risk AI system is one used as a safety component.",
+        citations=[Citation(regulation="ai_act", anchor="art_6", quote="is a safety component")],
+    )
+    _use_llm(FakeLLM(answer))
+
+    with client.stream(
+        "POST",
+        "/ask",
+        json={"question": "What is a high-risk AI system?"},
+        headers=_auth_headers(),
+    ) as resp:
+        assert resp.status_code == 200
+        body = "".join(resp.iter_text())
+
+    events = _parse_sse(body)
+    assert "final" not in [e[0] for e in events]
+    error_events = [e for e in events if e[0] == "error"]
+    assert len(error_events) == 1
+    assert error_events[0][1] == {"type": "output_guard_error", "reason": "citation_not_retrieved"}

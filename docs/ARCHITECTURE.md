@@ -85,21 +85,28 @@ C4Container
 
 A **node** is a Python function that reads and updates shared state; an **edge** decides which node runs next. **Interrupt** means the graph pauses mid-run and waits for external input (a human) before resuming — LangGraph persists the paused state to the Postgres checkpointer so the pause can outlast the process.
 
+Solid edges below are the actual compiled graph (`graph/build.py`) as it
+exists today; dashed edges mark where `router`/`critic`/`hitl` are *designed*
+to sit once built — none of the three exist as nodes yet (`grep -rn
+"add_node" src/compliance_copilot/graph/build.py` is the source of truth).
+
 ```mermaid
 flowchart TD
-    START([START]) --> guard_in[guard_in\nprompt-injection heuristics + Haiku classifier\nPII detection/redaction · topic/scope check]
-    guard_in -- blocked --> refuse_in[refusal response]
-    refuse_in --> guard_out
-    guard_in -- clean --> router[router\nHaiku: classify question type\n+ pick retrieval strategy]
-    router --> retrieve[retrieve\ncalls MCP tools:\nsearch_regulation / get_article]
-    retrieve --> answer[answer\nSonnet drafts answer\nPydantic structured output + citations]
-    answer --> critic[critic\nHaiku LLM-judge: citation exists?\nfaithful to retrieved text? confidence score]
-    critic -- confidence >= threshold --> guard_out[guard_out\ncitation-must-exist check\nPydantic schema validation\nrefusal policy]
-    critic -- confidence < threshold --> hitl[["interrupt()\npause, persist state to Postgres checkpoint,\nsurface draft + reasoning to operator"]]
-    hitl -- operator approves / edits --> guard_out
-    hitl -- operator rejects --> refuse_out[refusal response]
-    refuse_out --> guard_out
+    START([START]) --> guard_in[guard_in\nprompt-injection heuristics + Haiku classifier\nPII detection/redaction]
+    guard_in -- blocked --> refuse[refuse\nfixed refusal text, AnswerSchema shape]
+    guard_in -- clean --> retrieve[retrieve\narticles-first search + recital context]
+    guard_in -. clean .-> router{{router (planned, Week 4)\nHaiku: classify question type\n+ pick retrieval strategy}}
+    retrieve --> answer[answer\nSonnet/GPT drafts answer\nstructured output + citations\nself-validates, retries once]
+    answer -- citation invalid, retry left --> answer
+    answer -- retries exhausted --> fail[["fail\nraises CitationError"]]
+    answer -- citations valid --> guard_out[guard_out\ncanary / scaffold / PII-placeholder leak checks\nscope heuristic · citation-retrieved invariant]
+    answer -. citations valid .-> critic{{critic (planned, Week 4)\nHaiku LLM-judge: faithful to retrieved text?\nconfidence score}}
+    critic -.-> hitl[["hitl (planned, Week 4)\ninterrupt(): pause, persist checkpoint,\nsurface draft + reasoning to operator"]]
+    refuse --> guard_out
     guard_out --> END([END, streamed to client])
+
+    classDef planned stroke-dasharray: 5 5,fill:#eee,color:#666;
+    class router,critic,hitl planned;
 ```
 
 State carried through the graph (conceptually — the actual `TypedDict`/Pydantic schema is defined in code, not here): the original question, redacted question, classification, retrieved chunks with article IDs, draft answer, citation list, critic confidence score and reasoning, and a running list of guardrail events (for the trace and for the refusal message if one is needed).

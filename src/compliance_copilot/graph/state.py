@@ -33,6 +33,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from compliance_copilot.guards.injection import GuardResult
+from compliance_copilot.guards.output import OutputVerdict
 from compliance_copilot.retriever import RetrievedChunk
 
 
@@ -107,9 +108,9 @@ class GraphContext:
 
 class GraphState(TypedDict):
     """Shared state threaded through `guard_in` -> (`retrieve` -> `answer` ->
-    (`answer` | `fail`)) | `refuse`. Keys nodes don't fill in until they run
-    are `NotRequired` so the initial `{"question": ...}` dict passed to
-    `.invoke()` is still valid input.
+    (`answer` -> `guard_out` | `fail`)) | (`refuse` -> `guard_out`). Keys
+    nodes don't fill in until they run are `NotRequired` so the initial
+    `{"question": ...}` dict passed to `.invoke()` is still valid input.
 
     `guard`/`refused` back Day 11's input guard (ADR-0018): `guard_in_node`
     (nodes.py) always fills `guard`; `refused` is only set `True` by
@@ -126,7 +127,13 @@ class GraphState(TypedDict):
     ("EMAIL_ADDRESS", "PERSON")), never present when nothing was found —
     `guard_in_node` sets it in the SAME return dict that overwrites
     `question` with the redacted text, so this key's presence always means
-    "the `question` you're reading has already been redacted"."""
+    "the `question` you're reading has already been redacted".
+
+    `output_guard` (ADR-0021): set by `guard_out_node`, the final gate that
+    runs on EVERY terminal path — a passed answer, a `guard_in` refusal, and
+    an exhausted-retry failure all funnel through it before END. Always
+    present once that node has run; its `ok`/`reason` are safe to log (see
+    guards/output.py's `OutputVerdict`)."""
 
     question: str
     guard: NotRequired[GuardResult]
@@ -138,3 +145,4 @@ class GraphState(TypedDict):
     draft: NotRequired[AnswerSchema | None]
     citation_error: NotRequired[str | None]
     attempts: NotRequired[int]
+    output_guard: NotRequired[OutputVerdict]
