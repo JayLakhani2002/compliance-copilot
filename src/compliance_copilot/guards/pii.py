@@ -203,7 +203,17 @@ def redact(text: str, language: str | None = None) -> RedactionResult:
             )
             if _looks_like_name(text[r.start : r.end])
         ]
-    results = [r for r in results if not _is_legal_identifier(text[r.start : r.end])]
+    # The same name-shape rule applies to every PERSON span, whichever model
+    # produced it: de_core_news_sm tagged the single token "Daten" in
+    # "personenbezogene Daten" as PERSON. Trade: a lone surname ("Müller")
+    # is not redacted — in a legal question a person is almost always
+    # named with two tokens ("Herr Müller", "Hans Müller").
+    results = [
+        r
+        for r in results
+        if not _is_legal_identifier(text[r.start : r.end])
+        and (r.entity_type != "PERSON" or _looks_like_name(text[r.start : r.end]))
+    ]
     if not results:
         return RedactionResult(text=text, entities=())
 
