@@ -53,7 +53,7 @@ C4Container
     Container_Boundary(vps, "Hetzner VPS (Germany)") {
         Container(caddy, "Caddy", "reverse proxy", "TLS termination, routes api.example.com")
         Container(api, "api", "FastAPI + LangGraph, Python 3.12", "Guardrails, graph orchestration, SSE streaming, API-key auth, rate limiting")
-        Container(mcp, "mcp-server", "Python, mcp SDK v2 (FastMCP-style)", "search_regulation, get_article, cite tools")
+        Container(mcp, "mcp-server", "Python, mcp SDK 1.29.1 (FastMCP)", "search_regulation, get_article, cite tools")
         ContainerDb(pg, "postgres", "PostgreSQL 16 + pgvector", "documents, chunks+embeddings, LangGraph checkpoints, eval results")
         Container(langfuse_web, "langfuse (web+worker)", "Langfuse self-host", "Tracing UI + ingestion API")
         ContainerDb(clickhouse, "clickhouse", "ClickHouse", "Langfuse trace/analytics store (Langfuse's own dependency, not app data)")

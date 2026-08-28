@@ -8,6 +8,8 @@
 # and tests can override values without touching real env vars (see
 # tests/test_db_integration.py, which reads DATABASE_URL directly to decide
 # whether to skip — that's an intentional exception, not a settings bypass).
+from typing import Literal
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -131,6 +133,19 @@ class Settings(BaseSettings):
     # skips straight past `redact()` entirely, same "disabled means skip
     # it" contract `classifier_enabled` above already gives layer 2.
     pii_redaction_enabled: bool = True
+
+    # ADR-0007: transport for mcp_server.py's `FastMCP` instance. "stdio"
+    # (default) is what CI/dev/`MultiServerMCPClient` all spawn — no
+    # listening port, no auth surface. "streamable-http" is for the
+    # Compose-internal `mcp-server` container only (docs/ARCHITECTURE.md
+    # §3) — never exposed past Caddy, since there's no auth on it yet.
+    mcp_transport: Literal["stdio", "streamable-http"] = "stdio"
+    # Only read when mcp_transport="streamable-http". 127.0.0.1 (not
+    # 0.0.0.0): even inside the Compose network this stays loopback-only
+    # unless an operator deliberately widens it — narrowest default that
+    # still works for the same-container/localhost case.
+    mcp_host: str = "127.0.0.1"
+    mcp_port: int = 8001
 
 
 settings = Settings()

@@ -35,6 +35,25 @@ curl -sN -X POST localhost:8000/ask -H "Content-Type: application/json" \
 
 Set `LANGFUSE_PUBLIC_KEY`/`LANGFUSE_SECRET_KEY`/`LANGFUSE_BASE_URL` to enable tracing (Langfuse Cloud, EU) — unset by default, so the app runs with zero tracing until you do.
 
+## MCP server
+
+`make mcp` starts a standalone MCP server (`search_regulation`, `get_article`,
+`cite`) over stdio — the same tools an MCP client can point at, e.g. Claude
+Desktop's config:
+
+```json
+{
+  "mcpServers": {
+    "compliance-copilot": {
+      "command": "uv",
+      "args": ["run", "--project", "/path/to/repo", "python", "-m", "compliance_copilot.mcp_server"]
+    }
+  }
+}
+```
+
+Set `MCP_TRANSPORT=streamable-http` (internal network only — no auth today, see ADR-0007) to switch transports.
+
 ## Quality gates
 
 Two CI gates: **`quality-gate`** (retrieval hit@5/MRR) runs on every PR against
