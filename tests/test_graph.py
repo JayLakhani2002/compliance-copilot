@@ -12,7 +12,9 @@ import pytest
 
 from compliance_copilot.graph import AnswerSchema, Citation, CitationError, GraphContext
 from compliance_copilot.graph.build import build_graph
+from compliance_copilot.graph.nodes import make_llm
 from compliance_copilot.retriever import RetrievedChunk
+from compliance_copilot.settings import settings
 
 ARTICLES = [
     RetrievedChunk(
@@ -251,3 +253,40 @@ def test_curly_quote_in_source_matches_straight_quote_in_citation(monkeypatch):
     )
     state = _run(FakeLLM(answer))  # must not raise
     assert state["answer"] is answer
+
+
+def test_make_llm_raises_for_unknown_provider(monkeypatch):
+    monkeypatch.setattr(settings, "llm_provider", "bogus")
+    with pytest.raises(ValueError, match="bogus"):
+        make_llm()
+
+
+def test_make_llm_openai_returns_invokable_without_network(monkeypatch):
+    """Constructing `ChatOpenAI` (+ `.with_structured_output`) is local
+    schema/config work — no HTTP call happens until `.invoke()` runs (see
+    the installed `langchain_openai.chat_models.base.BaseChatOpenAI.
+    with_structured_output`, which only binds a response_format and wraps an
+    output parser). `OPENAI_API_KEY` still has to be present for the
+    constructor itself, since `ChatOpenAI` reads it eagerly (a
+    `pydantic.SecretStr` field), even though nothing is sent over the wire
+    here."""
+    monkeypatch.setattr(settings, "llm_provider", "openai")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key-not-a-real-secret")
+    llm = make_llm()
+    assert hasattr(llm, "invoke")
+
+
+def test_make_llm_defaults_model_per_provider(monkeypatch):
+    """Flipping LLM_PROVIDER alone must be a complete switch (ADR-0002
+    amendment): with no ANSWER_MODEL set, the anthropic branch must get
+    an Anthropic model id, never the OpenAI default. The structured-output
+    runnable is `bound_model | parser`, so the chat model sits at
+    `.first.bound`."""
+    monkeypatch.setattr(settings, "answer_model", None)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key-not-a-real-secret")
+    monkeypatch.setattr(settings, "llm_provider", "anthropic")
+    assert make_llm().first.bound.model == "claude-sonnet-5"
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key-not-a-real-secret")
+    monkeypatch.setattr(settings, "llm_provider", "openai")
+    assert make_llm().first.bound.model_name == "gpt-4.1-mini"
+    assert make_llm(model="gpt-4.1").first.bound.model_name == "gpt-4.1"

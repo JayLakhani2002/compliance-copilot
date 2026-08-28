@@ -35,11 +35,24 @@ class Settings(BaseSettings):
     # embeddings.py). Declaring it as a field would just duplicate that and
     # risk it ending up in a log/repr of `settings`.
 
-    # ADR-0002: Sonnet is the answer-node model tier. Dateless id
-    # "claude-sonnet-5" is itself a pinned snapshot for this model
-    # generation (verified against the live Anthropic model table,
-    # 2026-08-24), not an evergreen alias that moves underneath us.
-    answer_model: str = "claude-sonnet-5"
+    # ADR-0002 amendment (2026-08-24): only an OPENAI_API_KEY exists in .env
+    # today (Anthropic key not yet purchased), so "openai" is the interim
+    # default — ADR-0002's actual *target* is "anthropic" with
+    # answer_model="claude-sonnet-5"; make_llm() (graph/nodes.py) is the one
+    # place this flag is read, so flipping it back is a one-line change.
+    llm_provider: str = "openai"
+
+    # gpt-4.1-mini: cheapest current OpenAI model that (a) supports
+    # `with_structured_output(method="json_schema")` and (b) isn't a
+    # reasoning-only model — gpt-5.x-class models silently drop
+    # `temperature=0` (langchain_openai's own `validate_temperature`),
+    # which would make answers non-deterministic. $0.40/$1.60 per MTok
+    # in/out (verified platform.openai.com/docs/pricing, 2026-08-24).
+    # None = "use the provider's default" (make_llm() maps openai ->
+    # gpt-4.1-mini, anthropic -> claude-sonnet-5, ADR-0002), so flipping
+    # LLM_PROVIDER alone never sends one vendor's model id to the other's
+    # client. Set ANSWER_MODEL only to override a provider's default.
+    answer_model: str | None = None
 
     # ANTHROPIC_API_KEY isn't read here directly — same reasoning as
     # OPENAI_API_KEY above: langchain-anthropic's ChatAnthropic reads it
