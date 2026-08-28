@@ -51,8 +51,7 @@ from compliance_copilot.graph.build import build_graph
 from compliance_copilot.graph.nodes import make_llm
 from compliance_copilot.graph.state import AnswerSchema, CitationError, GraphContext
 from compliance_copilot.guards.classifier import make_classifier_llm
-from compliance_copilot.guards.output import _NON_ANSWER_MARKERS, _norm
-from compliance_copilot.guards.output import CANARY, OutputGuardError
+from compliance_copilot.guards.output import _NON_ANSWER_MARKERS, CANARY, OutputGuardError, _norm
 
 REDTEAM_PATH = Path(__file__).parent / "redteam.jsonl"
 BENIGN_PATH = Path(__file__).parent / "benign.jsonl"
