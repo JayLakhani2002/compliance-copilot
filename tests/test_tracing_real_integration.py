@@ -6,9 +6,11 @@
 # real-DB/real-embeddings/real-LLM setup as test_graph_real_integration.py
 # (test_engine + fixture_regulations + pipeline.ingest), plus a real
 # Langfuse callback in the config this time.
+import asyncio
 import os
 
 import pytest
+from langchain_mcp_adapters.client import MultiServerMCPClient
 from sqlalchemy.orm import Session
 
 from compliance_copilot import tracing
@@ -16,6 +18,28 @@ from compliance_copilot.embeddings import get_embeddings
 from compliance_copilot.graph.build import ask
 from compliance_copilot.graph.nodes import make_llm
 from compliance_copilot.ingest import pipeline
+
+
+async def _mcp_tools(database_url: str) -> dict:
+    """ADR-0007 Day-17 amendment: same real-subprocess helper
+    tests/test_graph_real_integration.py uses — this test also needs
+    `retrieve_node`'s MCP tools, pointed at the disposable `test_engine` DB
+    (not whatever `DATABASE_URL` in `.env` points at)."""
+    env = {**os.environ, "DATABASE_URL": database_url}
+    client = MultiServerMCPClient(
+        {
+            "copilot": {
+                "transport": "stdio",
+                "command": "uv",
+                "args": ["run", "--frozen", "python", "-m", "compliance_copilot.mcp_server"],
+                "env": env,
+                "cwd": os.getcwd(),
+            }
+        }
+    )
+    tools = await client.get_tools()
+    return {tool.name: tool for tool in tools}
+
 
 pytestmark = [
     pytest.mark.integration,
@@ -43,12 +67,16 @@ def test_ask_produces_a_real_trace_id_and_flushes(test_engine, fixture_regulatio
 
     with Session(test_engine) as session:
         pipeline.ingest("ai_act", embeddings, session)
-        ask(
-            "What is an AI system?",
-            session=session,
-            embeddings=embeddings,
-            llm=make_llm(),
-            config=config,
+        tools = asyncio.run(_mcp_tools(test_engine.url.render_as_string(hide_password=False)))
+        asyncio.run(
+            ask(
+                "What is an AI system?",
+                session=session,
+                embeddings=embeddings,
+                llm=make_llm(),
+                tools=tools,
+                config=config,
+            )
         )
 
     trace_id = tracing.current_trace_id(config)

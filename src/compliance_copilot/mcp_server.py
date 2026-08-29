@@ -30,7 +30,7 @@ from sqlalchemy.orm import Session
 
 from compliance_copilot.db import Chunk, Document, get_engine
 from compliance_copilot.embeddings import get_embeddings
-from compliance_copilot.graph.nodes import _MIN_QUOTE_LENGTH, _normalise
+from compliance_copilot.guards.quotes import _MIN_QUOTE_LENGTH, _normalise
 from compliance_copilot.retriever import retrieve
 from compliance_copilot.settings import settings
 
@@ -193,14 +193,12 @@ def cite(
         parts = session.execute(stmt).scalars().all()
     if not parts:
         return {"valid": False, "reason": "not found"}
-    # Reuses graph/nodes.py's own citation-verification logic (same
-    # whitespace/case/curly-quote normalisation and minimum-length floor
-    # `answer_node` already enforces) rather than a second implementation
-    # that could silently drift from it — see this file's module docstring
-    # and the researcher handoff's §5 for why importing from nodes.py (not
-    # a new guards/quotes.py module) is the smaller diff: langchain-
-    # anthropic/langchain-openai are already hard project dependencies, so
-    # this import adds no new package, just an in-process function call.
+    # Reuses guards/quotes.py's normalisation (same whitespace/case/curly-
+    # quote handling and minimum-length floor `answer_node` (graph/nodes.py)
+    # already enforces) rather than a second implementation that could
+    # silently drift from it (ADR-0007's Day-17 amendment: moved out of
+    # graph.nodes so this server process doesn't import langchain-anthropic/
+    # langchain-openai just for a string-normalisation helper).
     normalised_quote = _normalise(quote)
     if len(normalised_quote) < _MIN_QUOTE_LENGTH:
         return {"valid": False, "reason": "quote too short to verify"}

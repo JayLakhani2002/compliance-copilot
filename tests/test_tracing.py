@@ -8,11 +8,13 @@
 # rely on, verified with a plain spy handler and no Langfuse involved at all.
 from __future__ import annotations
 
+import asyncio
 import os
 import subprocess
 import sys
 
 import pytest
+from fake_mcp_tools import tools_from_articles
 from langchain_core.callbacks import BaseCallbackHandler
 
 from compliance_copilot import tracing
@@ -45,10 +47,6 @@ class FakeLLM:
 
     def invoke(self, messages):
         return self._response
-
-
-def _fake_retrieve(question, k, *, kinds, session, embeddings):
-    return ARTICLES if kinds == ("article",) else []
 
 
 @pytest.fixture(autouse=True)
@@ -131,17 +129,19 @@ class SpyHandler(BaseCallbackHandler):
             self.node_names.append(node)
 
 
-def test_config_callbacks_propagate_to_graph_node_runs(monkeypatch):
-    monkeypatch.setattr("compliance_copilot.graph.nodes.retrieve", _fake_retrieve)
+def test_config_callbacks_propagate_to_graph_node_runs():
     answer = AnswerSchema(answer="...", citations=[])
     spy = SpyHandler()
 
-    ask(
-        "What is a high-risk AI system?",
-        session=None,
-        embeddings=None,
-        llm=FakeLLM(answer),
-        config={"callbacks": [spy]},
+    asyncio.run(
+        ask(
+            "What is a high-risk AI system?",
+            session=None,
+            embeddings=None,
+            llm=FakeLLM(answer),
+            tools=tools_from_articles(ARTICLES),
+            config={"callbacks": [spy]},
+        )
     )
 
     assert "retrieve" in spy.node_names

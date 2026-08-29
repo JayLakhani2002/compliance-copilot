@@ -4,11 +4,20 @@
 # models are installed (pyproject.toml's pinned wheel URLs) — the only cost
 # is the ~1-2s one-time model load, shared across every test in this file
 # via `get_analyzer()`'s `lru_cache(maxsize=1)`.
+#
+# `retrieve_node` is `async def` (ADR-0007's Day-17 amendment — it awaits an
+# MCP tool call), so `_run()` below drives `graph.ainvoke` via
+# `asyncio.run(...)`, and `fake_mcp_tools.tools_from_articles([])` (empty
+# corpus) stands in for the MCP tools — replacing the old `monkeypatch.
+# setattr("...nodes.retrieve", ...)` pattern (`retrieve_node` no longer
+# calls that function at all).
 from __future__ import annotations
 
+import asyncio
 import logging
 
 import pytest
+from fake_mcp_tools import tools_from_articles
 
 from compliance_copilot.graph.build import build_graph
 from compliance_copilot.graph.state import AnswerSchema, GraphContext
@@ -181,34 +190,32 @@ class _UnusedLLM:
         raise AssertionError("LLM must not be called for a PII-only (refused) question")
 
 
-def _run(question: str, llm, monkeypatch, retrieve_spy: list | None = None):
-    def fake_retrieve(q, k, *, kinds, session, embeddings):
-        if retrieve_spy is not None:
-            retrieve_spy.append(q)
-        return []
-
-    monkeypatch.setattr("compliance_copilot.graph.nodes.retrieve", fake_retrieve)
+def _run(question: str, llm, tools: dict | None = None):
     graph = build_graph()
-    context = GraphContext(session=None, embeddings=None, llm=llm)
-    return graph.invoke({"question": question}, context=context)
+    context = GraphContext(
+        session=None, embeddings=None, llm=llm, tools=tools or tools_from_articles([])
+    )
+    return asyncio.run(graph.ainvoke({"question": question}, context=context))
 
 
-def test_question_with_pii_reaches_retrieve_and_llm_only_redacted(monkeypatch):
-    """The retriever and the answer LLM must both receive REDACTED text
-    (placeholders), never the raw name/email — proves guard_in's
-    `question`-overwrite (nodes.py) actually propagates downstream."""
-    retrieve_calls: list[str] = []
+def test_question_with_pii_reaches_retrieve_and_llm_only_redacted():
+    """The `search_regulation` tool and the answer LLM must both receive
+    REDACTED text (placeholders), never the raw name/email — proves
+    guard_in's `question`-overwrite (nodes.py) actually propagates
+    downstream."""
     llm = _PassLLM()
+    tools = tools_from_articles([])
 
     state = _run(
         "My client Anna Schmidt, anna@x.de, asks: is she a deployer under the AI Act?",
         llm,
-        monkeypatch,
-        retrieve_spy=retrieve_calls,
+        tools=tools,
     )
 
-    assert retrieve_calls, "retrieve was never called"
-    for q in retrieve_calls:
+    search_calls = tools["search_regulation"].calls
+    assert search_calls, "search_regulation was never called"
+    for call in search_calls:
+        q = call["question"]
         assert "Anna Schmidt" not in q
         assert "anna@x.de" not in q
         assert "<PERSON>" in q or "<EMAIL>" in q
@@ -227,8 +234,8 @@ def test_question_with_pii_reaches_retrieve_and_llm_only_redacted(monkeypatch):
     assert state.get("refused") is not True
 
 
-def test_pii_only_question_is_refused_with_pii_only_reason(monkeypatch):
-    state = _run("hans@firma.de +49 151 23456789", _UnusedLLM(), monkeypatch)
+def test_pii_only_question_is_refused_with_pii_only_reason():
+    state = _run("hans@firma.de +49 151 23456789", _UnusedLLM())
 
     assert state["refused"] is True
     assert state["guard"].flagged is True
@@ -239,7 +246,7 @@ def test_pii_redaction_disabled_leaves_question_untouched(monkeypatch):
     monkeypatch.setattr(settings, "pii_redaction_enabled", False)
     llm = _PassLLM()
 
-    state = _run("Contact John Smith at john@x.com about this.", llm, monkeypatch)
+    state = _run("Contact John Smith at john@x.com about this.", llm)
 
     assert "pii_entities" not in state
     human_content = llm.messages[-1][1]
@@ -247,15 +254,17 @@ def test_pii_redaction_disabled_leaves_question_untouched(monkeypatch):
     assert "john@x.com" in human_content
 
 
-def test_guard_in_logs_entity_types_only_never_the_value(monkeypatch, caplog):
-    monkeypatch.setattr("compliance_copilot.graph.nodes.retrieve", lambda *a, **kw: [])
+def test_guard_in_logs_entity_types_only_never_the_value(caplog):
     llm = _PassLLM()
     graph = build_graph()
-    context = GraphContext(session=None, embeddings=None, llm=llm)
+    context = GraphContext(session=None, embeddings=None, llm=llm, tools=tools_from_articles([]))
 
     with caplog.at_level(logging.INFO, logger="compliance_copilot.graph.nodes"):
-        graph.invoke(
-            {"question": "Reach John Smith at john.smith@example.com please."}, context=context
+        asyncio.run(
+            graph.ainvoke(
+                {"question": "Reach John Smith at john.smith@example.com please."},
+                context=context,
+            )
         )
 
     pii_logs = [r for r in caplog.records if "guard_in pii redacted" in r.getMessage()]

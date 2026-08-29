@@ -6,28 +6,33 @@
 # themselves.
 from __future__ import annotations
 
+import asyncio
 import html
 import logging
 import re
 import time
+import uuid
 from typing import Any
 
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import SystemMessage
 from langchain_openai import ChatOpenAI
 from langgraph.runtime import Runtime
+from mcp.shared.exceptions import McpError
 
 from compliance_copilot.graph.state import (
     AnswerSchema,
     CitationError,
     GraphContext,
     GraphState,
+    ToolCallError,
 )
 from compliance_copilot.guards.classifier import classify
 from compliance_copilot.guards.injection import GuardResult, detect
 from compliance_copilot.guards.output import CANARY, OutputGuardError, check_output
 from compliance_copilot.guards.pii import redact
-from compliance_copilot.retriever import RetrievedChunk, retrieve
+from compliance_copilot.guards.quotes import _MIN_QUOTE_LENGTH, _normalise
+from compliance_copilot.retriever import RetrievedChunk
 from compliance_copilot.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -202,33 +207,182 @@ def refuse_node(state: GraphState) -> dict:
     return {"answer": AnswerSchema(answer=REFUSAL_TEXT, citations=[]), "refused": True}
 
 
-def retrieve_node(state: GraphState, runtime: Runtime[GraphContext]) -> dict:
-    """Node 1: articles are the primary, citable context (ADR-0013's default
-    `kinds=("article",)`); recitals are fetched separately as secondary,
-    non-citable context for `answer_node` to read but never cite.
+# ADR-0007 Day-17 amendment: initial attempt + one retry, transient
+# transport failures only — never retried into a loop, never retried past a
+# genuine validation/malformed-result failure (lesson 17's error policy).
+_MAX_TOOL_ATTEMPTS = 2
 
-    Calls the module-level `retrieve` (imported from retriever.py) rather
-    than embedding the lookup inline — tests monkeypatch that module-level
-    name directly (`compliance_copilot.graph.nodes.retrieve`) to run the
-    whole compiled graph with no DB/network, since a Python function looks
-    up a global name from its module's namespace at call time, not at
-    def time."""
+# "Transient" = the transport itself misbehaved (dropped pipe/socket,
+# process died mid-call, the MCP SDK's own protocol-level error) — never a
+# tool's own business-logic failure (a `ValueError` from a bad argument, a
+# malformed result shape), which must fail on the first attempt: retrying a
+# validation error just wastes the timeout budget on a call that can never
+# succeed. `TimeoutError` (raised by `asyncio.wait_for` below) is handled
+# separately so a stuck call gets the exact same bounded retry, not more.
+_TRANSIENT_TRANSPORT_ERRORS = (OSError, McpError)
+
+
+async def _call_tool(tool: Any, name: str, args: dict[str, Any], *, timeout: float) -> Any:
+    """Invokes one MCP-backed LangChain tool and returns its structured
+    result (the parsed dict/list `search_regulation`/`get_article` actually
+    return), or raises `ToolCallError` (state.py) on transport failure,
+    timeout, or a malformed result — never silently returns nothing (the
+    lesson's "fail loudly" policy: a quiet fallback here would hide a real
+    outage behind a confident-looking answer).
+
+    Calls with a `ToolCall`-shaped input (`{"type": "tool_call", ...}`), not
+    a bare args dict — verified live against a real MCP-backed tool
+    (`langchain_core.tools.base._format_output`): a plain-dict `.ainvoke()`
+    discards the tool's `artifact` (the parsed `structuredContent`) and
+    returns only its human-readable text content, while the `ToolCall` shape
+    is what makes LangChain build a `ToolMessage` carrying
+    `.artifact["structured_content"]` — the actual object our tools return,
+    not a string to re-parse.
+
+    Logs the tool NAME, latency, and error CLASS only — never `args`, since
+    they carry the (already-redacted) question, same rule `guards/
+    injection.py`'s `GuardResult.reasons` already follows."""
+    last_exc: BaseException | None = None
+    for attempt in range(1, _MAX_TOOL_ATTEMPTS + 1):
+        call = {"type": "tool_call", "name": name, "args": args, "id": f"{name}-{uuid.uuid4().hex}"}
+        started = time.monotonic()
+        try:
+            result = await asyncio.wait_for(tool.ainvoke(call), timeout=timeout)
+        except TimeoutError as exc:
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            logger.warning(
+                "mcp_tool timeout tool=%s attempt=%d elapsed_ms=%d", name, attempt, elapsed_ms
+            )
+            last_exc = exc
+        except _TRANSIENT_TRANSPORT_ERRORS as exc:
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            logger.warning(
+                "mcp_tool transient_error tool=%s error=%s attempt=%d elapsed_ms=%d",
+                name,
+                type(exc).__name__,
+                attempt,
+                elapsed_ms,
+            )
+            last_exc = exc
+        except Exception as exc:
+            # Not transient (a bug in our own call, or an SDK error outside
+            # the transient set above) — never retried.
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            logger.warning(
+                "mcp_tool error tool=%s error=%s elapsed_ms=%d",
+                name,
+                type(exc).__name__,
+                elapsed_ms,
+            )
+            raise ToolCallError(f"{name} failed: {type(exc).__name__}") from exc
+        else:
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            if getattr(result, "status", "success") == "error":
+                # The tool itself reported a failure (its own `ValueError`,
+                # e.g. a bad anchor) — a business-logic/validation failure,
+                # never retried.
+                logger.warning("mcp_tool tool_error tool=%s elapsed_ms=%d", name, elapsed_ms)
+                raise ToolCallError(f"{name} returned an error result")
+            artifact = getattr(result, "artifact", None)
+            if not isinstance(artifact, dict) or "structured_content" not in artifact:
+                logger.warning("mcp_tool malformed tool=%s elapsed_ms=%d", name, elapsed_ms)
+                raise ToolCallError(f"{name} returned a malformed result (no structured content)")
+            logger.info("mcp_tool ok tool=%s attempt=%d elapsed_ms=%d", name, attempt, elapsed_ms)
+            return artifact["structured_content"]
+        if attempt == _MAX_TOOL_ATTEMPTS:
+            raise ToolCallError(
+                f"{name} failed after {_MAX_TOOL_ATTEMPTS} attempts: {type(last_exc).__name__}"
+            ) from last_exc
+    raise ToolCallError(
+        f"{name} failed"
+    )  # pragma: no cover — unreachable, loop always returns/raises
+
+
+async def retrieve_node(state: GraphState, runtime: Runtime[GraphContext]) -> dict:
+    """Node 1 (ADR-0007 Day-17 amendment): `retrieve_node` is now the MCP
+    *client* — it calls the `search_regulation`/`get_article` tools
+    (mcp_server.py) via `runtime.context.tools` instead of importing
+    `retrieve()` from retriever.py directly, so no MCP-specific code lives
+    anywhere else in the graph. `async def` + `await ... .ainvoke(...)`
+    because talking to the MCP server (a separate process over stdio) is
+    I/O — LangGraph already runs sync and async nodes side by side in one
+    compiled graph (a sync node is auto-wrapped in a thread pool), so
+    nothing else in the graph has to change shape for this.
+
+    Two-hop lookup, not one: `search_regulation` returns a RANKED list of
+    `{regulation, anchor, title, snippet, distance, part}` (snippet
+    truncated to 300 chars, mcp_server.py) — too short to answer from or
+    validate citations against. `get_article` is called once per unique
+    (regulation, anchor) from that ranking to fetch each match's FULL,
+    all-parts-joined text, which is what actually gets rendered into the
+    prompt and checked against by `_validate_citations`.
+
+    Recitals are dropped from this integration: `search_regulation` only
+    searches `kind="article"` (mcp_server.py, ADR-0013 — recitals were
+    never meant to be a citable search target for an external MCP client),
+    and no MCP tool exposes recital search. `state["recitals"]` is always
+    `[]` here — a real behaviour change from the pre-MCP `retrieve()` call
+    that also fetched supporting recitals, flagged in this feature's
+    ADR-0007 amendment as an open risk rather than silently absorbed."""
     ctx = runtime.context
-    articles = retrieve(
-        state["question"],
-        k=5,
-        kinds=("article",),
-        session=ctx.session,
-        embeddings=ctx.embeddings,
+    tools = ctx.tools
+    if not tools:
+        raise ToolCallError(
+            "no MCP tools available in GraphContext (mcp_enabled=False, or tool loading failed)"
+        )
+    question = state["question"]
+    timeout = settings.mcp_tool_timeout_s
+
+    search_result = await _call_tool(
+        tools["search_regulation"],
+        "search_regulation",
+        {"question": question, "k": 5},
+        timeout=timeout,
     )
-    recitals = retrieve(
-        state["question"],
-        k=3,
-        kinds=("recital",),
-        session=ctx.session,
-        embeddings=ctx.embeddings,
-    )
-    return {"articles": articles, "recitals": recitals}
+    # `list[dict]` returns come back from the SDK wrapped as `{"result":
+    # [...]}` (ADR-0007's amendment, verified live) — a bare `dict` return
+    # (get_article/cite) is NOT wrapped, so only unwrap for this shape.
+    hits = search_result.get("result") if isinstance(search_result, dict) else search_result
+    if not isinstance(hits, list):
+        raise ToolCallError("search_regulation returned a malformed result (expected a list)")
+
+    articles: list[RetrievedChunk] = []
+    seen: set[tuple[str, str]] = set()
+    for hit in hits:
+        if not isinstance(hit, dict) or "regulation" not in hit or "anchor" not in hit:
+            raise ToolCallError("search_regulation returned a malformed result item")
+        key = (hit["regulation"], hit["anchor"])
+        if key in seen:
+            # An oversize article's multiple parts (chunker.py) can occupy
+            # more than one of the k search slots — `get_article` already
+            # joins every part into one block, so a second hit for the same
+            # anchor has nothing new to fetch.
+            continue
+        seen.add(key)
+        article = await _call_tool(
+            tools["get_article"],
+            "get_article",
+            {"regulation": hit["regulation"], "anchor": hit["anchor"]},
+            timeout=timeout,
+        )
+        if not isinstance(article, dict) or "text" not in article:
+            raise ToolCallError("get_article returned a malformed result")
+        articles.append(
+            RetrievedChunk(
+                anchor=hit["anchor"],
+                regulation=hit["regulation"],
+                kind="article",
+                # not returned by get_article; unused downstream (_render_chunk/_validate_citations)
+                number=0,
+                title=article.get("title"),
+                text=article["text"],
+                distance=float(hit.get("distance", 0.0)),
+                # get_article joins every part into one text, so a part index has no
+                # meaning here (and nothing downstream reads it).
+                part=0,
+            )
+        )
+    return {"articles": articles, "recitals": []}
 
 
 def _render_chunk(chunk: RetrievedChunk) -> str:
@@ -247,40 +401,6 @@ def _render_chunk(chunk: RetrievedChunk) -> str:
     title = html.escape(chunk.title or "", quote=True)
     header = f'<excerpt regulation="{chunk.regulation}" anchor="{chunk.anchor}" title="{title}">'
     return f"{header}{text}</excerpt>"
-
-
-# The corpus's own text uses Unicode curly quotes (U+2018/U+2019, U+201C/
-# U+201D) around every defined term (chunker.py's definition-boundary regex
-# matches '‘' for the same reason) — the model may reproduce a quote with
-# straight ASCII quotes instead. Map both to straight so that difference
-# alone never causes a false-positive CitationError (reviewer round 1).
-_QUOTE_MAP = str.maketrans({"‘": "'", "’": "'", "“": '"', "”": '"'})
-
-# Minimum normalised-quote length: an empty or 1-2 character quote is a
-# substring of almost any text, so it would pass the verbatim check with
-# zero actual information content (reviewer round 1) — reject it outright
-# rather than let it through as a "cited" claim.
-_MIN_QUOTE_LENGTH = 20
-
-
-def _normalise(text: str) -> str:
-    """Whitespace-collapsed, case-folded, curly-quotes-to-straight —
-    applied to both the model's quote and the source chunk text before the
-    substring check, so a quote that only differs by spacing, letter case,
-    or quote-mark style still counts as verbatim (ADR-0014).
-
-    `html.unescape` runs first: `_render_chunk` HTML-escapes chunk text
-    before showing it to the model (`&`/`<`/`>` -> `&amp;`/`&lt;`/`&gt;`),
-    and the system prompt tells the model to copy its citation quote
-    "verbatim... from the cited excerpt's text" — i.e. from what it was
-    shown, escaped form included. Unescaping both sides here before
-    comparing against the raw DB text is what makes a genuinely-verbatim
-    quote containing one of those characters still pass (round-1 review
-    finding: previously only the escape direction was implemented, not the
-    reverse, so this was a live false-positive-`CitationError` bug for any
-    chunk containing `&`, `<`, or `>`)."""
-    text = html.unescape(text)
-    return re.sub(r"\s+", " ", text).strip().casefold().translate(_QUOTE_MAP)
 
 
 def _build_messages(state: GraphState) -> list[tuple[str, str] | SystemMessage]:

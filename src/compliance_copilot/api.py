@@ -40,7 +40,7 @@ from starlette.responses import Response
 from compliance_copilot import embeddings as embeddings_module
 from compliance_copilot import tracing
 from compliance_copilot.db import get_session
-from compliance_copilot.graph import CitationError, GraphContext
+from compliance_copilot.graph import CitationError, GraphContext, make_mcp_tools
 from compliance_copilot.graph.build import build_graph
 from compliance_copilot.graph.nodes import make_llm
 from compliance_copilot.guards.classifier import make_classifier_llm
@@ -119,6 +119,30 @@ def get_classifier_dependency() -> Any | None:
     if not settings.classifier_enabled:
         return None
     return make_classifier_llm()
+
+
+# ADR-0007 Day-17 amendment: `make_mcp_tools()` is `async def` (it awaits
+# `MultiServerMCPClient.get_tools()`), so it can't be wrapped in a plain
+# `@lru_cache` the way the sync dependencies above are — a tiny hand-rolled
+# async-singleton cache instead. `_UNSET`, not `None`, marks "not built
+# yet": `None` is itself a valid cached value (`settings.mcp_enabled=False`,
+# make_mcp_tools()'s own "how to reverse" lever), so it must be
+# distinguishable from "haven't tried yet".
+_UNSET = object()
+_tools_cache: dict[str, Any] | None | object = _UNSET
+
+
+async def get_tools_dependency() -> dict[str, Any] | None:
+    """Built once per process (warmed up in `lifespan()` below, same
+    "build once at startup" reasoning as `build_graph()`/
+    `get_classifier_dependency()`) — the tool LIST is cheap to hold onto;
+    `MultiServerMCPClient`'s per-call sessions mean each tool's own
+    `.ainvoke()` still opens/tears down its own subprocess+session, so
+    reusing this list across requests doesn't hold any connection open."""
+    global _tools_cache
+    if _tools_cache is _UNSET:
+        _tools_cache = await make_mcp_tools()
+    return _tools_cache
 
 
 # ---------------------------------------------------------------------------
@@ -213,6 +237,7 @@ async def _stream_answer(
     embeddings: Embeddings,
     llm: Any,
     classifier: Any | None,
+    tools: dict[str, Any] | None,
 ) -> AsyncIterator[str]:
     """The `/ask` response body: runs the compiled graph via `astream(...,
     stream_mode='updates')`, translating each node's partial state into an
@@ -233,7 +258,9 @@ async def _stream_answer(
     state); `final` is emitted once, at `guard_out`, using whichever values
     are current by then."""
     graph = build_graph()
-    context = GraphContext(session=session, embeddings=embeddings, llm=llm, classifier=classifier)
+    context = GraphContext(
+        session=session, embeddings=embeddings, llm=llm, classifier=classifier, tools=tools
+    )
     started = time.monotonic()
     # One config per request: `run_config()` builds a fresh CallbackHandler
     # (or `[]` when tracing is disabled, tracing.py) and a request-scoped
@@ -414,6 +441,10 @@ async def lifespan(app: FastAPI):
     # be first, instead of on startup where a slow LLM client construction
     # belongs.
     get_classifier_dependency()
+    # ADR-0007 Day-17 amendment: same reasoning again — spawning the MCP
+    # server subprocess and loading its tools happens once here, at
+    # startup, not on whichever request happens to arrive first.
+    await get_tools_dependency()
     yield
     # `shutdown()`, not `flush()`: this runs once as the process exits, so it
     # should also stop Langfuse's background consumer threads (tracing.py) —
@@ -467,9 +498,15 @@ async def ask(
     embeddings: Embeddings = Depends(get_embeddings_dependency),
     llm: Any = Depends(get_llm_dependency),
     classifier: Any | None = Depends(get_classifier_dependency),
+    tools: dict[str, Any] | None = Depends(get_tools_dependency),
 ) -> StreamingResponse:
     generator = _stream_answer(
-        req.question, session=session, embeddings=embeddings, llm=llm, classifier=classifier
+        req.question,
+        session=session,
+        embeddings=embeddings,
+        llm=llm,
+        classifier=classifier,
+        tools=tools,
     )
     return StreamingResponse(
         generator,

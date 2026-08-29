@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -25,7 +26,7 @@ from sqlalchemy.orm import Session
 from compliance_copilot import tracing
 from compliance_copilot.db import Chunk, Document, get_engine
 from compliance_copilot.embeddings import get_embeddings
-from compliance_copilot.graph import CitationError
+from compliance_copilot.graph import CitationError, make_mcp_tools
 from compliance_copilot.graph import ask as ask_graph
 from compliance_copilot.graph.nodes import make_llm
 from compliance_copilot.graph.state import AnswerSchema
@@ -157,29 +158,31 @@ def _print_cost_note(n_questions: int) -> None:
     )
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--faithfulness-min", type=float, default=0.0)
-    parser.add_argument(
-        "--json", type=Path, default=None, help="Dump the full report to this path."
-    )
-    args = parser.parse_args()
-
-    goldens = load_golden_answers()
+async def _run_goldens(goldens: list[GoldenAnswer]) -> list[QuestionOutcome]:
+    """ADR-0007 Day-17 amendment: `ask_graph` (`compliance_copilot.graph.
+    ask`) is `async def` now — `retrieve_node` awaits an MCP tool call, and
+    sync `graph.invoke()` raises `TypeError` the moment a run reaches it.
+    `main()` wraps this whole function in `asyncio.run(...)`, same pattern
+    `evals/run_redteam.py`/`cli.py`'s `ask` command use for the same
+    reason. Spawns the MCP server subprocess once (`make_mcp_tools()`) and
+    reuses its tools across every golden question, matching the "per-call
+    sessions, tool list built once" design (ADR-0007's Day-17 amendment)."""
     embeddings = get_embeddings()
     answer_llm = make_llm()
     judge_llm = ChatOpenAI(model=_JUDGE_MODEL, temperature=0)
+    tools = await make_mcp_tools()
 
     outcomes: list[QuestionOutcome] = []
     with Session(get_engine()) as session:
         for golden in goldens:
             config = tracing.run_config(tags=["answer-quality-eval", f"golden:{golden.id}"])
             try:
-                answer = ask_graph(
+                answer = await ask_graph(
                     golden.question,
                     session=session,
                     embeddings=embeddings,
                     llm=answer_llm,
+                    tools=tools,
                     config=config,
                 )
             except CitationError as exc:
@@ -193,6 +196,20 @@ def main() -> None:
             trace_id = tracing.current_trace_id(config)
             tracing.score("judge_faithful", 1.0 if verdict.faithful else 0.0, trace_id)
             tracing.score("judge_relevant", 1.0 if verdict.relevant else 0.0, trace_id)
+
+    return outcomes
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--faithfulness-min", type=float, default=0.0)
+    parser.add_argument(
+        "--json", type=Path, default=None, help="Dump the full report to this path."
+    )
+    args = parser.parse_args()
+
+    goldens = load_golden_answers()
+    outcomes = asyncio.run(_run_goldens(goldens))
 
     aggregates = aggregate(outcomes)
     print_report(outcomes, aggregates)

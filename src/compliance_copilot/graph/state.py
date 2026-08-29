@@ -25,6 +25,7 @@
 # request, so it's passed at `.invoke()` time instead of stored in state.
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, NotRequired, TypedDict
 
@@ -82,6 +83,20 @@ class CitationError(ValueError):
     error can't leak the question text."""
 
 
+class ToolCallError(RuntimeError):
+    """Raised by `retrieve_node` (graph/nodes.py) when an MCP tool call
+    fails — a transport error/timeout that exhausted its bounded retries, a
+    tool-reported validation failure, or a malformed result shape (ADR-0007
+    Day-17 amendment). Deliberately a hard failure, never a silent fallback
+    to direct retrieval: a quiet fallback here would hide a real MCP outage
+    behind a confident-looking answer. Falls through api.py's `/ask` generic
+    exception handler as an `internal_error` SSE event, and surfaces to the
+    CLI the same way `OutputGuardError` does — an internal failure, not a
+    refusal. Message is built only from the tool name and error class, never
+    the call's arguments (which carry the question) — same rule
+    `CitationError`'s docstring above already follows."""
+
+
 @dataclass
 class GraphContext:
     """Run-scoped dependencies, supplied per `.invoke(..., context=...)` call
@@ -104,6 +119,19 @@ class GraphContext:
     # that builds a `GraphContext` without it (tests, any code that hasn't
     # been touched by this feature) keeps working unchanged.
     classifier: Any | None = None
+    # ADR-0007 Day-17 amendment: `search_regulation`/`get_article`
+    # LangChain `BaseTool` objects (from `langchain_mcp_adapters.
+    # MultiServerMCPClient.get_tools()`, built once in build.py's
+    # `make_mcp_tools()`), keyed by tool name — `retrieve_node` reads
+    # `tools["search_regulation"]` etc. instead of importing `retrieve()`
+    # directly. `None` (the default) means "no tools loaded" — a real
+    # question reaching `retrieve_node` with no tools raises `ToolCallError`
+    # immediately (fail loudly, never a silent fallback to direct
+    # retrieval); tests that only exercise `guard_in`'s refusal path never
+    # reach `retrieve_node` at all, so they're unaffected by leaving this
+    # unset, same "existing caller keeps working" contract `classifier`
+    # above already established.
+    tools: Mapping[str, Any] | None = None
 
 
 class GraphState(TypedDict):

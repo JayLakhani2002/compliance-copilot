@@ -147,5 +147,22 @@ class Settings(BaseSettings):
     mcp_host: str = "127.0.0.1"
     mcp_port: int = 8001
 
+    # ADR-0007 Day-17 amendment: `retrieve_node` (graph/nodes.py) is now the
+    # MCP *client* — `False` is the one-line "how to reverse" an MCP-outage
+    # incident needs: `build.make_mcp_tools()` returns `None` instead of
+    # spawning the server subprocess, so `GraphContext.tools` stays empty.
+    # This is NOT a silent fallback to direct retrieval (the lesson's
+    # fail-loud rule) — a real question still reaches `retrieve_node`, which
+    # still raises `ToolCallError` the moment it finds no tools, just
+    # without ever spawning a doomed subprocess first. Defaults `True` since
+    # the MCP server is the only retrieval path now.
+    mcp_enabled: bool = True
+    # Per-tool-call ceiling (`asyncio.wait_for` in `retrieve_node`) — bounds
+    # one stuck `search_regulation`/`get_article` call so it can't stall a
+    # request indefinitely (lesson 17, "Check yourself" #1). 30s is
+    # generous headroom over a local stdio round-trip's normal
+    # millisecond-scale latency.
+    mcp_tool_timeout_s: float = 30.0
+
 
 settings = Settings()

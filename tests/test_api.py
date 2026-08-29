@@ -1,16 +1,18 @@
 # tests/test_api.py — unit tests for the FastAPI HTTP surface (api.py,
 # ADR-0016). No network, no DB: `app.dependency_overrides` swaps the real
-# DB session/embeddings/LLM for fakes (same fake-LLM-double pattern as
-# tests/test_graph.py), and monkeypatches
-# `compliance_copilot.graph.nodes.retrieve` for fake retrieved chunks —
-# lets the whole request/response/SSE-framing path run with no external
-# services.
+# DB session/embeddings/LLM/MCP-tools for fakes (same fake-LLM-double
+# pattern as tests/test_graph.py) — `get_tools_dependency` is overridden
+# with `fake_mcp_tools.tools_from_articles` (ADR-0007's Day-17 amendment)
+# instead of monkeypatching `retrieve()` directly, since `retrieve_node` no
+# longer calls it — lets the whole request/response/SSE-framing path run
+# with no external services.
 from __future__ import annotations
 
 import json
 import time
 
 import pytest
+from fake_mcp_tools import tools_from_articles
 from fastapi.testclient import TestClient
 
 from compliance_copilot.api import (
@@ -18,6 +20,7 @@ from compliance_copilot.api import (
     get_classifier_dependency,
     get_embeddings_dependency,
     get_llm_dependency,
+    get_tools_dependency,
     limiter,
 )
 from compliance_copilot.db import get_session
@@ -39,7 +42,6 @@ ARTICLES = [
         part=0,
     ),
 ]
-RECITALS: list[RetrievedChunk] = []
 
 
 class FakeLLM:
@@ -67,10 +69,6 @@ class StatefulLLM:
         return self._responses.pop(0)
 
 
-def _fake_retrieve(question, k, *, kinds, session, embeddings):
-    return ARTICLES if kinds == ("article",) else RECITALS
-
-
 def _override_get_session():
     # A real generator function (not a lambda returning an iterator) so
     # FastAPI's dependency system manages it the same way as the real
@@ -80,7 +78,6 @@ def _override_get_session():
 
 @pytest.fixture(autouse=True)
 def _fakes(monkeypatch):
-    monkeypatch.setattr("compliance_copilot.graph.nodes.retrieve", _fake_retrieve)
     monkeypatch.setattr(settings, "api_key", API_KEY)
     monkeypatch.setattr(settings, "rate_limit", "20/minute")
     # Tracing disabled by default (ADR-0009 amendment, no Langfuse account
@@ -97,6 +94,11 @@ def _fakes(monkeypatch):
     # `ChatOpenAI` (needs OPENAI_API_KEY) on every `/ask` call. Tests that
     # actually exercise the classifier override this again to a fake.
     app.dependency_overrides[get_classifier_dependency] = lambda: None
+    # ADR-0007 Day-17 amendment: fake `search_regulation`/`get_article`
+    # tools reproducing ARTICLES — without this override, a real `/ask`
+    # call would hit `get_tools_dependency`'s process-global cache and try
+    # to spawn a real MCP server subprocess on the first request.
+    app.dependency_overrides[get_tools_dependency] = lambda: tools_from_articles(ARTICLES)
     yield
     app.dependency_overrides.clear()
     limiter.reset()  # clear per-key hit counts so tests don't bleed into each other

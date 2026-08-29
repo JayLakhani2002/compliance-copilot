@@ -94,7 +94,7 @@ to sit once built — none of the three exist as nodes yet (`grep -rn
 flowchart TD
     START([START]) --> guard_in[guard_in\nprompt-injection heuristics + Haiku classifier\nPII detection/redaction]
     guard_in -- blocked --> refuse[refuse\nfixed refusal text, AnswerSchema shape]
-    guard_in -- clean --> retrieve[retrieve\narticles-first search + recital context]
+    guard_in -- clean --> retrieve[retrieve\nMCP client: search_regulation + get_article\narticles only, ADR-0007 Day-17 amendment]
     guard_in -. clean .-> router{{router (planned, Week 4)\nHaiku: classify question type\n+ pick retrieval strategy}}
     retrieve --> answer[answer\nSonnet/GPT drafts answer\nstructured output + citations\nself-validates, retries once]
     answer -- citation invalid, retry left --> answer

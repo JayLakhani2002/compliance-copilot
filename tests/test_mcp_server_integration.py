@@ -132,8 +132,11 @@ def test_stdio_roundtrip_list_tools_and_get_article(test_engine, fixture_regulat
     async def _run():
         async with stdio_client(params) as (read, write):
             async with ClientSession(read, write) as session:
-                await session.initialize()
-                tools = await session.list_tools()
+                # Day-16 reviewer nit, fixed in the Day-17 amendment: no
+                # timeout meant a broken/hanging server subprocess could
+                # stall this test (and CI) indefinitely.
+                await asyncio.wait_for(session.initialize(), timeout=60)
+                tools = await asyncio.wait_for(session.list_tools(), timeout=60)
                 assert {t.name for t in tools.tools} == {
                     "search_regulation",
                     "get_article",

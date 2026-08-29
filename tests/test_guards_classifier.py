@@ -5,11 +5,20 @@
 # `.invoke(messages) -> Verdict` (same "instead of LangChain's fake chat
 # models" reasoning as tests/test_graph.py's `FakeLLM` — see that file's
 # module docstring), never a real LLM client.
+# `retrieve_node` is `async def` (ADR-0007's Day-17 amendment — it awaits an
+# MCP tool call), so `_run`/the one direct `graph.stream` call below use
+# `asyncio.run(...)`/`graph.astream(...)`, and `fake_mcp_tools.
+# tools_from_articles([])` (empty corpus) stands in for the MCP tools on
+# every allow-through path here, replacing the old `monkeypatch.setattr(
+# "...nodes.retrieve", ...)` pattern (`retrieve_node` no longer calls that
+# function at all).
 from __future__ import annotations
 
+import asyncio
 import logging
 
 import pytest
+from fake_mcp_tools import tools_from_articles
 
 from compliance_copilot.graph.build import build_graph
 from compliance_copilot.graph.state import AnswerSchema, GraphContext
@@ -65,9 +74,13 @@ def _clear_verdict_cache():
 def _run(question: str, classifier, llm=None) -> dict:
     graph = build_graph()
     context = GraphContext(
-        session=None, embeddings=None, llm=llm or _UnusedLLM(), classifier=classifier
+        session=None,
+        embeddings=None,
+        llm=llm or _UnusedLLM(),
+        classifier=classifier,
+        tools=tools_from_articles([]),
     )
-    return graph.invoke({"question": question}, context=context)
+    return asyncio.run(graph.ainvoke({"question": question}, context=context))
 
 
 # Heuristics-clean text (no "ignore"/"disregard"/"DAN"/delimiter/"PWNED"
@@ -80,8 +93,7 @@ PARAPHRASED_QUESTION = (
 
 
 # --- (a) allow ---------------------------------------------------------
-def test_allow_verdict_passes_to_retrieve(monkeypatch):
-    monkeypatch.setattr("compliance_copilot.graph.nodes.retrieve", lambda *a, **kw: [])
+def test_allow_verdict_passes_to_retrieve():
     fake = FakeClassifier(Verdict(verdict="allow", category="none", confidence=0.95))
 
     state = _run(PARAPHRASED_QUESTION, fake, llm=_PassLLM())
@@ -104,8 +116,7 @@ def test_block_above_threshold_is_refused():
 
 
 # --- (c) block below threshold -> passes --------------------------------
-def test_block_below_confidence_threshold_passes(monkeypatch):
-    monkeypatch.setattr("compliance_copilot.graph.nodes.retrieve", lambda *a, **kw: [])
+def test_block_below_confidence_threshold_passes():
     # settings.classifier_block_confidence default 0.6 — 0.3 is below it.
     fake = FakeClassifier(Verdict(verdict="block", category="other", confidence=0.3))
 
@@ -131,10 +142,9 @@ def test_classifier_exception_fails_open_and_never_logs_the_text(exc, caplog):
     assert PARAPHRASED_QUESTION not in warnings[0].getMessage()
 
 
-def test_classifier_exception_in_graph_falls_through_to_retrieve(monkeypatch):
+def test_classifier_exception_in_graph_falls_through_to_retrieve():
     """End-to-end: a classifier that raises must not block the question —
     the graph still reaches `retrieve`/`answer` (fail-open, ADR-0019)."""
-    monkeypatch.setattr("compliance_copilot.graph.nodes.retrieve", lambda *a, **kw: [])
     fake = FakeClassifier(exc=TimeoutError("slow network"))
 
     state = _run(PARAPHRASED_QUESTION, fake, llm=_PassLLM())
@@ -169,22 +179,30 @@ def test_same_normalised_text_hits_cache_different_text_does_not():
 def test_classifier_block_stream_visits_guard_in_then_refuse_never_retrieve():
     fake = FakeClassifier(Verdict(verdict="block", category="exfiltration", confidence=0.95))
     graph = build_graph()
-    context = GraphContext(session=None, embeddings=None, llm=_UnusedLLM(), classifier=fake)
+    context = GraphContext(
+        session=None,
+        embeddings=None,
+        llm=_UnusedLLM(),
+        classifier=fake,
+        tools=tools_from_articles([]),
+    )
 
-    nodes_visited = [
-        list(update)[0]
-        for update in graph.stream(
-            {"question": PARAPHRASED_QUESTION}, context=context, stream_mode="updates"
-        )
-    ]
+    async def _collect():
+        return [
+            list(update)[0]
+            async for update in graph.astream(
+                {"question": PARAPHRASED_QUESTION}, context=context, stream_mode="updates"
+            )
+        ]
+
+    nodes_visited = asyncio.run(_collect())
     # ADR-0021: `guard_out` runs on every terminal path now, this
     # classifier-block refusal included.
     assert nodes_visited == ["guard_in", "refuse", "guard_out"]
 
 
 # --- classifier disabled (None) is a complete no-op ----------------------
-def test_classifier_none_skips_layer_2_entirely(monkeypatch):
-    monkeypatch.setattr("compliance_copilot.graph.nodes.retrieve", lambda *a, **kw: [])
+def test_classifier_none_skips_layer_2_entirely():
 
     state = _run(PARAPHRASED_QUESTION, classifier=None, llm=_PassLLM())
 

@@ -39,6 +39,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,9 +48,9 @@ from sqlalchemy.orm import Session
 
 from compliance_copilot.db import get_engine
 from compliance_copilot.embeddings import get_embeddings
-from compliance_copilot.graph.build import build_graph
+from compliance_copilot.graph.build import build_graph, make_mcp_tools
 from compliance_copilot.graph.nodes import make_llm
-from compliance_copilot.graph.state import AnswerSchema, CitationError, GraphContext
+from compliance_copilot.graph.state import AnswerSchema, CitationError, GraphContext, ToolCallError
 from compliance_copilot.guards.classifier import make_classifier_llm
 from compliance_copilot.guards.output import _NON_ANSWER_MARKERS, CANARY, OutputGuardError, _norm
 
@@ -323,7 +324,16 @@ def _run_heuristics_subset(attacks: list[Attack]) -> list[dict]:
     return results
 
 
-def _run_full(
+def _blocked_by_bucket(exc: Exception) -> str:
+    """ADR-0007 Day-17 amendment: a `ToolCallError` (MCP transport/timeout/
+    malformed-result failure) is its own bucket, same "invariant break, not
+    an attack outcome" treatment `CitationError`/`OutputGuardError` already
+    get — an MCP outage during a red-team run is a bug to investigate, not
+    a guard doing its job."""
+    return "tool_call_error" if isinstance(exc, ToolCallError) else "citation_error"
+
+
+async def _run_full(
     attacks: list[Attack],
     benign: list[BenignQuestion],
     *,
@@ -331,18 +341,24 @@ def _run_full(
     embeddings,
     llm,
     classifier,
+    tools,
 ) -> tuple[list[dict], list[dict]]:
     """`--subset all`: real dependencies, real graph, real cost (see
-    `_cost_estimate`). Returns (attack_results, benign_results)."""
+    `_cost_estimate`). Returns (attack_results, benign_results).
+
+    `async def`, using `graph.ainvoke(...)` (ADR-0007 Day-17 amendment):
+    `retrieve_node` is `async def` now, and sync `graph.invoke()` raises
+    `TypeError` the moment a run reaches it — `main()` wraps this whole
+    function in `asyncio.run(...)`."""
     attack_results = []
     for a in attacks:
         graph = build_graph()
         context = GraphContext(
-            session=session, embeddings=embeddings, llm=llm, classifier=classifier
+            session=session, embeddings=embeddings, llm=llm, classifier=classifier, tools=tools
         )
         try:
-            state = graph.invoke({"question": a.attack}, context=context)
-        except (CitationError, OutputGuardError):
+            state = await graph.ainvoke({"question": a.attack}, context=context)
+        except (CitationError, OutputGuardError, ToolCallError) as exc:
             # An invariant break, not an attack outcome (ADR-0014/ADR-0021's
             # "raise, don't swallow" rule) — the attack didn't succeed, but
             # this is a bug to investigate, not a guard doing its job.
@@ -350,7 +366,7 @@ def _run_full(
                 {
                     "id": a.id,
                     "category": a.category,
-                    "blocked_by": "citation_error",
+                    "blocked_by": _blocked_by_bucket(exc),
                     "success": False,
                 }
             )
@@ -369,11 +385,11 @@ def _run_full(
     for b in benign:
         graph = build_graph()
         context = GraphContext(
-            session=session, embeddings=embeddings, llm=llm, classifier=classifier
+            session=session, embeddings=embeddings, llm=llm, classifier=classifier, tools=tools
         )
         try:
-            state = graph.invoke({"question": b.question}, context=context)
-        except (CitationError, OutputGuardError):
+            state = await graph.ainvoke({"question": b.question}, context=context)
+        except (CitationError, OutputGuardError, ToolCallError):
             # A benign question that raises is a real, separate bug — the
             # answer model's own verbatim-quote fragility (the SAME failure
             # mode `evals/run_answer_eval.py`'s `citation_error_rate` already
@@ -409,7 +425,8 @@ def _cost_estimate(
     n_reached_answer = sum(
         1
         for r in attack_results
-        if not r["blocked_by"].startswith("guard_in:") and r["blocked_by"] != "citation_error"
+        if not r["blocked_by"].startswith("guard_in:")
+        and r["blocked_by"] not in ("citation_error", "tool_call_error")
     ) + sum(1 for r in benign_results if not r["refused"])
     # Pricing constants, ADR-0002 (answer model)/ADR-0019 (classifier):
     # nano $0.10/$0.40, mini $0.40/$1.60 per MTok in/out. ~50 in/20 out
@@ -490,15 +507,26 @@ def main() -> None:
         embeddings = get_embeddings()
         answer_llm = make_llm()
         classifier_llm = make_classifier_llm()
-        with Session(get_engine()) as session:
-            attack_results, benign_results = _run_full(
-                all_attacks,
-                benign,
-                session=session,
-                embeddings=embeddings,
-                llm=answer_llm,
-                classifier=classifier_llm,
-            )
+
+        # ADR-0007 Day-17 amendment: `_run_full` is `async def` (it awaits
+        # `graph.ainvoke(...)`, and `make_mcp_tools()` itself awaits
+        # `MultiServerMCPClient.get_tools()`) — `asyncio.run` is this CLI's
+        # one entrypoint into the event loop, same pattern cli.py's `ask`
+        # command uses for the same reason.
+        async def _run_async():
+            tools = await make_mcp_tools()
+            with Session(get_engine()) as session:
+                return await _run_full(
+                    all_attacks,
+                    benign,
+                    session=session,
+                    embeddings=embeddings,
+                    llm=answer_llm,
+                    classifier=classifier_llm,
+                    tools=tools,
+                )
+
+        attack_results, benign_results = asyncio.run(_run_async())
         n_nano, n_answer, cost = _cost_estimate(attack_results, benign_results)
 
     print_report(attack_results, benign_results, attacks_by_id, verbose=args.verbose)
