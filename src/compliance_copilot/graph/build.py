@@ -1,8 +1,11 @@
-# src/compliance_copilot/graph/build.py — assembles the two nodes into the
-# LangGraph `StateGraph` (docs/ARCHITECTURE.md §4: today's graph is just
-# `retrieve -> answer`; the router/critic/interrupt nodes shown in that
-# diagram are later features that get added as nodes+edges here, not a
-# restructure).
+# src/compliance_copilot/graph/build.py — assembles the graph's nodes into
+# the LangGraph `StateGraph` (docs/ARCHITECTURE.md §4). ADR-0023 (this
+# feature) adds `router` (before `retrieve`) and `critic` (before
+# `guard_out`) as plain nodes+edges, same incremental pattern every prior
+# guard/gate feature (ADR-0018/0019/0020/0021) added its own node with — no
+# restructure. The `interrupt()`-based HITL pause the architecture diagram
+# also sketches is still a later feature (Day 20, once the critic's
+# confidence score has been calibrated on real traffic).
 from __future__ import annotations
 
 import os
@@ -16,10 +19,12 @@ from sqlalchemy.orm import Session
 
 from compliance_copilot.graph.nodes import (
     answer_node,
+    critic_node,
     guard_in_node,
     guard_out_node,
     refuse_node,
     retrieve_node,
+    router_node,
 )
 from compliance_copilot.graph.state import AnswerSchema, CitationError, GraphContext, GraphState
 from compliance_copilot.settings import settings
@@ -33,8 +38,27 @@ MAX_ATTEMPTS = 2
 def route_after_guard(state: GraphState) -> str:
     """Conditional edge after `guard_in` — mirrors `route_after_answer`
     below: a plain state check reading one `GraphState` key, no `runtime`
-    param needed (same precedent)."""
-    return "refuse" if state["guard"].flagged else "retrieve"
+    param needed (same precedent). ADR-0023: a clean question now goes to
+    `router`, not straight to `retrieve` — `router_node` decides the search
+    scope (or no-ops when disabled) before retrieval runs."""
+    return "refuse" if state["guard"].flagged else "router"
+
+
+def route_after_router(state: GraphState) -> str:
+    """Conditional edge after `router` (ADR-0023) — `out_of_scope` short-
+    circuits straight to `refuse` (no retrieval/answer spend on a question
+    about neither regulation); every other label, INCLUDING an absent
+    `state["router"]` key (router disabled, or a fail-open outage already
+    normalised to `both` by `router_node`), goes to `retrieve`. Two
+    different sources (`route_after_guard` above, this function) both map
+    into the same `refuse` node — confirmed safe: `add_conditional_edges`
+    just adds graph edges, no exclusivity constraint between them (verified
+    against installed `langgraph/graph/state.py`, and smoke-tested in
+    tests/test_graph.py)."""
+    router_verdict = state.get("router")
+    if router_verdict is not None and router_verdict.regulation == "out_of_scope":
+        return "refuse"
+    return "retrieve"
 
 
 def route_after_answer(state: GraphState) -> str:
@@ -42,13 +66,14 @@ def route_after_answer(state: GraphState) -> str:
     param needed (routing only reads two `GraphState` keys; `path` callables
     passed to `add_conditional_edges` support a `runtime` param the same way
     nodes do, via LangGraph's `RunnableCallable` wrapping, but this routing
-    decision doesn't need one). Success -> `guard_out` (ADR-0021: the final
-    output-side gate runs on every path, including a good answer — it's no
-    longer a direct route to END); a citation failure with a retry left ->
-    back to `answer` with the failed draft now in state; out of retries ->
-    `fail` (which raises, never reaching `guard_out`)."""
+    decision doesn't need one). Success -> `critic` (ADR-0023: records a
+    faithfulness verdict, never blocks yet) -> `guard_out` (ADR-0021: the
+    final output-side gate runs on every path, including a good answer); a
+    citation failure with a retry left -> back to `answer` with the failed
+    draft now in state; out of retries -> `fail` (which raises, never
+    reaching `critic`/`guard_out`)."""
     if state.get("answer") is not None:
-        return "guard_out"
+        return "critic"
     if state.get("attempts", 0) < MAX_ATTEMPTS:
         return "answer"
     return "fail"
@@ -121,22 +146,33 @@ def build_graph():
     `interrupt()`-based human review lands, not before)."""
     builder = StateGraph(GraphState, context_schema=GraphContext)
     builder.add_node("guard_in", guard_in_node)
+    builder.add_node("router", router_node)
     builder.add_node("refuse", refuse_node)
     builder.add_node("retrieve", retrieve_node)
     builder.add_node("answer", answer_node)
     builder.add_node("fail", fail_node)
+    builder.add_node("critic", critic_node)
     builder.add_node("guard_out", guard_out_node)
     builder.add_edge(START, "guard_in")
+    # ADR-0023: a clean question now goes to `router`, not straight to
+    # `retrieve` — `router_node` decides the search scope before retrieval.
     builder.add_conditional_edges(
-        "guard_in", route_after_guard, {"retrieve": "retrieve", "refuse": "refuse"}
+        "guard_in", route_after_guard, {"router": "router", "refuse": "refuse"}
+    )
+    builder.add_conditional_edges(
+        "router", route_after_router, {"retrieve": "retrieve", "refuse": "refuse"}
     )
     # ADR-0021: `refuse` no longer goes straight to END — `guard_out` is the
-    # final gate on EVERY path, a `guard_in` refusal included.
+    # final gate on EVERY path, a `guard_in`/`router` refusal included.
     builder.add_edge("refuse", "guard_out")
     builder.add_edge("retrieve", "answer")
     builder.add_conditional_edges(
-        "answer", route_after_answer, {"answer": "answer", "fail": "fail", "guard_out": "guard_out"}
+        "answer", route_after_answer, {"answer": "answer", "fail": "fail", "critic": "critic"}
     )
+    # ADR-0023: `critic` records a faithfulness verdict (never blocks yet,
+    # Day 20's job) — a single unconditional edge into `guard_out`, which
+    # stays the final gate on every path (ADR-0021's invariant).
+    builder.add_edge("critic", "guard_out")
     # `fail_node` always raises (never returns), so this edge is unreachable
     # in practice — kept for the same reason it always was: an explicit
     # graph shape, not a dangling node.
@@ -152,6 +188,8 @@ async def ask(
     embeddings: Embeddings,
     llm: Any,
     classifier: Any | None = None,
+    router: Any | None = None,
+    critic: Any | None = None,
     tools: dict[str, Any] | None = None,
     config: dict | None = None,
 ) -> AnswerSchema:
@@ -173,6 +211,11 @@ async def ask(
     the classifier check, same as before this feature existed, so every
     existing caller that doesn't pass one is unaffected.
 
+    `router`/`critic`: ADR-0023's two new cheap-LLM calls, forwarded into
+    `GraphContext`. `None` (the default) disables each — `router_node`/
+    `critic_node` no-op, same "existing caller unaffected" contract
+    `classifier` above already gives.
+
     `tools`: ADR-0007's MCP tool mapping (`make_mcp_tools()` above), keyed
     by tool name — forwarded into `GraphContext.tools`. `None` (the
     default) means a real question that reaches `retrieve_node` raises
@@ -187,7 +230,13 @@ async def ask(
     pass one."""
     graph = build_graph()
     context = GraphContext(
-        session=session, embeddings=embeddings, llm=llm, classifier=classifier, tools=tools
+        session=session,
+        embeddings=embeddings,
+        llm=llm,
+        classifier=classifier,
+        router=router,
+        critic=critic,
+        tools=tools,
     )
     state = await graph.ainvoke({"question": question}, context=context, config=config)
     return state["answer"]

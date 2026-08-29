@@ -147,6 +147,42 @@ class Settings(BaseSettings):
     mcp_host: str = "127.0.0.1"
     mcp_port: int = 8001
 
+    # ADR-0023: the router — a cheap-LLM call, before `retrieve`, that labels
+    # the question ai_act/gdpr/both/out_of_scope so `retrieve_node` can
+    # narrow `search_regulation`'s filter. `False` is the one-line "how to
+    # reverse" (mirrors `classifier_enabled`) — `router_node` (graph/nodes.py)
+    # then no-ops (`GraphContext.router=None`), `route_after_router` treats
+    # the absent `state["router"]` key the same as "both" (today's
+    # pre-router behaviour), never `out_of_scope`.
+    router_enabled: bool = True
+    # `None` = "use make_router_llm()'s per-provider default" (openai ->
+    # gpt-4.1-nano, anthropic -> claude-haiku-4-5), same reasoning as
+    # `classifier_model`. Set ROUTER_MODEL only to override.
+    router_model: str | None = None
+    # Bounds one slow router call so it can't stall every request — a
+    # timeout here is one more input to `route()`'s fail-open path
+    # (router.py), not a hard failure.
+    router_timeout_s: float = 3.0
+
+    # ADR-0023: the critic — a cheap-LLM call, after `answer`, that checks
+    # whether the drafted answer's claims are actually supported by its own
+    # cited excerpts (semantic support, not just verbatim-quote presence).
+    # `False` disables it entirely (mirrors `classifier_enabled`) —
+    # `critic_node` (graph/nodes.py) no-ops when `GraphContext.critic=None`.
+    critic_enabled: bool = True
+    # `None` = "use make_critic_llm()'s per-provider default", same
+    # reasoning as `classifier_model`/`router_model`.
+    critic_model: str | None = None
+    # Bounds one slow critic call — same reasoning as `router_timeout_s`.
+    critic_timeout_s: float = 3.0
+    # Day-20 placeholder: the confidence cutoff a future conditional edge
+    # (or `interrupt()`) will read to decide whether a low-confidence critic
+    # verdict pauses/blocks an answer. NOT READ ANYWHERE YET — Day 18/20 only
+    # records the critic's verdict (lesson 18: "records first, blocks
+    # later"); declaring the knob now means Day 20 needs no settings-schema
+    # change, only a new conditional edge that reads it.
+    critic_confidence_min: float = 0.6
+
     # ADR-0007 Day-17 amendment: `retrieve_node` (graph/nodes.py) is now the
     # MCP *client* — `False` is the one-line "how to reverse" an MCP-outage
     # incident needs: `build.make_mcp_tools()` returns `None` instead of

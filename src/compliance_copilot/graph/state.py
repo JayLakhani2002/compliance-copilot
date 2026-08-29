@@ -33,9 +33,11 @@ from langchain_core.embeddings import Embeddings
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from compliance_copilot.critic import CriticVerdict
 from compliance_copilot.guards.injection import GuardResult
 from compliance_copilot.guards.output import OutputVerdict
 from compliance_copilot.retriever import RetrievedChunk
+from compliance_copilot.router import RouterVerdict
 
 
 class Citation(BaseModel):
@@ -132,13 +134,25 @@ class GraphContext:
     # unset, same "existing caller keeps working" contract `classifier`
     # above already established.
     tools: Mapping[str, Any] | None = None
+    # ADR-0023: an object with `.invoke(messages) -> RouterVerdict`
+    # (`router.make_router_llm()`'s return value), or `None` to disable the
+    # router entirely (`settings.router_enabled=False`) — same "existing
+    # caller keeps working" default `classifier` above already establishes.
+    router: Any | None = None
+    # ADR-0023: an object with `.invoke(messages) -> CriticVerdict`
+    # (`critic.make_critic_llm()`'s return value), or `None` to disable the
+    # critic entirely (`settings.critic_enabled=False`) — same contract.
+    critic: Any | None = None
 
 
 class GraphState(TypedDict):
-    """Shared state threaded through `guard_in` -> (`retrieve` -> `answer` ->
-    (`answer` -> `guard_out` | `fail`)) | (`refuse` -> `guard_out`). Keys
-    nodes don't fill in until they run are `NotRequired` so the initial
-    `{"question": ...}` dict passed to `.invoke()` is still valid input.
+    """Shared state threaded through `guard_in` -> (`router` -> (`retrieve` ->
+    `answer` -> (`answer` -> `critic` -> `guard_out` | `fail`)) | `refuse`) |
+    (`refuse` -> `guard_out`) — ADR-0023 inserts `router` between `guard_in`
+    and `retrieve`/`refuse`, and `critic` between `answer`'s success branch
+    and `guard_out`. Keys nodes don't fill in until they run are
+    `NotRequired` so the initial `{"question": ...}` dict passed to
+    `.invoke()` is still valid input.
 
     `guard`/`refused` back Day 11's input guard (ADR-0018): `guard_in_node`
     (nodes.py) always fills `guard`; `refused` is only set `True` by
@@ -161,16 +175,29 @@ class GraphState(TypedDict):
     runs on EVERY terminal path — a passed answer, a `guard_in` refusal, and
     an exhausted-retry failure all funnel through it before END. Always
     present once that node has run; its `ok`/`reason` are safe to log (see
-    guards/output.py's `OutputVerdict`)."""
+    guards/output.py's `OutputVerdict`).
+
+    `router` (ADR-0023): set by `router_node`, which runs right after
+    `guard_in` on a clean question — ABSENT when the router is disabled
+    (`GraphContext.router=None`), never present on a `guard_in` refusal
+    (that path skips `router` entirely). `retrieve_node` reads it (falling
+    back to "no filter" when absent) to narrow `search_regulation`'s scope.
+
+    `critic` (ADR-0023): set by `critic_node`, which runs only on the
+    answer-success branch, right before `guard_out` — ABSENT on a refusal
+    (there's no substantive claim to critique) and when the critic is
+    disabled (`GraphContext.critic=None`)."""
 
     question: str
     guard: NotRequired[GuardResult]
     refused: NotRequired[bool]
     pii_entities: NotRequired[tuple[str, ...]]
+    router: NotRequired[RouterVerdict]
     articles: NotRequired[list[RetrievedChunk]]
     recitals: NotRequired[list[RetrievedChunk]]
     answer: NotRequired[AnswerSchema | None]
     draft: NotRequired[AnswerSchema | None]
     citation_error: NotRequired[str | None]
     attempts: NotRequired[int]
+    critic: NotRequired[CriticVerdict]
     output_guard: NotRequired[OutputVerdict]

@@ -17,6 +17,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from compliance_copilot import tracing
+from compliance_copilot.critic import make_critic_llm
 from compliance_copilot.db import Chunk, get_engine, init_db
 from compliance_copilot.embeddings import get_embeddings
 from compliance_copilot.graph import (
@@ -33,6 +34,7 @@ from compliance_copilot.guards.classifier import make_classifier_llm
 from compliance_copilot.ingest.eurlex import REGULATIONS
 from compliance_copilot.ingest.pipeline import ingest
 from compliance_copilot.logging_filter import install_pii_scrub
+from compliance_copilot.router import make_router_llm
 from compliance_copilot.settings import settings
 
 
@@ -50,6 +52,9 @@ async def _run_ask(question: str) -> None:
     # means skip it" contract `guard_in_node` already gives a `None`
     # classifier, so this is a one-line off switch here too.
     classifier = make_classifier_llm() if settings.classifier_enabled else None
+    # ADR-0023: same "disabled means skip it" contract as `classifier` above.
+    router = make_router_llm() if settings.router_enabled else None
+    critic = make_critic_llm() if settings.critic_enabled else None
     # ADR-0007 Day-17 amendment: spawns the MCP server subprocess and loads
     # its tools once for this command invocation (`None` when
     # `settings.mcp_enabled=False` — never a silent fallback to direct
@@ -69,7 +74,13 @@ async def _run_ask(question: str) -> None:
         # for this one extra field isn't worth it (ponytail).
         graph = build_graph()
         context = GraphContext(
-            session=session, embeddings=embeddings, llm=llm, classifier=classifier, tools=tools
+            session=session,
+            embeddings=embeddings,
+            llm=llm,
+            classifier=classifier,
+            router=router,
+            critic=critic,
+            tools=tools,
         )
         try:
             state = await graph.ainvoke({"question": question}, context=context, config=config)

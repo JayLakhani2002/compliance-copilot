@@ -39,6 +39,7 @@ from starlette.responses import Response
 
 from compliance_copilot import embeddings as embeddings_module
 from compliance_copilot import tracing
+from compliance_copilot.critic import make_critic_llm
 from compliance_copilot.db import get_session
 from compliance_copilot.graph import CitationError, GraphContext, make_mcp_tools
 from compliance_copilot.graph.build import build_graph
@@ -46,6 +47,7 @@ from compliance_copilot.graph.nodes import make_llm
 from compliance_copilot.guards.classifier import make_classifier_llm
 from compliance_copilot.guards.output import OutputGuardError
 from compliance_copilot.logging_filter import install_pii_scrub
+from compliance_copilot.router import make_router_llm
 from compliance_copilot.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -119,6 +121,26 @@ def get_classifier_dependency() -> Any | None:
     if not settings.classifier_enabled:
         return None
     return make_classifier_llm()
+
+
+@lru_cache(maxsize=1)
+def get_router_dependency() -> Any | None:
+    """ADR-0023: same "disabled means None" contract as
+    `get_classifier_dependency` above — `router_node` no-ops when this is
+    `None`."""
+    if not settings.router_enabled:
+        return None
+    return make_router_llm()
+
+
+@lru_cache(maxsize=1)
+def get_critic_dependency() -> Any | None:
+    """ADR-0023: same "disabled means None" contract as
+    `get_classifier_dependency` above — `critic_node` no-ops when this is
+    `None`."""
+    if not settings.critic_enabled:
+        return None
+    return make_critic_llm()
 
 
 # ADR-0007 Day-17 amendment: `make_mcp_tools()` is `async def` (it awaits
@@ -237,6 +259,8 @@ async def _stream_answer(
     embeddings: Embeddings,
     llm: Any,
     classifier: Any | None,
+    router: Any | None,
+    critic: Any | None,
     tools: dict[str, Any] | None,
 ) -> AsyncIterator[str]:
     """The `/ask` response body: runs the compiled graph via `astream(...,
@@ -247,7 +271,9 @@ async def _stream_answer(
     `CitationError`'s own docstring, state.py).
 
     `classifier`: ADR-0019's layer-2 guard, `None` when disabled
-    (`get_classifier_dependency` above).
+    (`get_classifier_dependency` above). `router`/`critic`: ADR-0023's two
+    new cheap-LLM calls, `None` when disabled (`get_router_dependency`/
+    `get_critic_dependency` above) — same contract.
 
     ADR-0021: `guard_out` now runs on every path AFTER `refuse`/`answer`
     (build.py), so the `final` event — and which `answer`/`refused` it
@@ -259,7 +285,13 @@ async def _stream_answer(
     are current by then."""
     graph = build_graph()
     context = GraphContext(
-        session=session, embeddings=embeddings, llm=llm, classifier=classifier, tools=tools
+        session=session,
+        embeddings=embeddings,
+        llm=llm,
+        classifier=classifier,
+        router=router,
+        critic=critic,
+        tools=tools,
     )
     started = time.monotonic()
     # One config per request: `run_config()` builds a fresh CallbackHandler
@@ -276,6 +308,13 @@ async def _stream_answer(
         ):
             for node_name, node_update in update.items():
                 elapsed_ms = int((time.monotonic() - started) * 1000)
+                # ADR-0023: `router_node`/`critic_node` return `{}` when
+                # disabled (`GraphContext.router`/`.critic` is `None`) —
+                # verified live that LangGraph normalises an empty-dict node
+                # return to `None` in the `stream_mode="updates"` payload, so
+                # this is what keeps `node_update.get(...)` below safe rather
+                # than raising `AttributeError` on `None`.
+                node_update = node_update or {}
                 if node_name == "guard_in":
                     guard = node_update["guard"]
                     # ADR-0020: entity TYPE names only, e.g. ["PERSON",
@@ -313,6 +352,23 @@ async def _stream_answer(
                         if trace_id is not None:
                             yield _sse("trace", {"trace_id": trace_id})
                         trace_emitted = True
+                elif node_name == "router":
+                    # ADR-0023: absent when the router is disabled
+                    # (`GraphContext.router=None`) — no event at all in that
+                    # case, same "invisible when off" behaviour every other
+                    # optional guard already has. `verdict.reason` is free
+                    # model text (router.py's `RouterVerdict`) — logged only,
+                    # never forwarded in the SSE payload (ADR-0023's leak
+                    # guard: only policy-approved fields reach the client).
+                    verdict = node_update.get("router")
+                    if verdict is not None:
+                        logger.info(
+                            "node=%s regulation=%s elapsed_ms=%d",
+                            node_name,
+                            verdict.regulation,
+                            elapsed_ms,
+                        )
+                        yield _sse("node", {"node": node_name, "regulation": verdict.regulation})
                 elif node_name == "refuse":
                     # No preceding "node" event for `refuse` itself — the
                     # `guard_in` event above already told the client this
@@ -366,6 +422,33 @@ async def _stream_answer(
                         # amendment, Day 10 builds eval scores on top of
                         # this): a validated answer scores 1.0.
                         tracing.score("citation_valid", 1.0, tracing.current_trace_id(config))
+                elif node_name == "critic":
+                    # ADR-0023: absent when the critic is disabled
+                    # (`GraphContext.critic=None`) or on a refused path (the
+                    # critic never runs there — build.py only wires it onto
+                    # `answer`'s success branch). `verdict.reasoning` is free
+                    # model text, same leak-guard rule as `router` above —
+                    # logged and scored, never forwarded in the SSE payload.
+                    verdict = node_update.get("critic")
+                    if verdict is not None:
+                        logger.info(
+                            "node=%s faithful=%s confidence=%s elapsed_ms=%d",
+                            node_name,
+                            verdict.faithful,
+                            verdict.confidence,
+                            elapsed_ms,
+                        )
+                        yield _sse(
+                            "node",
+                            {
+                                "node": node_name,
+                                "faithful": verdict.faithful,
+                                "confidence": verdict.confidence,
+                            },
+                        )
+                        trace_id = tracing.current_trace_id(config)
+                        tracing.score("critic_faithful", 1.0 if verdict.faithful else 0.0, trace_id)
+                        tracing.score("critic_confidence", verdict.confidence, trace_id)
                 elif node_name == "guard_out":
                     # ADR-0021: the final gate, reached on every path. Its
                     # own update only carries "answer"/"refused" when it
@@ -441,6 +524,9 @@ async def lifespan(app: FastAPI):
     # be first, instead of on startup where a slow LLM client construction
     # belongs.
     get_classifier_dependency()
+    # ADR-0023: same reasoning again for the router/critic clients.
+    get_router_dependency()
+    get_critic_dependency()
     # ADR-0007 Day-17 amendment: same reasoning again — spawning the MCP
     # server subprocess and loading its tools happens once here, at
     # startup, not on whichever request happens to arrive first.
@@ -498,6 +584,8 @@ async def ask(
     embeddings: Embeddings = Depends(get_embeddings_dependency),
     llm: Any = Depends(get_llm_dependency),
     classifier: Any | None = Depends(get_classifier_dependency),
+    router: Any | None = Depends(get_router_dependency),
+    critic: Any | None = Depends(get_critic_dependency),
     tools: dict[str, Any] | None = Depends(get_tools_dependency),
 ) -> StreamingResponse:
     generator = _stream_answer(
@@ -506,6 +594,8 @@ async def ask(
         embeddings=embeddings,
         llm=llm,
         classifier=classifier,
+        router=router,
+        critic=critic,
         tools=tools,
     )
     return StreamingResponse(

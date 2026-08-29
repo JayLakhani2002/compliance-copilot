@@ -20,6 +20,7 @@ from langchain_openai import ChatOpenAI
 from langgraph.runtime import Runtime
 from mcp.shared.exceptions import McpError
 
+from compliance_copilot.critic import critique
 from compliance_copilot.graph.state import (
     AnswerSchema,
     CitationError,
@@ -33,6 +34,7 @@ from compliance_copilot.guards.output import CANARY, OutputGuardError, check_out
 from compliance_copilot.guards.pii import redact
 from compliance_copilot.guards.quotes import _MIN_QUOTE_LENGTH, _normalise
 from compliance_copilot.retriever import RetrievedChunk
+from compliance_copilot.router import RouterVerdict, route
 from compliance_copilot.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -196,14 +198,43 @@ def guard_in_node(state: GraphState, runtime: Runtime[GraphContext]) -> dict:
     return {"guard": result, "question": redaction.text, "pii_entities": redaction.entities}
 
 
+def router_node(state: GraphState, runtime: Runtime[GraphContext]) -> dict:
+    """Node between `guard_in` and `retrieve`/`refuse` (ADR-0023): labels the
+    (already guard_in-cleaned, PII-redacted) question `ai_act`/`gdpr`/`both`/
+    `out_of_scope` so `retrieve_node` can narrow its search filter, and so
+    `route_after_router` (build.py) can short-circuit an out-of-scope
+    question straight to `refuse` without spending a retrieval/answer call.
+
+    `runtime.context.router is None` (router disabled, `settings.
+    router_enabled=False`) is a no-op — returns `{}`, leaving `state["router"]`
+    absent, which `retrieve_node`/`route_after_router` both treat as "no
+    filter, never out_of_scope" (today's pre-router behaviour, the same
+    "existing caller keeps working" contract `classifier`/`tools` already
+    give `GraphContext`).
+
+    `route()` (router.py) returns `None` on any outage — failed OPEN to
+    `both` here (not `out_of_scope`): the harm ceiling of a wrong scope guess
+    is a slightly worse top-5, not a wrong action, so an outage must never
+    turn into a false refusal (docs/decisions/ADR-0023). `route()` already
+    logs the exception class name on failure; nothing further to log here."""
+    router_llm = runtime.context.router
+    if router_llm is None:
+        return {}
+    verdict = route(state["question"], router_llm)
+    if verdict is None:
+        verdict = RouterVerdict(regulation="both", reason="router_error")
+    return {"router": verdict}
+
+
 def refuse_node(state: GraphState) -> dict:
-    """Reached only when `route_after_guard` (build.py) sends the graph
-    here — a refusal is a normal answer with zero citations flowing through
-    the same `AnswerSchema` shape every other answer uses, not a raised
-    exception (ADR-0018: `guard_in` blocks by returning a value, the same
-    "guard blocks, never swaps" posture ADR-0014/0015 already established
-    for citation failures, just via a different mechanism since there's no
-    LLM draft to reject here)."""
+    """Reached when `route_after_guard` OR `route_after_router` (build.py,
+    ADR-0023) sends the graph here — a `guard_in` block and an `out_of_scope`
+    router verdict share this same node. A refusal is a normal answer with
+    zero citations flowing through the same `AnswerSchema` shape every other
+    answer uses, not a raised exception (ADR-0018: `guard_in` blocks by
+    returning a value, the same "guard blocks, never swaps" posture
+    ADR-0014/0015 already established for citation failures, just via a
+    different mechanism since there's no LLM draft to reject here)."""
     return {"answer": AnswerSchema(answer=REFUSAL_TEXT, citations=[]), "refused": True}
 
 
@@ -333,10 +364,20 @@ async def retrieve_node(state: GraphState, runtime: Runtime[GraphContext]) -> di
     question = state["question"]
     timeout = settings.mcp_tool_timeout_s
 
+    # ADR-0023: `state.get("router")` — absent (router disabled or never
+    # ran) is treated identically to a "both" verdict, i.e. no filter, the
+    # pre-router behaviour every existing test/caller already expects.
+    router_verdict = state.get("router")
+    regulation = (
+        None
+        if router_verdict is None or router_verdict.regulation == "both"
+        else router_verdict.regulation
+    )
+
     search_result = await _call_tool(
         tools["search_regulation"],
         "search_regulation",
-        {"question": question, "k": 5},
+        {"question": question, "k": 5, "regulation": regulation},
         timeout=timeout,
     )
     # `list[dict]` returns come back from the SDK wrapped as `{"result":
@@ -509,6 +550,41 @@ def answer_node(state: GraphState, runtime: Runtime[GraphContext]) -> dict:
         return {"draft": result, "citation_error": str(exc), "attempts": attempts, "answer": None}
 
     return {"answer": result, "citation_error": None, "attempts": attempts}
+
+
+def critic_node(state: GraphState, runtime: Runtime[GraphContext]) -> dict:
+    """Node between `answer`'s success branch and `guard_out` (ADR-0023,
+    ADR-0021's invariant: `guard_out` stays the final gate on EVERY path —
+    this node sits BEFORE it, never replaces it). Never runs on a refusal
+    (`route_after_answer`, build.py, only sends the success branch here) —
+    a fixed refusal has zero citations and no substantive claim to critique.
+
+    Checks the gap neither `_validate_citations` nor `guard_out`'s
+    `citation_not_retrieved` re-check can see: does the drafted answer's
+    PROSE claim actually follow from what the quoted text SAYS (semantic
+    support), not just whether the quote string is verbatim-present.
+
+    Context is built from `state["articles"]` (already in memory, no DB
+    round-trip) and CITED-only (same `(regulation, anchor)` keying
+    `_validate_citations` above already uses) — mirrors the offline judge's
+    (`evals/judge.py`) own cited-only contract, so the two stay comparable.
+
+    `runtime.context.critic is None` (critic disabled, `settings.
+    critic_enabled=False`) is a no-op — returns `{}`, leaving
+    `state["critic"]` absent. `critique()` (critic.py) never raises past
+    this node — an outage still yields a verdict, a pessimistic one."""
+    critic_llm = runtime.context.critic
+    if critic_llm is None:
+        return {}
+    answer = state["answer"]
+    by_key = {(c.regulation, c.anchor): c.text for c in state["articles"]}
+    contexts = [
+        by_key[(cit.regulation, cit.anchor)]
+        for cit in answer.citations
+        if (cit.regulation, cit.anchor) in by_key
+    ]
+    verdict = critique(state["question"], answer.answer, contexts, critic_llm)
+    return {"critic": verdict}
 
 
 def guard_out_node(state: GraphState) -> dict:

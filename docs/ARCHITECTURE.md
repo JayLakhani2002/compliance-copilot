@@ -86,30 +86,32 @@ C4Container
 A **node** is a Python function that reads and updates shared state; an **edge** decides which node runs next. **Interrupt** means the graph pauses mid-run and waits for external input (a human) before resuming — LangGraph persists the paused state to the Postgres checkpointer so the pause can outlast the process.
 
 Solid edges below are the actual compiled graph (`graph/build.py`) as it
-exists today; dashed edges mark where `router`/`critic`/`hitl` are *designed*
-to sit once built — none of the three exist as nodes yet (`grep -rn
-"add_node" src/compliance_copilot/graph/build.py` is the source of truth).
+exists today (ADR-0023 shipped `router`/`critic` as real nodes); the dashed
+edge marks where `hitl` is *designed* to sit once built (Day 20) — it does
+not exist as a node yet (`grep -rn "add_node" src/compliance_copilot/graph/build.py`
+is the source of truth).
 
 ```mermaid
 flowchart TD
     START([START]) --> guard_in[guard_in\nprompt-injection heuristics + Haiku classifier\nPII detection/redaction]
     guard_in -- blocked --> refuse[refuse\nfixed refusal text, AnswerSchema shape]
-    guard_in -- clean --> retrieve[retrieve\nMCP client: search_regulation + get_article\narticles only, ADR-0007 Day-17 amendment]
-    guard_in -. clean .-> router{{router (planned, Week 4)\nHaiku: classify question type\n+ pick retrieval strategy}}
+    guard_in -- clean --> router[router\nHaiku/nano: ai_act / gdpr / both / out_of_scope\nADR-0023]
+    router -- out_of_scope --> refuse
+    router -- ai_act / gdpr / both --> retrieve[retrieve\nMCP client: search_regulation + get_article\nregulation filter from router, ADR-0007/0023]
     retrieve --> answer[answer\nSonnet/GPT drafts answer\nstructured output + citations\nself-validates, retries once]
     answer -- citation invalid, retry left --> answer
     answer -- retries exhausted --> fail[["fail\nraises CitationError"]]
-    answer -- citations valid --> guard_out[guard_out\ncanary / scaffold / PII-placeholder leak checks\nscope heuristic · citation-retrieved invariant]
-    answer -. citations valid .-> critic{{critic (planned, Week 4)\nHaiku LLM-judge: faithful to retrieved text?\nconfidence score}}
-    critic -.-> hitl[["hitl (planned, Week 4)\ninterrupt(): pause, persist checkpoint,\nsurface draft + reasoning to operator"]]
+    answer -- citations valid --> critic[critic\nHaiku/nano LLM-judge: faithful to cited excerpts?\nconfidence score, ADR-0023 — records only, does not block yet]
+    critic --> guard_out[guard_out\ncanary / scaffold / PII-placeholder leak checks\nscope heuristic · citation-retrieved invariant]
+    critic -.-> hitl[["hitl (planned, Day 20)\ninterrupt(): pause on low critic confidence,\npersist checkpoint, surface draft to operator"]]
     refuse --> guard_out
     guard_out --> END([END, streamed to client])
 
     classDef planned stroke-dasharray: 5 5,fill:#eee,color:#666;
-    class router,critic,hitl planned;
+    class hitl planned;
 ```
 
-State carried through the graph (conceptually — the actual `TypedDict`/Pydantic schema is defined in code, not here): the original question, redacted question, classification, retrieved chunks with article IDs, draft answer, citation list, critic confidence score and reasoning, and a running list of guardrail events (for the trace and for the refusal message if one is needed).
+State carried through the graph (conceptually — the actual `TypedDict`/Pydantic schema is defined in code, not here): the original question, redacted question, router label, retrieved chunks with article IDs, draft answer, citation list, critic confidence score and reasoning, and a running list of guardrail events (for the trace and for the refusal message if one is needed).
 
 Why `interrupt()` and not just a low-confidence label in the response: the eval-gated CI pipeline (ADR-0005) measures faithfulness and citation correctness on a golden set, but at *runtime*, on questions outside that golden set, a human review step is the guardrail of last resort before an uncertain legal-adjacent answer reaches a user. This is also the strongest "I built durable, resumable agent state" demonstration for the target job market (see `docs/research/market_research.md`).
 
@@ -133,29 +135,35 @@ sequenceDiagram
         G-->>API: refusal
         API-->>U: SSE: refusal message
     else clean
-        G->>LLM: router classification (Haiku)
-        LLM-->>G: question type + strategy
-        G->>M: search_regulation(query, filters)
-        M->>PG: vector similarity search
-        PG-->>M: top-k chunks + metadata
-        M-->>G: chunks with article refs
-        G->>LLM: draft answer (Sonnet, chunks as context)
-        LLM-->>G: structured answer + citations
-        G->>LLM: critic / LLM-judge (Haiku)
-        LLM-->>G: confidence score + reasoning
-        G-->>LF: trace: full run, cost, latency, scores
-        alt confidence high
+        G->>LLM: router (nano/Haiku): ai_act / gdpr / both / out_of_scope
+        LLM-->>G: regulation label
+        alt out_of_scope
+            G-->>API: refusal (no retrieval spend)
+            API-->>U: SSE: refusal message
+        else in scope
+            G->>M: search_regulation(query, regulation filter)
+            M->>PG: vector similarity search
+            PG-->>M: top-k chunks + metadata
+            M-->>G: chunks with article refs
+            G->>LLM: draft answer (Sonnet, chunks as context)
+            LLM-->>G: structured answer + citations
+            G->>LLM: critic (nano/Haiku): faithful to cited excerpts?
+            LLM-->>G: confidence score + reasoning
+            G-->>LF: trace: full run, cost, latency, scores (incl. critic_faithful/critic_confidence)
+            Note over G: guard_out runs unconditionally next (ADR-0021) —<br/>critic RECORDS a score today, it does not branch yet
             G->>G: guard_out (citation-exists check, schema validate)
             G-->>API: final answer
             API-->>U: SSE: streamed answer + citations
-        else confidence low
-            G->>G: interrupt() — persist checkpoint to PG
-            G-->>API: run paused (thread_id)
-            API-->>U: SSE: "under review" status
-            Note over G,PG: operator resumes later via separate endpoint
         end
     end
 ```
+
+Day 20 (planned, not yet built): once the critic's confidence score has
+been calibrated on real traffic, a low-confidence verdict routes to
+`interrupt()` instead of straight to `guard_out` — pausing the run,
+persisting the checkpoint to Postgres, and surfacing the draft to an
+operator via a separate resume endpoint, rather than the unconditional path
+shown above.
 
 ## 6. Trust boundaries
 
