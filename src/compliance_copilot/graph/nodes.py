@@ -27,6 +27,7 @@ from compliance_copilot.graph.state import (
     GraphContext,
     GraphState,
     ToolCallError,
+    Turn,
 )
 from compliance_copilot.guards.classifier import classify
 from compliance_copilot.guards.injection import GuardResult, detect
@@ -53,6 +54,49 @@ REFUSAL_TEXT = (
     "I can only answer questions about the EU AI Act and GDPR based on their "
     "text. This request was declined by the input safety check."
 )
+
+# ADR-0024: per-turn keys that must NOT leak from turn N into turn N+1 of the
+# same thread_id — state does not auto-reset between checkpointed turns (a
+# checkpoint is a snapshot of EVERYTHING), so without this, e.g. turn 1's
+# `attempts` count (already at MAX_ATTEMPTS after a retry) would make turn
+# 2's FIRST citation failure route straight to `fail` instead of getting its
+# own retry (`route_after_answer`, build.py, reads `attempts` with no idea
+# which turn it came from). `guard_in_node` merges this into every one of
+# its return dicts (below) since it's the one node every turn always visits
+# first. `None`/`0`/`False` here reproduce the exact "key absent" behaviour
+# every reader (`state.get(...)`) already treats as the fresh-turn default —
+# this is not a new contract, just making sure a stale value never survives
+# to be read as if it were fresh.
+#
+# `refused` is in this set for a real reason found while testing this
+# feature, not just for completeness: `check_output` (guards/output.py)
+# SKIPS its `placeholder_leak`/`citation_not_retrieved`/`scope_unsupported`
+# checks entirely once `refused=True` (a refusal is fixed text, by
+# construction, so those checks don't apply to it). If a turn ends in a
+# refusal and `refused` weren't reset, a LATER turn's real, generated answer
+# would inherit that stale `True` and have those checks silently skipped —
+# a citation `retrieve_node` never fetched could sail through unchecked.
+_PER_TURN_RESET: dict[str, Any] = {
+    "answer": None,
+    "refused": False,
+    "draft": None,
+    "citation_error": None,
+    "attempts": 0,
+    "output_guard": None,
+    "router": None,
+    "critic": None,
+    # `pii_entities` is only written on the redaction branch of `guard_in`, so
+    # without this reset a clean turn-2 question would still carry turn-1's
+    # entity list — and `cli.py` reads it off the merged state to print
+    # "PII redacted". Its presence must always describe THIS question (state.py).
+    "pii_entities": (),
+    # Retrieval results are per-question too. `retrieve_node` refills them on
+    # the clean path; on a refusal path they would otherwise linger from the
+    # previous turn (harmless today only because `check_output` skips the
+    # citation check when refused=True — don't rely on that cross-file detail).
+    "articles": [],
+    "recitals": [],
+}
 
 # Module constant, not built inline in `answer()`: stable text across every
 # call is what lets prompt caching kick in without touching this string
@@ -153,11 +197,18 @@ def guard_in_node(state: GraphState, runtime: Runtime[GraphContext]) -> dict:
     both ran on the RAW text above, so an attacker can't dodge either check
     by wrapping a payload in PII-looking text and hoping redaction erases
     it before detection sees it. A question that's already refusing never
-    needs redacting: `refuse_node` never reads `state['question']`."""
+    needs redacting: `refuse_node` never reads `state['question']`.
+
+    ADR-0024: also the per-turn reset point — `_PER_TURN_RESET` is merged
+    into every return below, since `guard_in_node` is the one node every
+    turn of a checkpointed thread always visits first, before anything that
+    reads a per-turn key (`route_after_answer`'s `attempts`, `answer_node`'s
+    `citation_error`/`draft`, ...) gets a chance to see a stale value left
+    over from a previous turn."""
     result = detect(state["question"], threshold=settings.guard_threshold)
     if result.flagged:
         logger.info("guard_in flagged reasons=%s score=%s", result.reasons, result.score)
-        return {"guard": result}
+        return {**_PER_TURN_RESET, "guard": result}
 
     classifier = runtime.context.classifier
     if classifier is not None:
@@ -179,11 +230,11 @@ def guard_in_node(state: GraphState, runtime: Runtime[GraphContext]) -> dict:
                 flagged=True, score=verdict.confidence, reasons=(f"classifier:{verdict.category}",)
             )
     if result.flagged or not settings.pii_redaction_enabled:
-        return {"guard": result}
+        return {**_PER_TURN_RESET, "guard": result}
 
     redaction = redact(state["question"])
     if not redaction.entities:
-        return {"guard": result}
+        return {**_PER_TURN_RESET, "guard": result}
     logger.info("guard_in pii redacted entities=%s", redaction.entities)
     # Everything downstream (retrieve/answer/tracing) reads `state["question"]`
     # — returning it here overwrites the raw text, so the redacted version is
@@ -195,7 +246,12 @@ def guard_in_node(state: GraphState, runtime: Runtime[GraphContext]) -> dict:
     stripped = _PLACEHOLDER_RE.sub("", redaction.text).strip()
     if len(redaction.text) < 10 or not stripped:
         result = GuardResult(flagged=True, score=1.0, reasons=("pii_only",))
-    return {"guard": result, "question": redaction.text, "pii_entities": redaction.entities}
+    return {
+        **_PER_TURN_RESET,
+        "guard": result,
+        "question": redaction.text,
+        "pii_entities": redaction.entities,
+    }
 
 
 def router_node(state: GraphState, runtime: Runtime[GraphContext]) -> dict:
@@ -444,17 +500,38 @@ def _render_chunk(chunk: RetrievedChunk) -> str:
     return f"{header}{text}</excerpt>"
 
 
-def _build_messages(state: GraphState) -> list[tuple[str, str] | SystemMessage]:
-    """Renders the retrieved context + question into the (role, content)
-    message pairs any `BaseChatModel.invoke()` accepts (a plain 2-tuple of
-    (role, content) is the generic input form every LangChain chat model's
-    `.invoke()` normalises through `langchain_core.messages.utils`).
+def _history_messages(state: GraphState) -> list[tuple[str, str]]:
+    """ADR-0024: renders `state.get("history", [])` (already capped to the
+    last 3 turns by `guard_out_node`, see `Turn`'s docstring in state.py) as
+    prior `("human", question), ("ai", answer)` pairs, oldest first — the
+    same generic 2-tuple message form `_build_messages` already uses, so
+    `runtime.context.llm.invoke(messages)` sees it as ordinary conversation
+    turns. Absent/empty on a graph with no checkpointer, or a thread's first
+    turn — `[]` in, `[]` out, no change to `_build_messages`'s existing
+    output shape for every caller that predates this feature."""
+    messages: list[tuple[str, str]] = []
+    for turn in state.get("history", []):
+        messages.append(("human", turn.question))
+        messages.append(("ai", turn.answer))
+    return messages
 
-    Ordering — system, then articles+recitals, then question last — is
-    deliberate: it's the stable-prefix-first shape both providers' prompt
-    caching needs (OpenAI automatic, Anthropic via `_system_message` above).
-    The question is HTML-escaped for the same reason chunk text is (see
-    `_render_chunk`) — it can't otherwise close the `<question>` tag early."""
+
+def _build_messages(state: GraphState) -> list[tuple[str, str] | SystemMessage]:
+    """Renders the conversation history + retrieved context + question into
+    the (role, content) message pairs any `BaseChatModel.invoke()` accepts
+    (a plain 2-tuple of (role, content) is the generic input form every
+    LangChain chat model's `.invoke()` normalises through
+    `langchain_core.messages.utils`).
+
+    Ordering — system, then prior-turn history, then THIS turn's
+    articles+recitals+question last — is deliberate: it's the
+    stable-prefix-first shape both providers' prompt caching needs (OpenAI
+    automatic, Anthropic via `_system_message` above) — the system prompt
+    never changes, history changes turn-to-turn but is still more stable
+    than this turn's freshly-retrieved excerpts, which change every call
+    (ADR-0002/ADR-0007, ADR-0024). The question is HTML-escaped for the same
+    reason chunk text is (see `_render_chunk`) — it can't otherwise close
+    the `<question>` tag early."""
     articles_block = "\n\n".join(_render_chunk(c) for c in state["articles"])
     recitals_block = "\n\n".join(_render_chunk(c) for c in state["recitals"])
     escaped_question = html.escape(state["question"], quote=False)
@@ -463,7 +540,7 @@ def _build_messages(state: GraphState) -> list[tuple[str, str] | SystemMessage]:
         f"<supporting_context>\n{recitals_block}\n</supporting_context>\n\n"
         f"<question>{escaped_question}</question>"
     )
-    return [_system_message(), ("human", human)]
+    return [_system_message(), *_history_messages(state), ("human", human)]
 
 
 def _validate_citations(
@@ -587,6 +664,27 @@ def critic_node(state: GraphState, runtime: Runtime[GraphContext]) -> dict:
     return {"critic": verdict}
 
 
+# ADR-0024: how many prior turns `answer_node` replays into the prompt.
+# Bounds both token cost and prompt-cache stability (ADR-0002/ADR-0007's
+# stable-prefix note) — unbounded history would grow the prefix every turn,
+# which breaks caching on every single call instead of just the
+# per-request excerpts that already change every call regardless.
+_HISTORY_MAX_TURNS = 3
+
+
+def _capped_history(state: GraphState, answer_text: str) -> list[Turn]:
+    """Appends this turn to `state.get("history", [])` and trims to the last
+    `_HISTORY_MAX_TURNS` — the FULL replacement list, not a delta (`history`
+    has no reducer, see `GraphState`'s docstring in state.py: `guard_out_node`
+    is the only writer, so "last write wins" is exactly the semantics this
+    needs, and a plain field is what lets a full-replacement return actually
+    cap the length instead of an `operator.add`-style reducer re-growing it
+    every turn)."""
+    return [*state.get("history", []), Turn(question=state["question"], answer=answer_text)][
+        -_HISTORY_MAX_TURNS:
+    ]
+
+
 def guard_out_node(state: GraphState) -> dict:
     """Node 3 (final): ADR-0021's independent output-side gate. Wired
     (build.py) so EVERY terminal path reaches this node before END — a
@@ -603,14 +701,31 @@ def guard_out_node(state: GraphState) -> dict:
     covers both "never retrieved" and "retrieved zero articles" the same
     way, since `check_output` treats "no retrieval happened" and "nothing
     was retrieved" identically (there's no citation that COULD be valid
-    either way)."""
+    either way).
+
+    ADR-0024: this is also the ONE place `state["history"]` is written — on
+    every path that returns rather than raises, since `guard_out` is the
+    final gate every terminal path reaches (ADR-0021's invariant) and by
+    the time it runs, `current_answer`'s text is settled either way. The
+    `citation_not_retrieved`/broken-refusal raise below does NOT append a
+    turn: that path means an upstream invariant is buggy, not that this
+    question got a real answer worth remembering."""
     articles = state.get("articles") or []
     retrieved_keys = {(c.regulation, c.anchor) for c in articles} or None
     refused = state.get("refused", False)
     verdict = check_output(state["answer"], retrieved_keys=retrieved_keys, refused=refused)
 
     if verdict.ok:
-        return {"output_guard": verdict}
+        if refused:
+            # A refused turn is not remembered: replaying a flagged (e.g.
+            # injection-attempt) question as "prior context" for the next
+            # three turns would hand it a second, unscreened way into the
+            # prompt. History holds answered questions only.
+            return {"output_guard": verdict}
+        return {
+            "output_guard": verdict,
+            "history": _capped_history(state, state["answer"].answer),
+        }
 
     logger.info("guard_out blocked reason=%s", verdict.reason)
 
@@ -630,11 +745,10 @@ def guard_out_node(state: GraphState) -> dict:
     # fixed refusal shape `guard_in`'s `refuse_node` already produces, so
     # any client handles exactly one refusal shape regardless of which
     # guard produced it (ADR-0014's "guard blocks, never swaps" rule).
-    return {
-        "answer": AnswerSchema(answer=REFUSAL_TEXT, citations=[]),
-        "refused": True,
-        "output_guard": verdict,
-    }
+    rewritten = AnswerSchema(answer=REFUSAL_TEXT, citations=[])
+    # Same rule as above: a turn that ended in a refusal is not added to
+    # history, so the next turn starts from the last *answered* exchange.
+    return {"answer": rewritten, "refused": True, "output_guard": verdict}
 
 
 # ADR-0002: the target tier is Sonnet; its 2026-08-24 amendment makes

@@ -4,19 +4,25 @@
 # whatever DATABASE_URL points at; `--reset` drops and recreates it — dev
 # only, see db.py's init_db docstring), `ingest` (fetch+parse+embed+upsert a
 # regulation; `--dry-run` fetches/parses/embeds but rolls back instead of
-# committing), and `search` (embed a question, print the top-k nearest
-# chunks by cosine distance — the first retrieval smoke test, ADR-0004).
+# committing), `search` (embed a question, print the top-k nearest chunks by
+# cosine distance — the first retrieval smoke test, ADR-0004), `ask` (runs
+# the graph for one question, ADR-0024's `--thread-id` continues a prior
+# conversation), and `delete-thread` (ADR-0024's GDPR-flavoured erasure path
+# — drops every checkpoint for one thread_id).
 # `python -m compliance_copilot.cli init-db --reset` / `... ingest
 # --regulation all` / `... search "What is a high-risk AI system?"` /
-# `... ask "What is a high-risk AI system?"`.
+# `... ask "What is a high-risk AI system?"` / `... ask "..." --thread-id
+# <uuid>` / `... delete-thread <uuid>`.
 import argparse
 import asyncio
 import sys
+import uuid
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from compliance_copilot import tracing
+from compliance_copilot.checkpointer import build_checkpointer, validate_thread_id
 from compliance_copilot.critic import make_critic_llm
 from compliance_copilot.db import Chunk, get_engine, init_db
 from compliance_copilot.embeddings import get_embeddings
@@ -38,14 +44,23 @@ from compliance_copilot.router import make_router_llm
 from compliance_copilot.settings import settings
 
 
-async def _run_ask(question: str) -> None:
+async def _run_ask(question: str, thread_id: str | None = None) -> None:
     """The `ask` command's body (ADR-0007 Day-17 amendment): `async def`,
     driving `graph.ainvoke(...)` — a real installed-`langgraph` smoke test
     confirmed sync `graph.invoke()` raises `TypeError: No synchronous
     function provided` the moment a run reaches `retrieve_node` (now
     `async def`, since it awaits an MCP tool call), so `main()` below wraps
     this one call in `asyncio.run(...)` rather than keeping a sync path
-    that no longer works."""
+    that no longer works.
+
+    ADR-0024: `thread_id` is `None` on a first-turn CLI call — the server
+    mints one (`uuid.uuid4()`) and prints it to stderr, the same "learn the
+    id you'll need to continue" contract `api.py`'s `thread` SSE event
+    gives an HTTP client; `main()`'s `--thread-id` flag is what a second
+    invocation passes back in to continue that conversation.
+    `build_checkpointer()` opens/closes its pool around this ONE call — a
+    CLI invocation is a fresh OS process every time, unlike the FastAPI
+    app's one long-lived pool (api.py's `lifespan`)."""
     embeddings = get_embeddings()
     llm = make_llm()
     # ADR-0019: `None` when CLASSIFIER_ENABLED=false — same "disabled
@@ -60,19 +75,27 @@ async def _run_ask(question: str) -> None:
     # `settings.mcp_enabled=False` — never a silent fallback to direct
     # retrieval, see `make_mcp_tools`'s docstring).
     tools = await make_mcp_tools()
+    resolved_thread_id = thread_id or str(uuid.uuid4())
+    # Printed immediately, before the graph even runs — same "the caller
+    # learns thread_id in time to reuse it, regardless of how this turn
+    # turns out" contract api.py's `thread` SSE event gives (that event is
+    # also the very first thing emitted, ADR-0024).
+    print(f"thread: {resolved_thread_id}", file=sys.stderr)
     # ADR-0009 amendment: a no-op config (empty callbacks list) when no
     # Langfuse keys are set — `tracing.run_config()` is a fresh function
     # call per invocation, no different from calling `graph.invoke` with
-    # no config= at all in that case.
+    # no config= at all in that case. `configurable.thread_id` (ADR-0024)
+    # rides alongside it, same shape api.py's `_stream_answer` builds.
     config = tracing.run_config()
-    with Session(get_engine()) as session:
+    config["configurable"] = {"thread_id": resolved_thread_id}
+    async with build_checkpointer() as checkpointer, Session(get_engine()) as session:
         # ADR-0020: calls the compiled graph directly (not the `ask()`
         # convenience wrapper) so this command can read `pii_entities`
         # off the final state — `ask()` deliberately keeps returning
         # just `AnswerSchema` for its other callers (tests,
         # test_graph_real_integration.py), so widening its signature
         # for this one extra field isn't worth it (ponytail).
-        graph = build_graph()
+        graph = build_graph(checkpointer=checkpointer)
         context = GraphContext(
             session=session,
             embeddings=embeddings,
@@ -148,6 +171,33 @@ async def _run_ask(question: str) -> None:
             print(f"trace: {trace_id}", file=sys.stderr)
 
 
+def _valid_thread_id(value: str) -> str:
+    """`argparse` `type=` callable for `--thread-id`/`delete-thread`'s
+    positional arg — raises `argparse.ArgumentTypeError` (argparse's own
+    convention for a bad `type=` conversion, prints a clean usage error
+    instead of a raw traceback) on anything `validate_thread_id`
+    (checkpointer.py) rejects, so both CLI entry points and `api.py`'s
+    `AskRequest` enforce the exact same UUID4 rule from one place."""
+    try:
+        return validate_thread_id(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+async def _run_delete_thread(thread_id: str) -> None:
+    """The `delete-thread` command's body (ADR-0024's GDPR-flavoured
+    erasure path) — drops every checkpoint row for `thread_id`. Opens its
+    own checkpointer for this one call, same "fresh process, fresh pool"
+    reasoning as `_run_ask` above. `adelete_thread` is idempotent-in-effect
+    (deleting an already-empty/unknown thread just deletes zero rows, per
+    the installed `AsyncPostgresSaver.adelete_thread`'s own `DELETE ...
+    WHERE thread_id = ...` implementation) — no separate "does this thread
+    exist" check needed before calling it."""
+    async with build_checkpointer() as checkpointer:
+        await checkpointer.adelete_thread(thread_id)
+    print(f"deleted all checkpoints for thread {thread_id}")
+
+
 def main() -> None:
     # ADR-0020: logging backstop (defence-in-depth only, see
     # logging_filter.py's module docstring) — installed before any command
@@ -194,6 +244,19 @@ def main() -> None:
         "ask", help="Run the retrieve -> answer graph and print a cited answer."
     )
     ask_parser.add_argument("question")
+    ask_parser.add_argument(
+        "--thread-id",
+        type=_valid_thread_id,
+        default=None,
+        help="ADR-0024: continue a prior conversation (a UUID4 this command already printed "
+        "to stderr on an earlier call). Omit to start a new one — the server mints one.",
+    )
+
+    delete_thread_parser = subparsers.add_parser(
+        "delete-thread",
+        help="ADR-0024: erase all checkpointed state for a thread_id (GDPR erasure path).",
+    )
+    delete_thread_parser.add_argument("thread_id", type=_valid_thread_id)
 
     args = parser.parse_args()
 
@@ -246,7 +309,9 @@ def main() -> None:
         # is the CLI's one entrypoint into the event loop, same pattern
         # `evals/run_redteam.py`/`evals/run_answer_eval.py`'s `main()`
         # functions use for the same reason.
-        asyncio.run(_run_ask(args.question))
+        asyncio.run(_run_ask(args.question, args.thread_id))
+    elif args.command == "delete-thread":
+        asyncio.run(_run_delete_thread(args.thread_id))
 
 
 if __name__ == "__main__":

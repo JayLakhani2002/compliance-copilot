@@ -11,6 +11,7 @@ from compliance_copilot.graph.state import (
     CitationError,
     GraphContext,
     ToolCallError,
+    Turn,
 )
 from compliance_copilot.guards.output import OutputGuardError
 
@@ -22,6 +23,7 @@ __all__ = [
     "GraphContext",
     "OutputGuardError",
     "ToolCallError",
+    "Turn",
     "ask",
     "build_graph",
     "make_mcp_tools",

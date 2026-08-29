@@ -85,6 +85,8 @@ C4Container
 
 A **node** is a Python function that reads and updates shared state; an **edge** decides which node runs next. **Interrupt** means the graph pauses mid-run and waits for external input (a human) before resuming — LangGraph persists the paused state to the Postgres checkpointer so the pause can outlast the process.
 
+**ADR-0024 (Day 19):** the Postgres checkpointer described above is live for *every* run today, not only a future interrupt-pending one — `build_graph(checkpointer=...)` compiles with an `AsyncPostgresSaver` in the API/CLI (`InMemorySaver` in unit tests), keyed by the `thread_id` a client sends back on `/ask`. This is what makes a follow-up question ("and what about deployers?") see the prior turn's question/answer, capped to the last 3 turns and rendered into the prompt after the system prompt, before the current excerpts. The graph's node shape below is unchanged by this — persistence is wiring around the compiled graph (`.compile(checkpointer=...)`, a `thread_id` in `config["configurable"]`), not a new node.
+
 Solid edges below are the actual compiled graph (`graph/build.py`) as it
 exists today (ADR-0023 shipped `router`/`critic` as real nodes); the dashed
 edge marks where `hitl` is *designed* to sit once built (Day 20) — it does

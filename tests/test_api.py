@@ -10,13 +10,16 @@ from __future__ import annotations
 
 import json
 import time
+import uuid
 
 import pytest
 from fake_mcp_tools import tools_from_articles
 from fastapi.testclient import TestClient
+from langgraph.checkpoint.memory import InMemorySaver
 
 from compliance_copilot.api import (
     app,
+    get_checkpointer_dependency,
     get_classifier_dependency,
     get_critic_dependency,
     get_embeddings_dependency,
@@ -213,21 +216,24 @@ def test_happy_path_streams_retrieve_then_answer_then_final(client):
     # exactly as before. ADR-0021 adds `guard_out` as the real last node
     # before `final` — every path (this one included) now gets one extra
     # trailing "node" event, and `final` is emitted there, not at `answer`.
-    assert [e[0] for e in events] == ["node", "node", "node", "node", "final"]
-    assert events[0][1] == {
+    # ADR-0024: `thread` is now the very first event of every request,
+    # ahead of `guard_in` — the server-issued (no `thread_id` sent) id.
+    assert [e[0] for e in events] == ["thread", "node", "node", "node", "node", "final"]
+    uuid.UUID(events[0][1]["thread_id"])  # must not raise — a valid UUID string
+    assert events[1][1] == {
         "node": "guard_in",
         "flagged": False,
         "score": 0.0,
         "reasons": [],
         "pii": [],
     }
-    assert events[1][1] == {"node": "retrieve", "articles": ["art_6"], "recitals": []}
-    assert events[2][1] == {"node": "answer", "attempt": 1, "citation_error": False}
-    assert events[3][1] == {"node": "guard_out", "ok": True, "reason": None}
+    assert events[2][1] == {"node": "retrieve", "articles": ["art_6"], "recitals": []}
+    assert events[3][1] == {"node": "answer", "attempt": 1, "citation_error": False}
+    assert events[4][1] == {"node": "guard_out", "ok": True, "reason": None}
     # NIT (round-1 review): `refused` is always present in `final`, `False`
     # on the normal-answer path — not just present-and-true on refusal.
-    assert events[4][1]["refused"] is False
-    final = AnswerSchema.model_validate(events[4][1])
+    assert events[5][1]["refused"] is False
+    final = AnswerSchema.model_validate(events[5][1])
     assert final.citations[0].anchor == "art_6"
 
 
@@ -257,9 +263,9 @@ def test_trace_event_emitted_when_tracing_enabled(client, monkeypatch):
     # ADR-0018), not after `retrieve` — so a refused request gets one too.
     # ADR-0021: `guard_out` adds one more trailing "node" event before
     # `final` (retrieve, answer, guard_out — three "node" events after
-    # guard_in/trace).
-    assert [e[0] for e in events] == ["node", "trace", "node", "node", "node", "final"]
-    assert events[1] == ("trace", {"trace_id": "abc"})
+    # guard_in/trace). ADR-0024: `thread` fires first, ahead of everything.
+    assert [e[0] for e in events] == ["thread", "node", "trace", "node", "node", "node", "final"]
+    assert events[2] == ("trace", {"trace_id": "abc"})
 
 
 # --- (e) fail-twice --------------------------------------------------------
@@ -443,19 +449,20 @@ def test_flagged_question_emits_guard_in_node_then_final_refused(client):
 
     events = _parse_sse(body)
     # ADR-0021: `guard_out` runs on every path, this refusal included — one
-    # more "node" event before `final`, which it now emits.
-    assert [e[0] for e in events] == ["node", "node", "final"]
-    guard_event = events[0][1]
+    # more "node" event before `final`, which it now emits. ADR-0024:
+    # `thread` fires first, ahead of everything.
+    assert [e[0] for e in events] == ["thread", "node", "node", "final"]
+    guard_event = events[1][1]
     assert guard_event["node"] == "guard_in"
     assert guard_event["flagged"] is True
     assert guard_event["score"] >= 1.0
     assert "instruction_override" in guard_event["reasons"]
     assert guard_event["pii"] == []  # refused before redaction ever ran
 
-    guard_out_event = events[1][1]
+    guard_out_event = events[2][1]
     assert guard_out_event == {"node": "guard_out", "ok": True, "reason": None}
 
-    final_event = events[2][1]
+    final_event = events[3][1]
     assert final_event["refused"] is True
     assert final_event["answer"] == REFUSAL_TEXT
     assert final_event["citations"] == []
@@ -495,16 +502,17 @@ def test_classifier_block_emits_guard_in_node_then_final_refused(client):
 
     events = _parse_sse(body)
     # ADR-0021: `guard_out` runs on every path, this refusal included.
-    assert [e[0] for e in events] == ["node", "node", "final"]
-    guard_event = events[0][1]
+    # ADR-0024: `thread` fires first, ahead of everything.
+    assert [e[0] for e in events] == ["thread", "node", "node", "final"]
+    guard_event = events[1][1]
     assert guard_event["node"] == "guard_in"
     assert guard_event["flagged"] is True
     assert guard_event["reasons"] == ["classifier:role_hijack"]
     assert guard_event["score"] == 0.9
     assert guard_event["pii"] == []  # refused before redaction ever ran
-    assert events[1][1] == {"node": "guard_out", "ok": True, "reason": None}
+    assert events[2][1] == {"node": "guard_out", "ok": True, "reason": None}
 
-    final_event = events[2][1]
+    final_event = events[3][1]
     assert final_event["refused"] is True
     assert final_event["answer"] == REFUSAL_TEXT
 
@@ -562,13 +570,14 @@ def test_pii_only_question_is_refused_via_api(client):
 
     events = _parse_sse(body)
     # ADR-0021: `guard_out` runs on every path, this refusal included.
-    assert [e[0] for e in events] == ["node", "node", "final"]
-    guard_event = events[0][1]
+    # ADR-0024: `thread` fires first, ahead of everything.
+    assert [e[0] for e in events] == ["thread", "node", "node", "final"]
+    guard_event = events[1][1]
     assert guard_event["flagged"] is True
     assert guard_event["reasons"] == ["pii_only"]
-    assert events[1][1] == {"node": "guard_out", "ok": True, "reason": None}
+    assert events[2][1] == {"node": "guard_out", "ok": True, "reason": None}
 
-    final_event = events[2][1]
+    final_event = events[3][1]
     assert final_event["refused"] is True
     assert final_event["answer"] == REFUSAL_TEXT
 
@@ -787,3 +796,122 @@ def test_critic_never_emitted_on_refusal_path_via_api(client):
     events = _parse_sse(body)
     node_names = [e[1]["node"] for e in events if e[0] == "node"]
     assert "critic" not in node_names
+
+
+# --- ADR-0024: durable state — thread_id contract + checkpointer wiring ---
+class RecordingLLM:
+    """Like `FakeLLM` above, but also captures the messages of its last
+    `.invoke()` call — needed only by the history-rendering test below,
+    which has to inspect what the SECOND turn's prompt actually contained."""
+
+    def __init__(self, response: AnswerSchema):
+        self._response = response
+        self.messages = None
+
+    def invoke(self, messages):
+        self.messages = messages
+        return self._response
+
+
+def test_invalid_thread_id_returns_422(client):
+    # Unlike `question` (ADR-0006's trust-boundary rule, the
+    # `too_short_question` test above), `thread_id` isn't sensitive content
+    # — it's a client-supplied identifier the client already has, so the
+    # 422 body is free to echo it back for debuggability; only the status
+    # code is the contract here.
+    resp = client.post(
+        "/ask",
+        json={"question": "What is a high-risk AI system?", "thread_id": "not-a-uuid"},
+        headers=_auth_headers(),
+    )
+    assert resp.status_code == 422
+
+
+def test_non_v4_uuid_thread_id_returns_422(client):
+    """A syntactically valid UUID that isn't version 4 (e.g. a v1) must
+    still be rejected — ADR-0024's rule is specifically "looks like
+    something the server itself would issue", not just "any UUID"."""
+    v1_uuid = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+    resp = client.post(
+        "/ask",
+        json={"question": "What is a high-risk AI system?", "thread_id": v1_uuid},
+        headers=_auth_headers(),
+    )
+    assert resp.status_code == 422
+
+
+def test_thread_id_omitted_is_server_issued_and_differs_per_request(client):
+    answer = AnswerSchema(answer="...", citations=[])
+    _use_llm(FakeLLM(answer))
+
+    thread_ids = []
+    for _ in range(2):
+        with client.stream(
+            "POST",
+            "/ask",
+            json={"question": "What is a high-risk AI system?"},
+            headers=_auth_headers(),
+        ) as resp:
+            body = "".join(resp.iter_text())
+        events = _parse_sse(body)
+        assert events[0][0] == "thread"
+        thread_ids.append(events[0][1]["thread_id"])
+        uuid.UUID(thread_ids[-1])  # must not raise
+
+    assert thread_ids[0] != thread_ids[1]
+
+
+def test_thread_id_supplied_is_echoed_back_verbatim(client):
+    answer = AnswerSchema(answer="...", citations=[])
+    _use_llm(FakeLLM(answer))
+    supplied = str(uuid.uuid4())
+
+    with client.stream(
+        "POST",
+        "/ask",
+        json={"question": "What is a high-risk AI system?", "thread_id": supplied},
+        headers=_auth_headers(),
+    ) as resp:
+        body = "".join(resp.iter_text())
+
+    events = _parse_sse(body)
+    assert events[0] == ("thread", {"thread_id": supplied})
+
+
+def test_two_turn_conversation_via_api_carries_history_into_second_prompt(client):
+    """Overriding `get_checkpointer_dependency` with a single shared
+    `InMemorySaver()` instance (the SAME object for both requests) is what
+    proves the API's OWN wiring (`_stream_answer` building
+    `build_graph(checkpointer=...)` off a real dependency, `configurable.
+    thread_id` actually reaching the graph) persists state across two real
+    `/ask` calls — not just that the graph-level mechanism works in
+    isolation (tests/test_graph.py already covers that)."""
+    saver = InMemorySaver()
+    app.dependency_overrides[get_checkpointer_dependency] = lambda: saver
+
+    first_question = "What is a high-risk AI system?"
+    first_answer = AnswerSchema(answer="High-risk means a safety component.", citations=[])
+    _use_llm(RecordingLLM(first_answer))
+
+    with client.stream(
+        "POST", "/ask", json={"question": first_question}, headers=_auth_headers()
+    ) as resp:
+        body = "".join(resp.iter_text())
+    thread_id = _parse_sse(body)[0][1]["thread_id"]
+
+    second_llm = RecordingLLM(AnswerSchema(answer="Yes, per the same article.", citations=[]))
+    _use_llm(second_llm)
+
+    with client.stream(
+        "POST",
+        "/ask",
+        json={"question": "And does that include medical devices?", "thread_id": thread_id},
+        headers=_auth_headers(),
+    ) as resp:
+        body2 = "".join(resp.iter_text())
+    events2 = _parse_sse(body2)
+    assert events2[0] == ("thread", {"thread_id": thread_id})
+
+    rendered = "\n".join(content for _role, content in second_llm.messages)
+    assert first_question in rendered
+    assert first_answer.answer in rendered

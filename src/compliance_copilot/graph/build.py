@@ -136,14 +136,22 @@ async def make_mcp_tools() -> dict[str, Any] | None:
 
 
 @lru_cache(maxsize=1)
-def build_graph():
-    """Builds and compiles the graph once. Safe to cache module-wide (no
-    per-request objects live on the compiled graph itself — those arrive via
-    `context=` at `.invoke()` time, see `state.py`'s `GraphContext`).
+def build_graph(checkpointer: Any | None = None):
+    """Builds and compiles the graph once per distinct `checkpointer`
+    (`lru_cache` keys on its arguments — `checkpointer` is hashed by object
+    identity, the default for a plain object with no custom `__eq__`, which
+    every saver class here is). Safe to cache module-wide (no per-request
+    objects live on the compiled graph itself — those arrive via `context=`
+    at `.invoke()` time, see `state.py`'s `GraphContext`).
 
-    No checkpointer is passed to `.compile()`: this feature has no pause/
-    resume step yet (ADR-0001 flags a Postgres checkpointer as needed once
-    `interrupt()`-based human review lands, not before)."""
+    ADR-0024: `checkpointer` is `None` by default (every existing caller
+    that calls `build_graph()` with no args is unaffected — same "existing
+    caller keeps working" contract `GraphContext`'s optional fields already
+    give). The app passes a real saver — `InMemorySaver()` in unit tests,
+    `AsyncPostgresSaver` in the API/CLI (`checkpointer.py`) — so a
+    `thread_id` in `config["configurable"]` actually persists state across
+    turns; `None` keeps today's stateless-per-call behaviour (a `thread_id`
+    is accepted but nothing durable happens with it)."""
     builder = StateGraph(GraphState, context_schema=GraphContext)
     builder.add_node("guard_in", guard_in_node)
     builder.add_node("router", router_node)
@@ -178,7 +186,7 @@ def build_graph():
     # graph shape, not a dangling node.
     builder.add_edge("fail", END)
     builder.add_edge("guard_out", END)
-    return builder.compile()
+    return builder.compile(checkpointer=checkpointer)
 
 
 async def ask(
@@ -192,6 +200,7 @@ async def ask(
     critic: Any | None = None,
     tools: dict[str, Any] | None = None,
     config: dict | None = None,
+    checkpointer: Any | None = None,
 ) -> AnswerSchema:
     """Convenience entry point: runs the compiled graph for one question and
     returns just the final `AnswerSchema` (rather than making every caller —
@@ -227,8 +236,12 @@ async def ask(
     enabled). `None` here just means "no callbacks" — `graph.ainvoke()`
     already defaults to that with no `config=` kwarg at all, so this is
     additive, not a behaviour change for existing callers/tests that don't
-    pass one."""
-    graph = build_graph()
+    pass one.
+
+    `checkpointer`: ADR-0024's durable-state saver, forwarded to
+    `build_graph()`. `None` (the default) is today's pre-ADR-0024 behaviour
+    — every existing caller of `ask()` is unaffected."""
+    graph = build_graph(checkpointer=checkpointer)
     context = GraphContext(
         session=session,
         embeddings=embeddings,

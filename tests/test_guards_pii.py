@@ -248,7 +248,9 @@ def test_pii_redaction_disabled_leaves_question_untouched(monkeypatch):
 
     state = _run("Contact John Smith at john@x.com about this.", llm)
 
-    assert "pii_entities" not in state
+    # The per-turn reset (ADR-0024) always writes the key; "no redaction
+    # happened" now means an EMPTY tuple, not an absent key.
+    assert not state.get("pii_entities")
     human_content = llm.messages[-1][1]
     assert "John Smith" in human_content
     assert "john@x.com" in human_content

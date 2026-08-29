@@ -35,6 +35,26 @@ curl -sN -X POST localhost:8000/ask -H "Content-Type: application/json" \
 
 Set `LANGFUSE_PUBLIC_KEY`/`LANGFUSE_SECRET_KEY`/`LANGFUSE_BASE_URL` to enable tracing (Langfuse Cloud, EU) — unset by default, so the app runs with zero tracing until you do.
 
+### Conversations (`thread_id`, ADR-0024)
+
+Omit `thread_id` on the first call — the response's very first SSE event is
+`event: thread`, `data: {"thread_id": "<uuid>"}`, the id the server just
+minted. Send that same id back on the next call to continue the
+conversation (up to the last 3 turns are replayed into the prompt):
+
+```bash
+curl -sN -X POST localhost:8000/ask -H "Content-Type: application/json" \
+  -H "X-API-Key: $API_KEY" \
+  -d '{"question":"And what about GDPR?","thread_id":"<uuid from the first response>"}'
+```
+
+A client-supplied `thread_id` must be a syntactically valid UUID4 (422
+otherwise) — but note this doesn't grant per-caller privacy: this API has
+one shared `X-API-Key`, so any key holder can supply any validly-shaped
+`thread_id` and resume that conversation (ADR-0024's security note, an
+open gap ADR-0016 already named). Erase a conversation's checkpointed state
+with `python -m compliance_copilot.cli delete-thread <uuid>`.
+
 ## MCP server
 
 `make mcp` starts a standalone MCP server (`search_regulation`, `get_article`,

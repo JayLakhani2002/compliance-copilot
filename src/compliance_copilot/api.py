@@ -28,7 +28,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
 from langchain_core.embeddings import Embeddings
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
@@ -39,6 +39,7 @@ from starlette.responses import Response
 
 from compliance_copilot import embeddings as embeddings_module
 from compliance_copilot import tracing
+from compliance_copilot.checkpointer import build_checkpointer, validate_thread_id
 from compliance_copilot.critic import make_critic_llm
 from compliance_copilot.db import get_session
 from compliance_copilot.graph import CitationError, GraphContext, make_mcp_tools
@@ -64,6 +65,23 @@ class AskRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     question: str = Field(min_length=3, max_length=settings.max_question_chars)
+    # ADR-0024: absent (the common case — a conversation's first turn) means
+    # the server mints a fresh `uuid.uuid4()` (the `ask` route below) and
+    # returns it in the first SSE event so the client can continue the
+    # conversation by sending it back here on the next call. A
+    # client-supplied value must look like something the server itself
+    # would have issued — `validate_thread_id` (checkpointer.py) rejects
+    # anything else with a 422, since a guessable/sequential id would let a
+    # caller resume or read another session's checkpointed conversation
+    # (ADR-0024's security note — this does NOT close the separate,
+    # still-open ADR-0016 gap: the shared API key means any key holder can
+    # still supply any validly-SHAPED thread_id and resume ANY thread).
+    thread_id: str | None = Field(default=None)
+
+    @field_validator("thread_id")
+    @classmethod
+    def _thread_id_must_be_uuid4(cls, v: str | None) -> str | None:
+        return v if v is None else validate_thread_id(v)
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +170,25 @@ def get_critic_dependency() -> Any | None:
 # distinguishable from "haven't tried yet".
 _UNSET = object()
 _tools_cache: dict[str, Any] | None | object = _UNSET
+
+
+def get_checkpointer_dependency(request: Request) -> Any | None:
+    """ADR-0024: the `AsyncPostgresSaver` built once in `lifespan()` below
+    and stored on `app.state.checkpointer` — read via a dependency (not a
+    module-level global) so tests can override it the same way as every
+    other dependency here (`app.dependency_overrides`), e.g. with a
+    fixture-scoped `InMemorySaver()` for a Postgres-free unit test of
+    multi-turn history.
+
+    `getattr(..., None)`, not `request.app.state.checkpointer` directly:
+    `TestClient(app)` used WITHOUT its `with` context manager (this
+    project's existing `tests/test_api.py` fixture) never runs `lifespan()`
+    at all, so `app.state.checkpointer` is simply never set in that case —
+    `None` reproduces this feature's pre-existing behaviour exactly
+    (`build_graph(checkpointer=None)`: a `thread_id` is accepted but nothing
+    durable happens with it), rather than an `AttributeError` breaking every
+    existing test that doesn't care about persistence."""
+    return getattr(request.app.state, "checkpointer", None)
 
 
 async def get_tools_dependency() -> dict[str, Any] | None:
@@ -262,6 +299,8 @@ async def _stream_answer(
     router: Any | None,
     critic: Any | None,
     tools: dict[str, Any] | None,
+    checkpointer: Any | None,
+    thread_id: str,
 ) -> AsyncIterator[str]:
     """The `/ask` response body: runs the compiled graph via `astream(...,
     stream_mode='updates')`, translating each node's partial state into an
@@ -282,8 +321,18 @@ async def _stream_answer(
     track the latest values across node updates (`stream_mode='updates'`
     only ever hands this loop the KEYS one node changed, not the full
     state); `final` is emitted once, at `guard_out`, using whichever values
-    are current by then."""
-    graph = build_graph()
+    are current by then.
+
+    ADR-0024: `checkpointer`/`thread_id` wire up durable, multi-turn state —
+    `checkpointer` is `None` when `lifespan()` hasn't run (e.g. a bare
+    `TestClient(app)`, see `get_checkpointer_dependency`'s docstring), which
+    reproduces today's stateless-per-call behaviour exactly. The `thread`
+    event fires FIRST, before the graph even starts, since the caller
+    already knows `thread_id` by then (server-issued or client-supplied,
+    validated) — this is what lets a client that omitted `thread_id` learn
+    the one the server picked, in time to send it back on the next call."""
+    yield _sse("thread", {"thread_id": thread_id})
+    graph = build_graph(checkpointer=checkpointer)
     context = GraphContext(
         session=session,
         embeddings=embeddings,
@@ -298,7 +347,11 @@ async def _stream_answer(
     # (or `[]` when tracing is disabled, tracing.py) and a request-scoped
     # session id, so concurrent `/ask` calls never share a handler instance
     # (see tracing.current_trace_id's docstring on why that matters).
+    # `configurable.thread_id` (ADR-0024) rides alongside it — LangGraph
+    # reads this key straight off the same config dict, no separate
+    # `config=` argument needed.
     config = tracing.run_config(session_id=uuid.uuid4().hex)
+    config["configurable"] = {"thread_id": thread_id}
     trace_emitted = False
     current_answer = None
     current_refused = False
@@ -514,24 +567,33 @@ async def lifespan(app: FastAPI):
     # docstring) — installed once at process startup, before any request
     # can log anything.
     install_pii_scrub()
-    # Build the graph once at startup rather than on the first request —
-    # `build_graph()` is itself `@lru_cache(maxsize=1)` (build.py), so this
-    # call just moves the one-time build earlier; it's a no-op if a request
-    # already triggered it first.
-    build_graph()
-    # Same reasoning for the classifier client (ADR-0019) — a request-time
-    # first-call cost would otherwise land on whichever caller happens to
-    # be first, instead of on startup where a slow LLM client construction
-    # belongs.
-    get_classifier_dependency()
-    # ADR-0023: same reasoning again for the router/critic clients.
-    get_router_dependency()
-    get_critic_dependency()
-    # ADR-0007 Day-17 amendment: same reasoning again — spawning the MCP
-    # server subprocess and loading its tools happens once here, at
-    # startup, not on whichever request happens to arrive first.
-    await get_tools_dependency()
-    yield
+    # ADR-0024: the durable-state pool+saver, opened once for the process's
+    # whole lifetime (`build_checkpointer()`'s `async with` closes the pool
+    # on the way out of THIS function, i.e. on shutdown) and stored on
+    # `app.state` so `get_checkpointer_dependency` above can read it per
+    # request. A Postgres outage at startup means this raises and the app
+    # never comes up — deliberate, same "fail before any LLM spend" posture
+    # ADR-0001/the persistence lesson already call for, not a new one.
+    async with build_checkpointer() as checkpointer:
+        app.state.checkpointer = checkpointer
+        # Build the graph once at startup rather than on the first request
+        # — `build_graph()` is itself `@lru_cache(maxsize=1)` (build.py), so
+        # this call just moves the one-time build earlier; it's a no-op if
+        # a request already triggered it first.
+        build_graph(checkpointer=checkpointer)
+        # Same reasoning for the classifier client (ADR-0019) — a
+        # request-time first-call cost would otherwise land on whichever
+        # caller happens to be first, instead of on startup where a slow
+        # LLM client construction belongs.
+        get_classifier_dependency()
+        # ADR-0023: same reasoning again for the router/critic clients.
+        get_router_dependency()
+        get_critic_dependency()
+        # ADR-0007 Day-17 amendment: same reasoning again — spawning the
+        # MCP server subprocess and loading its tools happens once here, at
+        # startup, not on whichever request happens to arrive first.
+        await get_tools_dependency()
+        yield
     # `shutdown()`, not `flush()`: this runs once as the process exits, so it
     # should also stop Langfuse's background consumer threads (tracing.py) —
     # a no-op when tracing is disabled.
@@ -587,7 +649,12 @@ async def ask(
     router: Any | None = Depends(get_router_dependency),
     critic: Any | None = Depends(get_critic_dependency),
     tools: dict[str, Any] | None = Depends(get_tools_dependency),
+    checkpointer: Any | None = Depends(get_checkpointer_dependency),
 ) -> StreamingResponse:
+    # ADR-0024: mint a fresh thread on the client's first turn; a
+    # client-supplied `thread_id` already passed `AskRequest`'s UUID4
+    # validator above.
+    thread_id = req.thread_id or str(uuid.uuid4())
     generator = _stream_answer(
         req.question,
         session=session,
@@ -597,6 +664,8 @@ async def ask(
         router=router,
         critic=critic,
         tools=tools,
+        checkpointer=checkpointer,
+        thread_id=thread_id,
     )
     return StreamingResponse(
         generator,
