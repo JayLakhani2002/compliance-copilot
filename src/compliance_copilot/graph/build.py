@@ -34,6 +34,20 @@ from compliance_copilot.settings import settings
 # know the cap, it just increments `attempts` each time it runs.
 MAX_ATTEMPTS = 2
 
+# Worst-case LLM calls in ONE request, stated as a number and tested, not
+# left to intuition (lesson 21, ADR-0026): `guard_in`'s classifier (1,
+# ADR-0019) + `router` (1, ADR-0023) + `answer`, up to `MAX_ATTEMPTS` (2,
+# ADR-0015) + `critic` (1, ADR-0023) = 5. `hitl` (ADR-0025) makes no LLM
+# call of its own (its idempotency depends on that — see nodes.py's
+# `hitl_node` docstring), so it adds nothing to this sum. A test
+# (tests/evals/test_trajectory.py) asserts this constant actually equals
+# that derivation, so the two can't silently drift apart the day a node
+# gains a call, and a second test spies on real fake-LLM invocation counts
+# across a full run to prove the ceiling actually holds — a runaway loop is
+# a cost/latency bug a correctness-only test suite would never catch, since
+# the eventual ANSWER can still look perfectly fine.
+MAX_LLM_CALLS_PER_REQUEST = 1 + 1 + MAX_ATTEMPTS + 1
+
 
 def route_after_guard(state: GraphState) -> str:
     """Conditional edge after `guard_in` — mirrors `route_after_answer`

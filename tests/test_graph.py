@@ -17,13 +17,32 @@
 # async node. `_run`/`_run_stream` below wrap that in `asyncio.run(...)` so
 # every test function here stays a plain `def`, not `async def` — no new
 # pytest-asyncio dependency needed for a handful of `asyncio.run()` calls.
+#
+# The fakes/fixtures/`_run*` helpers themselves now live in
+# `tests/graph_helpers.py` (lesson 21, ADR-0026) — imported here, not
+# duplicated, so `tests/evals/test_trajectory.py` can drive the exact same
+# compiled-graph doubles this file already proved out.
 import asyncio
 
 import pytest
 from fake_mcp_tools import FakeMCPTool, ToolExecutionError, tools_from_articles
+from graph_helpers import (
+    ARTICLES,
+    ROUTER_FIXTURE,
+    CountingLLM,
+    FakeCriticLLM,
+    FakeLLM,
+    FakeRouterLLM,
+    RaisingLLM,
+    StatefulLLM,
+    _low_confidence_critic,
+    _resume_turn,
+    _run,
+    _run_stream,
+    _run_turn,
+)
 from langchain_core.messages import SystemMessage
 from langgraph.checkpoint.memory import InMemorySaver
-from langgraph.types import Command
 
 from compliance_copilot.critic import CriticVerdict, _build_messages
 from compliance_copilot.graph import (
@@ -31,7 +50,6 @@ from compliance_copilot.graph import (
     AnswerSchema,
     Citation,
     CitationError,
-    GraphContext,
     OutputGuardError,
     ToolCallError,
     Turn,
@@ -49,101 +67,6 @@ from compliance_copilot.guards.output import OutputVerdict
 from compliance_copilot.retriever import RetrievedChunk
 from compliance_copilot.router import RouterVerdict
 from compliance_copilot.settings import settings
-
-ARTICLES = [
-    RetrievedChunk(
-        anchor="art_6",
-        regulation="ai_act",
-        kind="article",
-        number=6,
-        title="Classification rules for high-risk AI systems",
-        text="An AI system shall be considered high-risk where it is a safety component.",
-        distance=0.1,
-        part=0,
-    ),
-    RetrievedChunk(
-        anchor="art_9",
-        regulation="ai_act",
-        kind="article",
-        number=9,
-        title="Risk management system",
-        text="A risk management system shall be established for high-risk AI systems.",
-        distance=0.2,
-        part=0,
-    ),
-]
-
-
-class FakeLLM:
-    """Stands in for `runtime.context.llm` — the only contract answer_node()
-    depends on is `.invoke(messages) -> AnswerSchema` (see nodes.py's
-    module docstring and ADR-0014)."""
-
-    def __init__(self, response: AnswerSchema):
-        self._response = response
-        self.messages: list[tuple[str, str]] | None = None
-
-    def invoke(self, messages):
-        self.messages = messages  # captured for the prompt-content assertions
-        return self._response
-
-
-def _run(
-    llm,
-    question: str = "What is a high-risk AI system?",
-    *,
-    articles: list[RetrievedChunk] = ARTICLES,
-    tools: dict | None = None,
-    router=None,
-    critic=None,
-):
-    """Runs the compiled graph once via `graph.ainvoke` (wrapped in
-    `asyncio.run` — see the module docstring). `tools` defaults to fake
-    `search_regulation`/`get_article` doubles built from `articles`
-    (`fake_mcp_tools.tools_from_articles`, ADR-0007's Day-17 amendment) —
-    pass an explicit `tools=` to simulate a tool failure instead. `router`/
-    `critic` (ADR-0023) default `None` — disabled, same "existing caller
-    unaffected" contract `classifier` already has."""
-    graph = build_graph()
-    if tools is None:
-        tools = tools_from_articles(articles)
-    context = GraphContext(
-        session=None, embeddings=None, llm=llm, router=router, critic=critic, tools=tools
-    )
-    return asyncio.run(graph.ainvoke({"question": question}, context=context))
-
-
-def _run_stream(
-    llm,
-    question: str = "What is a high-risk AI system?",
-    *,
-    articles: list[RetrievedChunk] = ARTICLES,
-    router=None,
-    critic=None,
-) -> list[str]:
-    """Same as `_run` but drives `graph.astream(..., stream_mode='updates')`
-    and returns just the ordered list of node names visited — the async
-    equivalent of the old sync `graph.stream(...)` loop these tests used
-    before `retrieve_node` became `async def`."""
-    graph = build_graph()
-    context = GraphContext(
-        session=None,
-        embeddings=None,
-        llm=llm,
-        router=router,
-        critic=critic,
-        tools=tools_from_articles(articles),
-    )
-
-    async def _collect():
-        return [
-            list(update)[0]
-            async for update in graph.astream(
-                {"question": question}, context=context, stream_mode="updates"
-            )
-        ]
-
-    return asyncio.run(_collect())
 
 
 def test_happy_path_returns_answer_with_retrieved_context():
@@ -258,22 +181,6 @@ def test_chunk_text_with_closing_excerpt_tag_is_escaped():
     # injected one got escaped to "&lt;/excerpt&gt;".
     assert human_content.count("</excerpt>") == 1
     assert "&lt;/excerpt&gt;" in human_content
-
-
-class StatefulLLM:
-    """Returns each response in order on successive `.invoke()` calls, and
-    records every call's messages (not just the last, unlike `FakeLLM`) —
-    drives the retry-once loop (bad citation on call 1, good on call 2) with
-    no network, same hand-written-double approach `FakeLLM` above already
-    uses (see this file's module docstring)."""
-
-    def __init__(self, responses: list[AnswerSchema]):
-        self._responses = list(responses)
-        self.calls: list[list] = []
-
-    def invoke(self, messages):
-        self.calls.append(messages)
-        return self._responses.pop(0)
 
 
 def test_bad_citation_then_good_citation_retries_once_and_succeeds():
@@ -805,87 +712,6 @@ def test_search_regulation_timeout_raises_tool_call_error(monkeypatch):
         _run(FakeLLM(AnswerSchema(answer="...", citations=[])), tools=tools)
 
 
-class FakeRouterLLM:
-    """Stands in for `runtime.context.router` — the only contract
-    `router_node` depends on is `.invoke(messages) -> RouterVerdict` (see
-    router.py's module docstring), same hand-written-double approach as
-    `FakeLLM` above."""
-
-    def __init__(self, verdict: RouterVerdict):
-        self._verdict = verdict
-        self.messages = None
-
-    def invoke(self, messages):
-        self.messages = messages
-        return self._verdict
-
-
-class RaisingLLM:
-    """A minimal double whose `.invoke()` always raises — simulates an LLM
-    outage for `route()`/`critique()`'s fail-* paths without a real network
-    call."""
-
-    def invoke(self, messages):
-        raise ConnectionError("simulated outage")
-
-
-class FakeCriticLLM:
-    """Stands in for `runtime.context.critic` — the only contract
-    `critic_node` depends on is `.invoke(messages) -> CriticVerdict`."""
-
-    def __init__(self, verdict: CriticVerdict):
-        self._verdict = verdict
-        self.messages = None
-
-    def invoke(self, messages):
-        self.messages = messages
-        return self._verdict
-
-
-# --- ADR-0023: the router — ten hand-labelled questions ------------------
-# Question 7 is deliberately the exact cross-regulation example lesson 18's
-# own "Check yourself" section names — a regression pin for the collision
-# case the router exists to solve (art_3 is a real anchor in BOTH the AI Act
-# and GDPR).
-ROUTER_FIXTURE = [
-    (
-        "What obligations does a provider have when placing a high-risk AI system on the market?",
-        "ai_act",
-    ),
-    (
-        "Under what conditions can an AI system be classified as high-risk under Article 6?",
-        "ai_act",
-    ),
-    (
-        "What are the risk management requirements for providers of high-risk AI "
-        "systems under Article 9?",
-        "ai_act",
-    ),
-    (
-        "What is the legal basis required for processing special category data under GDPR?",
-        "gdpr",
-    ),
-    (
-        "What rights does a data subject have to obtain human intervention in an "
-        "automated decision under Article 22?",
-        "gdpr",
-    ),
-    ("What is a data protection impact assessment and when is it required?", "gdpr"),
-    (
-        "Does Article 6 of the AI Act interact with GDPR's consent requirements "
-        "for automated decisions?",
-        "both",
-    ),
-    (
-        "How do the AI Act's transparency obligations for high-risk systems relate "
-        "to GDPR's data-subject information rights?",
-        "both",
-    ),
-    ("What is the best recipe for a German sauerbraten?", "out_of_scope"),
-    ("Can you help me write a Python script to scrape a website?", "out_of_scope"),
-]
-
-
 @pytest.mark.parametrize("question,expected", ROUTER_FIXTURE)
 def test_router_fixture_all_ten_labels_reach_the_search_filter(question, expected):
     """A `FakeRouterLLM` seeded with the "expected" label pins the MECHANISM
@@ -1075,33 +901,6 @@ def test_critic_prompt_escapes_closing_tags():
 # state survives a process restart, not just in-process reuse).
 
 
-def _run_turn(
-    graph,
-    llm,
-    question: str,
-    *,
-    thread_id: str,
-    articles: list[RetrievedChunk] = ARTICLES,
-    critic=None,
-):
-    """One turn of a checkpointed conversation against an already-compiled
-    `graph` (built with a checkpointer) — same shape as `_run` above, but
-    takes the compiled `graph` and a `thread_id` instead of building a
-    fresh (uncheckpointed) graph itself. Sharing `thread_id` across calls
-    is what makes state persist/accumulate (ADR-0024); a fresh `GraphContext`
-    every call mirrors how a real caller (api.py, cli.py) builds one per
-    request — `GraphContext` itself is never persisted, only `GraphState`."""
-    context = GraphContext(
-        session=None,
-        embeddings=None,
-        llm=llm,
-        critic=critic,
-        tools=tools_from_articles(articles),
-    )
-    config = {"configurable": {"thread_id": thread_id}}
-    return asyncio.run(graph.ainvoke({"question": question}, context=context, config=config))
-
-
 def test_two_turn_conversation_carries_prior_qa_into_second_prompt():
     """Turn 2's prompt must contain turn 1's question and answer — proof the
     checkpointer round-trips `history` and `answer_node` actually renders
@@ -1243,57 +1042,6 @@ def test_refused_turn_is_not_added_to_history():
 # every pause test seeds; resume tests always hand a `_UnusedLLM()` double
 # to the resumed call — asserting NO LLM call happens on resume IS the
 # idempotency proof (a re-run of `answer_node`/`critic_node` would call it).
-
-
-def _low_confidence_critic(reasoning: str = "not well supported") -> "FakeCriticLLM":
-    return FakeCriticLLM(CriticVerdict(faithful=False, confidence=0.1, reasoning=reasoning))
-
-
-class _UnusedLLM:
-    """Raises on any `.invoke()` — used on the RESUME side of a paused-run
-    test, where no node between `hitl` and `guard_out` ever calls an LLM.
-    A call here would mean something re-ran an LLM-backed node on resume."""
-
-    def invoke(self, messages):
-        raise AssertionError("no LLM call should happen on resume")
-
-
-class CountingLLM:
-    """Like `FakeCriticLLM`/`FakeLLM` but counts `.invoke()` calls —
-    `test_resume_does_not_recall_answer_or_critic_llm` needs an exact call
-    count, not just "did it raise"."""
-
-    def __init__(self, verdict):
-        self._verdict = verdict
-        self.calls = 0
-
-    def invoke(self, messages):
-        self.calls += 1
-        return self._verdict
-
-
-def _resume_turn(
-    graph, decision: str, edited_answer: str | None = None, *, thread_id: str, llm=None
-):
-    """Resumes a paused run via `Command(resume=...)` — same shape
-    `api.py`'s `_stream_resume`/`cli.py`'s `resume` command build. `llm`
-    defaults to `_UnusedLLM()`: nothing between `hitl` and `guard_out`
-    should ever call it, so a default that raises on any `.invoke()` is a
-    stronger default than a double that just returns something unused."""
-    context = GraphContext(
-        session=None,
-        embeddings=None,
-        llm=llm or _UnusedLLM(),
-        tools=tools_from_articles(ARTICLES),
-    )
-    config = {"configurable": {"thread_id": thread_id}}
-    return asyncio.run(
-        graph.ainvoke(
-            Command(resume={"decision": decision, "edited_answer": edited_answer}),
-            context=context,
-            config=config,
-        )
-    )
 
 
 def test_low_confidence_critic_pauses_run_with_expected_payload_and_no_final_answer():
