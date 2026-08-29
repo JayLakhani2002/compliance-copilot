@@ -1,11 +1,10 @@
 # src/compliance_copilot/graph/build.py — assembles the graph's nodes into
-# the LangGraph `StateGraph` (docs/ARCHITECTURE.md §4). ADR-0023 (this
-# feature) adds `router` (before `retrieve`) and `critic` (before
-# `guard_out`) as plain nodes+edges, same incremental pattern every prior
+# the LangGraph `StateGraph` (docs/ARCHITECTURE.md §4). ADR-0023 adds
+# `router` (before `retrieve`) and `critic` (before `guard_out`); ADR-0025
+# adds `hitl` between `critic` and `guard_out` — an `interrupt()`-based pause
+# on a low-confidence critic score. Same incremental pattern every prior
 # guard/gate feature (ADR-0018/0019/0020/0021) added its own node with — no
-# restructure. The `interrupt()`-based HITL pause the architecture diagram
-# also sketches is still a later feature (Day 20, once the critic's
-# confidence score has been calibrated on real traffic).
+# restructure.
 from __future__ import annotations
 
 import os
@@ -22,6 +21,7 @@ from compliance_copilot.graph.nodes import (
     critic_node,
     guard_in_node,
     guard_out_node,
+    hitl_node,
     refuse_node,
     retrieve_node,
     router_node,
@@ -160,6 +160,7 @@ def build_graph(checkpointer: Any | None = None):
     builder.add_node("answer", answer_node)
     builder.add_node("fail", fail_node)
     builder.add_node("critic", critic_node)
+    builder.add_node("hitl", hitl_node)
     builder.add_node("guard_out", guard_out_node)
     builder.add_edge(START, "guard_in")
     # ADR-0023: a clean question now goes to `router`, not straight to
@@ -177,10 +178,18 @@ def build_graph(checkpointer: Any | None = None):
     builder.add_conditional_edges(
         "answer", route_after_answer, {"answer": "answer", "fail": "fail", "critic": "critic"}
     )
-    # ADR-0023: `critic` records a faithfulness verdict (never blocks yet,
-    # Day 20's job) — a single unconditional edge into `guard_out`, which
-    # stays the final gate on every path (ADR-0021's invariant).
-    builder.add_edge("critic", "guard_out")
+    # ADR-0025: `critic` -> `hitl` -> `guard_out`, a single unconditional
+    # edge into each. `hitl_node` pauses (interrupt()) only when the critic
+    # ran and scored below `settings.critic_confidence_min`; otherwise it's
+    # a pass-through (`return {}`, which follows this static edge to
+    # `guard_out`). When it DOES pause, the resumed node instead returns a
+    # `Command(goto="guard_out")` — that dynamic routing overrides this
+    # static edge (verified: a node's `Command.goto` wins regardless of any
+    # static edge also registered for that node), so both the pass-through
+    # and every resume decision converge on `guard_out`, which stays the
+    # final gate on every path (ADR-0021's invariant, unchanged).
+    builder.add_edge("critic", "hitl")
+    builder.add_edge("hitl", "guard_out")
     # `fail_node` always raises (never returns), so this edge is unreachable
     # in practice — kept for the same reason it always was: an explicit
     # graph shape, not a dangling node.

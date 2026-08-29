@@ -22,6 +22,7 @@ from typing import Any
 from langchain_anthropic import ChatAnthropic
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
+from pydantic.json_schema import SkipJsonSchema
 
 from compliance_copilot.settings import settings
 
@@ -40,6 +41,17 @@ class CriticVerdict(BaseModel):
     reasoning: str = Field(
         max_length=300, description="Short justification, naming the gap if not faithful."
     )
+    # ADR-0025 round 2 (BLOCKER 1): distinguishes a critic-tier OUTAGE from a
+    # genuine low-faithfulness verdict — `hitl_node` (graph/nodes.py) must
+    # NOT pause every request just because the nano/Haiku tier is down
+    # (same fail-open reasoning ADR-0019 already applies to the classifier).
+    # `SkipJsonSchema` keeps this OUT of the structured-output JSON schema
+    # sent to the model (verified: `CriticVerdict.model_json_schema()` has
+    # no `error` property with this annotation) — so it can only ever be
+    # set by `critique()`'s own exception handler below, never by the LLM
+    # deciding on its own that it "errored". Not `exclude=True`: still
+    # present in `.model_dump()` for anything that later logs a verdict.
+    error: SkipJsonSchema[bool] = Field(default=False)
 
 
 # Reuses evals/judge.py's JUDGE_SYSTEM_PROMPT wording almost verbatim
@@ -109,5 +121,8 @@ def critique(question: str, answer: str, contexts: list[str], llm: Any) -> Criti
     except Exception as exc:
         logger.warning("critic call failed, recording pessimistic verdict: %s", type(exc).__name__)
         return CriticVerdict(
-            faithful=False, confidence=0.0, reasoning=f"critic_error:{type(exc).__name__}"
+            faithful=False,
+            confidence=0.0,
+            reasoning=f"critic_error:{type(exc).__name__}",
+            error=True,
         )

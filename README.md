@@ -55,6 +55,56 @@ one shared `X-API-Key`, so any key holder can supply any validly-shaped
 open gap ADR-0016 already named). Erase a conversation's checkpointed state
 with `python -m compliance_copilot.cli delete-thread <uuid>`.
 
+### Human review on low confidence (`interrupt`/`/resume`, ADR-0025)
+
+When the critic scores its confidence in a drafted answer below
+`CRITIC_CONFIDENCE_MIN` (default 0.6) — and the critic itself didn't error;
+a critic-tier outage fails OPEN (no pause), see ADR-0025's round 2 note —
+the run pauses instead of streaming a `final` event. `/ask`'s stream ends
+with:
+
+```
+event: interrupt
+data: {"thread_id": "<uuid>", "interrupt_id": "...", "status": "under_review"}
+```
+
+That's deliberately all the END USER sees — no draft, confidence, or
+reasoning on this channel (ADR-0025 round 2). An **operator** reviews the
+full payload via the CLI, which reads it straight off the checkpointed
+state and prints it before applying anything:
+
+```bash
+python -m compliance_copilot.cli resume <thread-id> --decision approve|edit|reject [--answer TEXT]
+# prints: interrupt_id / question / draft answer / critic confidence / critic reasoning
+# THEN applies the decision — the operator sees what they're approving.
+```
+
+Or resolve it over the API with `POST /resume` — note `interrupt_id` (from
+the `interrupt` event above) is required:
+
+```bash
+curl -sN -X POST localhost:8000/resume -H "Content-Type: application/json" \
+  -H "X-API-Key: $API_KEY" \
+  -d '{"thread_id":"<uuid>","interrupt_id":"<uuid>","decision":"approve"}'
+# or: {"thread_id":"<uuid>","interrupt_id":"<uuid>","decision":"edit","edited_answer":"..."}
+# or: {"thread_id":"<uuid>","interrupt_id":"<uuid>","decision":"reject"}
+```
+
+`/resume` streams the same `node`/`final` events `/ask` does once resumed.
+404 if `thread_id` is unknown; 409 if it isn't currently paused, or if
+`interrupt_id` doesn't match the pending review (a stale reference —
+someone already resumed it, or a later `/ask` re-paused the same thread on
+a different question). `/ask` itself now also 409s if called again with a
+`thread_id` that's currently paused — it never silently starts a new run
+over a pending review. An `edit`'s replacement text still has to pass
+every `guard_out` check a model's own draft does — never trusted just
+because a human wrote it. Same shared-`X-API-Key` caveat as `thread_id`
+above: any key holder who knows/guesses a paused `thread_id`+`interrupt_id`
+pair can resume it (ADR-0016, not solved by this feature). `ask` prints
+`under review (thread_id ...)` instead of an answer when it pauses, and
+409s (exit 9) if you `--thread-id` back into a thread that's already
+paused — run `resume` instead.
+
 ## MCP server
 
 `make mcp` starts a standalone MCP server (`search_regulation`, `get_article`,

@@ -915,3 +915,397 @@ def test_two_turn_conversation_via_api_carries_history_into_second_prompt(client
     rendered = "\n".join(content for _role, content in second_llm.messages)
     assert first_question in rendered
     assert first_answer.answer in rendered
+
+
+# --- ADR-0025: human-in-the-loop interrupt/resume -----------------------
+def test_ask_low_confidence_critic_emits_interrupt_event_and_no_final(client):
+    """A critic score below `settings.critic_confidence_min` pauses the run
+    (`hitl_node`) — `/ask`'s stream must end with `interrupt`, and never
+    reach `final`. ADR-0025 round 2 (SHOULD 1): the SSE payload carries
+    ONLY `{thread_id, interrupt_id, status}` — never the draft, confidence,
+    or reasoning, which are operator-facing (read via `aget_state`), not
+    something the SAME channel the end user reads should ever see."""
+    answer = AnswerSchema(
+        answer="A high-risk AI system is one used as a safety component.",
+        citations=[Citation(regulation="ai_act", anchor="art_6", quote="is a safety component")],
+    )
+    saver = InMemorySaver()
+    app.dependency_overrides[get_checkpointer_dependency] = lambda: saver
+    _use_llm(FakeLLM(answer))
+    app.dependency_overrides[get_critic_dependency] = lambda: FakeCritic(
+        False, 0.1, reasoning="does not follow from the excerpt"
+    )
+
+    with client.stream(
+        "POST",
+        "/ask",
+        json={"question": "What is a high-risk AI system?"},
+        headers=_auth_headers(),
+    ) as resp:
+        assert resp.status_code == 200
+        body = "".join(resp.iter_text())
+
+    events = _parse_sse(body)
+    assert "final" not in [e[0] for e in events]
+    interrupt_events = [e for e in events if e[0] == "interrupt"]
+    assert len(interrupt_events) == 1
+    payload = interrupt_events[0][1]
+    thread_id = events[0][1]["thread_id"]
+    assert payload == {
+        "thread_id": thread_id,
+        "interrupt_id": payload["interrupt_id"],
+        "status": "under_review",
+    }
+    assert isinstance(payload["interrupt_id"], str) and payload["interrupt_id"]
+    # The draft/confidence/reasoning are never in the response body at all.
+    body_text = body
+    assert "does not follow from the excerpt" not in body_text
+    assert answer.answer not in body_text
+
+
+def test_ask_high_confidence_critic_still_streams_final_no_interrupt(client):
+    answer = AnswerSchema(answer="...", citations=[])
+    _use_llm(FakeLLM(answer))
+    app.dependency_overrides[get_critic_dependency] = lambda: FakeCritic(True, 0.95)
+
+    with client.stream(
+        "POST",
+        "/ask",
+        json={"question": "What is a high-risk AI system?"},
+        headers=_auth_headers(),
+    ) as resp:
+        body = "".join(resp.iter_text())
+
+    events = _parse_sse(body)
+    assert "interrupt" not in [e[0] for e in events]
+    assert events[-1][0] == "final"
+
+
+def test_critic_outage_does_not_pause_and_still_streams_final(client):
+    """ADR-0025 round 2 (BLOCKER 1): a critic-tier outage (`error=True`)
+    must NOT pause the run — same fail-open reasoning ADR-0019 already
+    applies to the classifier's own outage."""
+
+    class RaisingCritic:
+        def invoke(self, messages):
+            raise ConnectionError("simulated critic outage")
+
+    answer = AnswerSchema(answer="...", citations=[])
+    _use_llm(FakeLLM(answer))
+    app.dependency_overrides[get_critic_dependency] = lambda: RaisingCritic()
+
+    with client.stream(
+        "POST",
+        "/ask",
+        json={"question": "What is a high-risk AI system?"},
+        headers=_auth_headers(),
+    ) as resp:
+        body = "".join(resp.iter_text())
+
+    events = _parse_sse(body)
+    assert "interrupt" not in [e[0] for e in events]
+    assert events[-1][0] == "final"
+
+
+def _pause_a_thread(client, saver, draft: AnswerSchema, confidence: float = 0.1) -> tuple[str, str]:
+    """Runs `/ask` once with a forced low-confidence critic, against the
+    given (shared) `InMemorySaver`, and returns the server-issued
+    `(thread_id, interrupt_id)` left paused — the fixture every `/resume`
+    test below builds on. `interrupt_id` now has to come from somewhere
+    other than the (deliberately reduced, SHOULD 1) SSE payload's `draft`/
+    `confidence` fields — it's still IN that payload (`interrupt_id`
+    was never removed, only `draft`/`confidence`/`reasoning` were)."""
+    app.dependency_overrides[get_checkpointer_dependency] = lambda: saver
+    _use_llm(FakeLLM(draft))
+    app.dependency_overrides[get_critic_dependency] = lambda: FakeCritic(False, confidence)
+    with client.stream(
+        "POST", "/ask", json={"question": "What is a high-risk AI system?"}, headers=_auth_headers()
+    ) as resp:
+        body = "".join(resp.iter_text())
+    events = _parse_sse(body)
+    thread_id = events[0][1]["thread_id"]
+    interrupt_id = next(e[1]["interrupt_id"] for e in events if e[0] == "interrupt")
+    return thread_id, interrupt_id
+
+
+# --- ADR-0025 round 2 (BLOCKER 2): /ask must not supersede a paused thread
+def test_ask_on_already_paused_thread_returns_409(client):
+    """Reproduced live before this fix: `/ask` with a `thread_id` that is
+    currently paused at `hitl` was NOT rejected — LangGraph happily started
+    a new run from START and OVERWROTE the paused checkpoint (the original
+    draft/critic verdict/interrupt vanished with no error). Now: 409."""
+    saver = InMemorySaver()
+    draft = AnswerSchema(answer="...", citations=[])
+    thread_id, _interrupt_id = _pause_a_thread(client, saver, draft)
+
+    resp = client.post(
+        "/ask",
+        json={"question": "A totally different question?", "thread_id": thread_id},
+        headers=_auth_headers(),
+    )
+    assert resp.status_code == 409
+
+
+def test_resume_unknown_thread_returns_404(client):
+    app.dependency_overrides[get_checkpointer_dependency] = lambda: InMemorySaver()
+    resp = client.post(
+        "/resume",
+        json={
+            "thread_id": str(uuid.uuid4()),
+            "interrupt_id": "irrelevant-for-an-unknown-thread",
+            "decision": "approve",
+        },
+        headers=_auth_headers(),
+    )
+    assert resp.status_code == 404
+
+
+def test_resume_thread_not_paused_returns_409(client):
+    """A thread that completed normally (never paused) exists in the
+    checkpointer but has nothing to resume — 409, not 404."""
+    saver = InMemorySaver()
+    app.dependency_overrides[get_checkpointer_dependency] = lambda: saver
+    answer = AnswerSchema(answer="...", citations=[])
+    _use_llm(FakeLLM(answer))
+
+    with client.stream(
+        "POST", "/ask", json={"question": "What is a high-risk AI system?"}, headers=_auth_headers()
+    ) as resp:
+        body = "".join(resp.iter_text())
+    thread_id = _parse_sse(body)[0][1]["thread_id"]
+
+    resp = client.post(
+        "/resume",
+        json={
+            "thread_id": thread_id,
+            "interrupt_id": "irrelevant-nothing-is-paused",
+            "decision": "approve",
+        },
+        headers=_auth_headers(),
+    )
+    assert resp.status_code == 409
+
+
+def test_resume_wrong_interrupt_id_returns_409(client):
+    """ADR-0025 round 2 (BLOCKER 2): a stale/mismatched `interrupt_id` — the
+    caller believes it's resolving a different pause than the one actually
+    pending — must not be silently applied to the real one."""
+    saver = InMemorySaver()
+    draft = AnswerSchema(answer="...", citations=[])
+    thread_id, interrupt_id = _pause_a_thread(client, saver, draft)
+    assert interrupt_id != "not-the-real-interrupt-id"
+
+    resp = client.post(
+        "/resume",
+        json={
+            "thread_id": thread_id,
+            "interrupt_id": "not-the-real-interrupt-id",
+            "decision": "approve",
+        },
+        headers=_auth_headers(),
+    )
+    assert resp.status_code == 409
+
+
+def test_resume_invalid_decision_returns_422(client):
+    resp = client.post(
+        "/resume",
+        json={"thread_id": str(uuid.uuid4()), "interrupt_id": "x", "decision": "maybe"},
+        headers=_auth_headers(),
+    )
+    assert resp.status_code == 422
+
+
+def test_resume_edit_missing_edited_answer_returns_422(client):
+    resp = client.post(
+        "/resume",
+        json={"thread_id": str(uuid.uuid4()), "interrupt_id": "x", "decision": "edit"},
+        headers=_auth_headers(),
+    )
+    assert resp.status_code == 422
+
+
+def test_resume_approve_edited_answer_returns_422(client):
+    """`edited_answer` must be ABSENT for a non-`edit` decision too — not
+    just optional."""
+    resp = client.post(
+        "/resume",
+        json={
+            "thread_id": str(uuid.uuid4()),
+            "interrupt_id": "x",
+            "decision": "approve",
+            "edited_answer": "should not be here",
+        },
+        headers=_auth_headers(),
+    )
+    assert resp.status_code == 422
+
+
+def test_resume_missing_interrupt_id_returns_422(client):
+    """ADR-0025 round 2 (BLOCKER 2): `interrupt_id` is required, not
+    optional — omitting it is a 422, not a silent "resume whatever is
+    pending"."""
+    resp = client.post(
+        "/resume",
+        json={"thread_id": str(uuid.uuid4()), "decision": "approve"},
+        headers=_auth_headers(),
+    )
+    assert resp.status_code == 422
+
+
+def test_resume_extra_field_returns_422(client):
+    resp = client.post(
+        "/resume",
+        json={
+            "thread_id": str(uuid.uuid4()),
+            "interrupt_id": "x",
+            "decision": "approve",
+            "extra": "nope",
+        },
+        headers=_auth_headers(),
+    )
+    assert resp.status_code == 422
+
+
+def test_resume_missing_api_key_returns_401(client):
+    resp = client.post(
+        "/resume",
+        json={"thread_id": str(uuid.uuid4()), "interrupt_id": "x", "decision": "approve"},
+    )
+    assert resp.status_code == 401
+
+
+def test_resume_approve_happy_path_streams_final(client):
+    saver = InMemorySaver()
+    draft = AnswerSchema(
+        answer="A high-risk AI system is one used as a safety component.",
+        citations=[Citation(regulation="ai_act", anchor="art_6", quote="is a safety component")],
+    )
+    thread_id, interrupt_id = _pause_a_thread(client, saver, draft)
+
+    resp = client.post(
+        "/resume",
+        json={"thread_id": thread_id, "interrupt_id": interrupt_id, "decision": "approve"},
+        headers=_auth_headers(),
+    )
+    assert resp.status_code == 200
+    events = _parse_sse(resp.text)
+    assert events[-1][0] == "final"
+    final = events[-1][1]
+    assert final["refused"] is False
+    assert final["answer"] == draft.answer
+
+
+def test_resume_edit_happy_path_returns_edited_text_after_guard_out(client):
+    saver = InMemorySaver()
+    draft = AnswerSchema(
+        answer="original draft text",
+        citations=[Citation(regulation="ai_act", anchor="art_6", quote="is a safety component")],
+    )
+    thread_id, interrupt_id = _pause_a_thread(client, saver, draft)
+
+    edited_text = "Edited: a high-risk AI system is one used as a safety component."
+    resp = client.post(
+        "/resume",
+        json={
+            "thread_id": thread_id,
+            "interrupt_id": interrupt_id,
+            "decision": "edit",
+            "edited_answer": edited_text,
+        },
+        headers=_auth_headers(),
+    )
+    assert resp.status_code == 200
+    events = _parse_sse(resp.text)
+    final = events[-1][1]
+    assert final["refused"] is False
+    assert final["answer"] == edited_text
+    assert final["citations"][0]["anchor"] == "art_6"  # kept the draft's own citations
+
+
+def test_resume_edit_violating_guard_out_is_refused(client):
+    from compliance_copilot.graph import REFUSAL_TEXT
+    from compliance_copilot.graph.nodes import CANARY
+
+    saver = InMemorySaver()
+    draft = AnswerSchema(
+        answer="original draft text",
+        citations=[Citation(regulation="ai_act", anchor="art_6", quote="is a safety component")],
+    )
+    thread_id, interrupt_id = _pause_a_thread(client, saver, draft)
+
+    resp = client.post(
+        "/resume",
+        json={
+            "thread_id": thread_id,
+            "interrupt_id": interrupt_id,
+            "decision": "edit",
+            "edited_answer": f"Sure, here it is: {CANARY}",
+        },
+        headers=_auth_headers(),
+    )
+    assert resp.status_code == 200
+    final = _parse_sse(resp.text)[-1][1]
+    assert final["refused"] is True
+    assert final["answer"] == REFUSAL_TEXT
+
+
+def test_resume_reject_returns_fixed_refusal(client):
+    from compliance_copilot.graph import REFUSAL_TEXT
+
+    saver = InMemorySaver()
+    draft = AnswerSchema(
+        answer="original draft text",
+        citations=[Citation(regulation="ai_act", anchor="art_6", quote="is a safety component")],
+    )
+    thread_id, interrupt_id = _pause_a_thread(client, saver, draft)
+
+    resp = client.post(
+        "/resume",
+        json={"thread_id": thread_id, "interrupt_id": interrupt_id, "decision": "reject"},
+        headers=_auth_headers(),
+    )
+    assert resp.status_code == 200
+    final = _parse_sse(resp.text)[-1][1]
+    assert final["refused"] is True
+    assert final["answer"] == REFUSAL_TEXT
+
+
+def test_resume_twice_second_call_returns_409(client):
+    """ADR-0025 round 2 (SHOULD 2): a double-resume on the same thread must
+    be pinned explicitly, not just incidentally exercised as a side effect
+    of a different test (round-1 review finding — the rate-limit test below
+    made this exact call but never asserted its status)."""
+    saver = InMemorySaver()
+    draft = AnswerSchema(answer="...", citations=[])
+    thread_id, interrupt_id = _pause_a_thread(client, saver, draft)
+
+    body = {"thread_id": thread_id, "interrupt_id": interrupt_id, "decision": "approve"}
+    first = client.post("/resume", json=body, headers=_auth_headers())
+    assert first.status_code == 200
+
+    second = client.post("/resume", json=body, headers=_auth_headers())
+    assert second.status_code == 409
+
+
+def test_resume_rate_limited_like_ask(client, monkeypatch):
+    saver = InMemorySaver()
+    draft = AnswerSchema(answer="...", citations=[])
+    # uses the default (generous) rate limit
+    thread_id, interrupt_id = _pause_a_thread(client, saver, draft)
+
+    monkeypatch.setattr(settings, "rate_limit", "2/minute")
+    limiter.reset()  # the pause-phase /ask call above already used the default bucket
+
+    body = {"thread_id": thread_id, "interrupt_id": interrupt_id, "decision": "approve"}
+    codes = [
+        client.post("/resume", json=body, headers=_auth_headers()).status_code for _ in range(3)
+    ]
+    # Same shared `_rate_limit_key` bucket `/ask` uses (api.py) — the first
+    # resume succeeds (200); the SAME thread is no longer paused for the
+    # second call (409, not a rate-limit rejection — pinned on its own by
+    # `test_resume_twice_second_call_returns_409` above); the THIRD call
+    # proves `SlowAPIMiddleware` (not the thread-state check) is what fires
+    # once the 2/minute budget is spent.
+    assert codes[0] == 200
+    assert codes[2] == 429

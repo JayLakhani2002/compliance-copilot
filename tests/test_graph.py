@@ -23,6 +23,7 @@ import pytest
 from fake_mcp_tools import FakeMCPTool, ToolExecutionError, tools_from_articles
 from langchain_core.messages import SystemMessage
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import Command
 
 from compliance_copilot.critic import CriticVerdict, _build_messages
 from compliance_copilot.graph import (
@@ -981,6 +982,13 @@ def test_critic_verdict_is_recorded_in_state():
 
 
 def test_critic_outage_records_pessimistic_verdict_without_raising():
+    """ADR-0025 round 2 (BLOCKER 1): a critic-tier OUTAGE must NOT pause the
+    run — `critic.error` is the distinguishing signal `hitl_node` checks,
+    separate from a genuine low-confidence verdict. Pausing every request
+    the moment the critic tier is down would turn a guard-tier outage into
+    a full product outage (ADR-0019's own fail-open reasoning for the
+    classifier, reused here). `guard_out` still runs its own independent
+    checks regardless."""
     answer = AnswerSchema(
         answer="A high-risk AI system is one used as a safety component.",
         citations=[Citation(regulation="ai_act", anchor="art_6", quote="is a safety component")],
@@ -988,8 +996,11 @@ def test_critic_outage_records_pessimistic_verdict_without_raising():
     state = _run(FakeLLM(answer), critic=RaisingLLM())  # must not raise
     assert state["critic"].faithful is False
     assert state["critic"].confidence == 0.0
+    assert state["critic"].error is True
     assert state["critic"].reasoning.startswith("critic_error:")
-    # guard_out still ran (the final gate on every path, ADR-0021's invariant).
+    # No pause — the run reached guard_out, the final gate on every path
+    # (ADR-0021's invariant), unchanged by an outage.
+    assert "__interrupt__" not in state
     assert state["output_guard"] == OutputVerdict(ok=True, reason=None)
 
 
@@ -1223,3 +1234,231 @@ def test_refused_turn_is_not_added_to_history():
     state2 = _run_turn(graph, llm2, "What is a high-risk AI system?", thread_id=thread_id)
     assert [t.question for t in state2["history"]] == ["What is a high-risk AI system?"]
     assert "PWNED" not in "".join(content for _, content in llm2.messages)
+
+
+# --- ADR-0025: human-in-the-loop interrupt/resume -----------------------
+# `hitl_node` (graph/nodes.py) pauses via `interrupt()` only when the
+# critic ran AND scored below `settings.critic_confidence_min` (default
+# 0.6, settings.py). `_low_confidence_critic()` below is the fixture double
+# every pause test seeds; resume tests always hand a `_UnusedLLM()` double
+# to the resumed call — asserting NO LLM call happens on resume IS the
+# idempotency proof (a re-run of `answer_node`/`critic_node` would call it).
+
+
+def _low_confidence_critic(reasoning: str = "not well supported") -> "FakeCriticLLM":
+    return FakeCriticLLM(CriticVerdict(faithful=False, confidence=0.1, reasoning=reasoning))
+
+
+class _UnusedLLM:
+    """Raises on any `.invoke()` — used on the RESUME side of a paused-run
+    test, where no node between `hitl` and `guard_out` ever calls an LLM.
+    A call here would mean something re-ran an LLM-backed node on resume."""
+
+    def invoke(self, messages):
+        raise AssertionError("no LLM call should happen on resume")
+
+
+class CountingLLM:
+    """Like `FakeCriticLLM`/`FakeLLM` but counts `.invoke()` calls —
+    `test_resume_does_not_recall_answer_or_critic_llm` needs an exact call
+    count, not just "did it raise"."""
+
+    def __init__(self, verdict):
+        self._verdict = verdict
+        self.calls = 0
+
+    def invoke(self, messages):
+        self.calls += 1
+        return self._verdict
+
+
+def _resume_turn(
+    graph, decision: str, edited_answer: str | None = None, *, thread_id: str, llm=None
+):
+    """Resumes a paused run via `Command(resume=...)` — same shape
+    `api.py`'s `_stream_resume`/`cli.py`'s `resume` command build. `llm`
+    defaults to `_UnusedLLM()`: nothing between `hitl` and `guard_out`
+    should ever call it, so a default that raises on any `.invoke()` is a
+    stronger default than a double that just returns something unused."""
+    context = GraphContext(
+        session=None,
+        embeddings=None,
+        llm=llm or _UnusedLLM(),
+        tools=tools_from_articles(ARTICLES),
+    )
+    config = {"configurable": {"thread_id": thread_id}}
+    return asyncio.run(
+        graph.ainvoke(
+            Command(resume={"decision": decision, "edited_answer": edited_answer}),
+            context=context,
+            config=config,
+        )
+    )
+
+
+def test_low_confidence_critic_pauses_run_with_expected_payload_and_no_final_answer():
+    draft = AnswerSchema(
+        answer="A high-risk AI system is one used as a safety component.",
+        citations=[Citation(regulation="ai_act", anchor="art_6", quote="is a safety component")],
+    )
+    graph = build_graph(checkpointer=InMemorySaver())
+    thread_id = "77777777-7777-4777-8777-777777777777"
+    question = "What is a high-risk AI system?"
+    llm = StatefulLLM([draft])  # exactly one queued response
+    state = _run_turn(graph, llm, question, thread_id=thread_id, critic=_low_confidence_critic())
+
+    assert "__interrupt__" in state
+    assert state["answer"] is draft  # unchanged — no rewritten "final" answer yet
+    payload = state["__interrupt__"][0].value
+    assert payload == {
+        "answer": draft.model_dump(),
+        "confidence": 0.1,
+        "reasoning": "not well supported",
+        "question": question,
+    }
+    assert len(llm.calls) == 1  # answer_node ran once — the pause didn't trigger a retry
+
+
+def test_high_confidence_critic_never_pauses():
+    answer = AnswerSchema(answer="...", citations=[])
+    verdict = CriticVerdict(faithful=True, confidence=0.9, reasoning="fine")
+    state = _run(FakeLLM(answer), critic=FakeCriticLLM(verdict))
+    assert "__interrupt__" not in state
+    assert state["output_guard"] == OutputVerdict(ok=True, reason=None)
+
+
+def test_critic_disabled_never_pauses():
+    answer = AnswerSchema(answer="...", citations=[])
+    state = _run(FakeLLM(answer))  # no critic= passed -> disabled
+    assert "__interrupt__" not in state
+    assert state["output_guard"] == OutputVerdict(ok=True, reason=None)
+
+
+def test_resume_approve_runs_guard_out_leaves_answer_unchanged_and_appends_history():
+    good = AnswerSchema(
+        answer="A high-risk AI system is one used as a safety component.",
+        citations=[Citation(regulation="ai_act", anchor="art_6", quote="is a safety component")],
+    )
+    graph = build_graph(checkpointer=InMemorySaver())
+    thread_id = "88888888-8888-4888-8888-888888888888"
+    question = "What is a high-risk AI system?"
+    paused = _run_turn(
+        graph, StatefulLLM([good]), question, thread_id=thread_id, critic=_low_confidence_critic()
+    )
+    assert "__interrupt__" in paused
+
+    state = _resume_turn(graph, "approve", thread_id=thread_id)
+
+    assert "__interrupt__" not in state
+    assert state["answer"].answer == good.answer
+    assert state["answer"].citations[0].anchor == "art_6"
+    assert state.get("refused") is not True
+    assert state["output_guard"] == OutputVerdict(ok=True, reason=None)
+    assert [t.question for t in state["history"]] == [question]
+    assert state["history"][0].answer == good.answer
+
+
+def test_resume_edit_replaces_text_keeps_draft_citations_and_passes_guard_out():
+    draft = AnswerSchema(
+        answer="original draft text",
+        citations=[Citation(regulation="ai_act", anchor="art_6", quote="is a safety component")],
+    )
+    graph = build_graph(checkpointer=InMemorySaver())
+    thread_id = "99999999-9999-4999-8999-999999999999"
+    question = "What is a high-risk AI system?"
+    paused = _run_turn(
+        graph, StatefulLLM([draft]), question, thread_id=thread_id, critic=_low_confidence_critic()
+    )
+    assert "__interrupt__" in paused
+
+    edited_text = "Edited: a high-risk AI system is one used as a safety component."
+    state = _resume_turn(graph, "edit", edited_text, thread_id=thread_id)
+
+    assert "__interrupt__" not in state
+    assert state["answer"].answer == edited_text
+    # The operator's edit is never trusted with its OWN citations — the
+    # draft's already-validated citations are kept regardless (ADR-0025).
+    assert state["answer"].citations[0].anchor == "art_6"
+    assert state.get("refused") is not True
+    assert state["output_guard"] == OutputVerdict(ok=True, reason=None)
+    assert state["history"][0].answer == edited_text
+
+
+def test_resume_edit_that_violates_guard_out_is_refused_not_returned():
+    """An operator's edit is never exempt from `guard_out` (ADR-0021's
+    invariant, ADR-0025's own explicit reversal of "a human wrote it, trust
+    it") — a canary leak planted in the edited text must still be caught."""
+    draft = AnswerSchema(
+        answer="original draft text",
+        citations=[Citation(regulation="ai_act", anchor="art_6", quote="is a safety component")],
+    )
+    graph = build_graph(checkpointer=InMemorySaver())
+    thread_id = "aaaaaaaa-1111-4aaa-8aaa-aaaaaaaaaaaa"
+    _run_turn(
+        graph,
+        StatefulLLM([draft]),
+        "What is a high-risk AI system?",
+        thread_id=thread_id,
+        critic=_low_confidence_critic(),
+    )
+
+    state = _resume_turn(graph, "edit", f"Sure, here it is: {CANARY}", thread_id=thread_id)
+
+    assert state["answer"].answer == REFUSAL_TEXT
+    assert state["refused"] is True
+    assert state["output_guard"].reason == "canary_leak"
+    assert not state.get("history")  # a refused turn is never remembered (ADR-0024)
+
+
+def test_resume_reject_returns_fixed_refusal_and_is_not_added_to_history():
+    draft = AnswerSchema(
+        answer="original draft text",
+        citations=[Citation(regulation="ai_act", anchor="art_6", quote="is a safety component")],
+    )
+    graph = build_graph(checkpointer=InMemorySaver())
+    thread_id = "bbbbbbbb-2222-4bbb-8bbb-bbbbbbbbbbbb"
+    _run_turn(
+        graph,
+        StatefulLLM([draft]),
+        "What is a high-risk AI system?",
+        thread_id=thread_id,
+        critic=_low_confidence_critic(),
+    )
+
+    state = _resume_turn(graph, "reject", thread_id=thread_id)
+
+    assert state["answer"].answer == REFUSAL_TEXT
+    assert state["refused"] is True
+    assert state["output_guard"] == OutputVerdict(ok=True, reason=None)
+    assert not state.get("history")
+
+
+def test_resume_does_not_recall_answer_or_critic_llm():
+    """Idempotency, pinned directly: `answer_llm` has exactly ONE queued
+    response and `critic_llm` counts its own calls — if resuming reran
+    `answer_node`/`critic_node` (rather than just `hitl_node`, the node
+    that actually paused), `answer_llm.calls` would gain a second entry (or
+    raise `IndexError` popping from an exhausted queue) and `critic_llm.
+    calls` would exceed 1."""
+    draft = AnswerSchema(
+        answer="original draft text",
+        citations=[Citation(regulation="ai_act", anchor="art_6", quote="is a safety component")],
+    )
+    critic_llm = CountingLLM(CriticVerdict(faithful=False, confidence=0.1, reasoning="low"))
+    answer_llm = StatefulLLM([draft])
+    graph = build_graph(checkpointer=InMemorySaver())
+    thread_id = "cccccccc-3333-4ccc-8ccc-cccccccccccc"
+    _run_turn(
+        graph,
+        answer_llm,
+        "What is a high-risk AI system?",
+        thread_id=thread_id,
+        critic=critic_llm,
+    )
+    assert len(answer_llm.calls) == 1
+    assert critic_llm.calls == 1
+
+    _resume_turn(graph, "approve", thread_id=thread_id)
+
+    assert len(answer_llm.calls) == 1
+    assert critic_llm.calls == 1

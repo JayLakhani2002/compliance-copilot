@@ -175,12 +175,11 @@ class Settings(BaseSettings):
     critic_model: str | None = None
     # Bounds one slow critic call — same reasoning as `router_timeout_s`.
     critic_timeout_s: float = 3.0
-    # Day-20 placeholder: the confidence cutoff a future conditional edge
-    # (or `interrupt()`) will read to decide whether a low-confidence critic
-    # verdict pauses/blocks an answer. NOT READ ANYWHERE YET — Day 18/20 only
-    # records the critic's verdict (lesson 18: "records first, blocks
-    # later"); declaring the knob now means Day 20 needs no settings-schema
-    # change, only a new conditional edge that reads it.
+    # ADR-0025: the confidence cutoff `hitl_node` (graph/nodes.py) reads to
+    # decide whether a low-confidence critic verdict pauses an answer for
+    # human review (`interrupt()`) — a verdict scoring AT or ABOVE this
+    # passes straight through. Starts conservative (biased toward pausing
+    # more, not less); tune from real critic-score traffic, not intuition.
     critic_confidence_min: float = 0.6
 
     # ADR-0007 Day-17 amendment: `retrieve_node` (graph/nodes.py) is now the

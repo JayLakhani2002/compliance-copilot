@@ -1,15 +1,17 @@
 # src/compliance_copilot/api.py — the HTTP surface for the graph
-# (docs/ARCHITECTURE.md §5-6, ADR-0008, ADR-0016). One route, `/ask`: an
-# API-key-gated, rate-limited, streaming (SSE) wrapper around
-# `graph.astream(...)` (ADR-0001's `retrieve -> answer` graph, unchanged).
-# `/healthz` is unauthenticated and does no DB/LLM work, for a container
-# orchestrator's liveness probe.
+# (docs/ARCHITECTURE.md §5-6, ADR-0008, ADR-0016). Two real routes: `/ask`,
+# an API-key-gated, rate-limited, streaming (SSE) wrapper around
+# `graph.astream(...)`, and `/resume` (ADR-0025), which continues a run
+# `/ask` paused via `hitl_node`'s `interrupt()`. `/healthz` is
+# unauthenticated and does no DB/LLM work, for a container orchestrator's
+# liveness probe.
 #
-# Why one module, not a package: today's surface is one real endpoint plus
-# a health check — splitting routes/deps/schemas into separate files would
-# be indirection with nothing on the other side of it yet (ponytail). Split
-# it the day a second real endpoint (e.g. the HITL resume endpoint
-# docs/ARCHITECTURE.md §5 sketches) actually lands.
+# Why one module, not a package: this is still a handful of routes sharing
+# one dependency set and one SSE-framing convention — splitting
+# routes/deps/schemas into separate files would be indirection with nothing
+# on the other side of it yet (ponytail). Split it the day a third
+# meaningfully different surface (not just another route on the same graph)
+# actually lands.
 from __future__ import annotations
 
 import asyncio
@@ -21,14 +23,15 @@ import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from functools import lru_cache
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Security, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
 from langchain_core.embeddings import Embeddings
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from langgraph.types import Command
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
@@ -82,6 +85,53 @@ class AskRequest(BaseModel):
     @classmethod
     def _thread_id_must_be_uuid4(cls, v: str | None) -> str | None:
         return v if v is None else validate_thread_id(v)
+
+
+# ---------------------------------------------------------------------------
+# ADR-0025: `/resume`'s request body — same trust-boundary posture as
+# `AskRequest` above (`extra="forbid"`, a bounded `edited_answer` length).
+# `edited_answer` is required exactly when `decision == "edit"` (enforced by
+# the `model_validator` below, not just a docstring convention) — the
+# operator's own text still has to reach `guard_out` unchanged by this
+# schema, this validator only decides whether a value is REQUIRED, never
+# rewrites it.
+# ---------------------------------------------------------------------------
+class ResumeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # Not `str | None` with a server-issued default like `AskRequest.
+    # thread_id`: resuming a run that doesn't exist yet makes no sense, so
+    # the client must already have one (from the `interrupt` SSE event or
+    # the CLI's "under review" line).
+    thread_id: str
+    # ADR-0025 round 2 (BLOCKER 2): required — the `interrupt_id` `/ask`'s
+    # `interrupt` SSE event already returned. `_require_paused_thread`
+    # compares this against the ACTUAL pending interrupt's `.id` (from
+    # `graph.aget_state`) before applying anything: a mismatch means the
+    # caller is resolving a STALE pause (a later `/ask` call already
+    # re-paused this same thread on a different question, or a previous
+    # `/resume` already resolved this exact one) — 409, never silently
+    # applied to the wrong draft.
+    interrupt_id: str
+    decision: Literal["approve", "edit", "reject"]
+    # Reuses `max_question_chars` (no separate "max answer length" setting
+    # exists yet, and an edited answer is the same order of magnitude of
+    # text) — same "bound cost/abuse at the trust boundary" reasoning
+    # `AskRequest.question` already applies.
+    edited_answer: str | None = Field(default=None, max_length=settings.max_question_chars)
+
+    @field_validator("thread_id")
+    @classmethod
+    def _thread_id_must_be_uuid4(cls, v: str) -> str:
+        return validate_thread_id(v)
+
+    @model_validator(mode="after")
+    def _edited_answer_matches_decision(self) -> ResumeRequest:
+        if self.decision == "edit" and not self.edited_answer:
+            raise ValueError("edited_answer is required when decision is 'edit'")
+        if self.decision != "edit" and self.edited_answer is not None:
+            raise ValueError("edited_answer is only allowed when decision is 'edit'")
+        return self
 
 
 # ---------------------------------------------------------------------------
@@ -289,76 +339,94 @@ def _sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
 
-async def _stream_answer(
-    question: str,
+async def _run_graph_and_stream(
+    graph: Any,
+    initial_input: dict[str, Any] | Command,
     *,
-    session: Session,
-    embeddings: Embeddings,
-    llm: Any,
-    classifier: Any | None,
-    router: Any | None,
-    critic: Any | None,
-    tools: dict[str, Any] | None,
-    checkpointer: Any | None,
+    context: GraphContext,
+    config: dict,
     thread_id: str,
 ) -> AsyncIterator[str]:
-    """The `/ask` response body: runs the compiled graph via `astream(...,
-    stream_mode='updates')`, translating each node's partial state into an
-    SSE event. Never yields the question or full chunk text — only node
-    names, article/recital anchors, attempt counts, and (on failure) a
-    citation-error message built solely from anchors (see
-    `CitationError`'s own docstring, state.py).
+    """The shared `astream(..., stream_mode='updates')` -> SSE-event loop
+    behind both `/ask` (`initial_input={"question": ...}`) and `/resume`
+    (ADR-0025, `initial_input=Command(resume=...)`) — `Pregel.astream`'s
+    installed signature accepts either as its first argument, so a fresh run
+    and a resumed one are the same loop from this point on: the same node
+    names, the same event shapes, the same exception handling. Never yields
+    the question or full chunk text — only node names, article/recital
+    anchors, attempt counts, and (on failure) a citation-error message built
+    solely from anchors (see `CitationError`'s own docstring, state.py).
 
-    `classifier`: ADR-0019's layer-2 guard, `None` when disabled
-    (`get_classifier_dependency` above). `router`/`critic`: ADR-0023's two
-    new cheap-LLM calls, `None` when disabled (`get_router_dependency`/
-    `get_critic_dependency` above) — same contract.
-
-    ADR-0021: `guard_out` now runs on every path AFTER `refuse`/`answer`
+    ADR-0021: `guard_out` runs on every path AFTER `refuse`/`answer`/`hitl`
     (build.py), so the `final` event — and which `answer`/`refused` it
     carries — has to reflect whatever `guard_out` decided, not the state at
-    the moment `refuse`/`answer` fired. `current_answer`/`current_refused`
+    the moment an earlier node fired. `current_answer`/`current_refused`
     track the latest values across node updates (`stream_mode='updates'`
     only ever hands this loop the KEYS one node changed, not the full
     state); `final` is emitted once, at `guard_out`, using whichever values
     are current by then.
 
-    ADR-0024: `checkpointer`/`thread_id` wire up durable, multi-turn state —
-    `checkpointer` is `None` when `lifespan()` hasn't run (e.g. a bare
-    `TestClient(app)`, see `get_checkpointer_dependency`'s docstring), which
-    reproduces today's stateless-per-call behaviour exactly. The `thread`
-    event fires FIRST, before the graph even starts, since the caller
-    already knows `thread_id` by then (server-issued or client-supplied,
-    validated) — this is what lets a client that omitted `thread_id` learn
-    the one the server picked, in time to send it back on the next call."""
-    yield _sse("thread", {"thread_id": thread_id})
-    graph = build_graph(checkpointer=checkpointer)
-    context = GraphContext(
-        session=session,
-        embeddings=embeddings,
-        llm=llm,
-        classifier=classifier,
-        router=router,
-        critic=critic,
-        tools=tools,
-    )
+    ADR-0025: a `{"__interrupt__": (Interrupt(...), ...)}` chunk (verified
+    against the installed `langgraph` pregel loop, matching Context7's
+    documented shape) is `hitl_node` pausing on a low-confidence critic
+    score — emits `interrupt` and ends the stream with no `final` event,
+    the same "stream ends without a final answer" contract a citation/
+    output-guard failure already gives via `error` below.
+
+    ADR-0025 round 2 (SHOULD 1): the `interrupt` SSE event carries ONLY
+    `{thread_id, interrupt_id, status: "under_review"}` — never the draft
+    answer, confidence, or reasoning. This is the same channel `/ask`'s
+    caller reads (`docs/ARCHITECTURE.md` §5: the end user gets "under
+    review", nothing more); an operator reviews the full payload separately
+    (`graph.aget_state()`, which the CLI `resume` command prints before
+    applying a decision) — a distinct identity from "whoever holds the
+    shared API key", in intent if not yet in enforcement (ADR-0016's still-
+    open gap). The full payload still lives inside `interrupt(...)` itself
+    (`hitl_node`, graph/nodes.py) — this is a narrower SSE projection of
+    it, not a narrower checkpoint.
+
+    Resuming (`initial_input` is a `Command`) starts this SAME loop
+    part-way through the graph — `answer_node`/`critic_node` already ran
+    (and were streamed) in the EARLIER call that paused, so THIS stream
+    never re-emits their updates. `current_answer`/`current_refused` are
+    seeded from the paused snapshot's own values (verified live: an
+    `approve` resume, which returns `Command(goto="guard_out")` with no
+    `update`, streams only `{"hitl": None}` then `guard_out`'s own update —
+    neither carries `answer` — so without this seed `current_answer` would
+    still be `None` when `final` tries to `.model_dump()` it)."""
     started = time.monotonic()
-    # One config per request: `run_config()` builds a fresh CallbackHandler
-    # (or `[]` when tracing is disabled, tracing.py) and a request-scoped
-    # session id, so concurrent `/ask` calls never share a handler instance
-    # (see tracing.current_trace_id's docstring on why that matters).
-    # `configurable.thread_id` (ADR-0024) rides alongside it — LangGraph
-    # reads this key straight off the same config dict, no separate
-    # `config=` argument needed.
-    config = tracing.run_config(session_id=uuid.uuid4().hex)
-    config["configurable"] = {"thread_id": thread_id}
     trace_emitted = False
     current_answer = None
     current_refused = False
+    if isinstance(initial_input, Command):
+        snapshot = await graph.aget_state(config)
+        current_answer = snapshot.values.get("answer")
+        current_refused = snapshot.values.get("refused", False)
     try:
         async for update in graph.astream(
-            {"question": question}, context=context, config=config, stream_mode="updates"
+            initial_input, context=context, config=config, stream_mode="updates"
         ):
+            if "__interrupt__" in update:
+                payload = update["__interrupt__"][0]
+                draft = payload.value
+                # Full draft/confidence/reasoning logged server-side only
+                # (an operator reading logs/traces, not the SSE response) —
+                # the SSE event below is deliberately narrower (SHOULD 1).
+                logger.info(
+                    "node=hitl interrupted confidence=%s elapsed_ms=%d",
+                    draft["confidence"],
+                    int((time.monotonic() - started) * 1000),
+                )
+                yield _sse(
+                    "interrupt",
+                    {
+                        "thread_id": thread_id,
+                        "interrupt_id": payload.id,
+                        "status": "under_review",
+                    },
+                )
+                tracing.score("interrupted", 1.0, tracing.current_trace_id(config))
+                return
             for node_name, node_update in update.items():
                 elapsed_ms = int((time.monotonic() - started) * 1000)
                 # ADR-0023: `router_node`/`critic_node` return `{}` when
@@ -502,6 +570,33 @@ async def _stream_answer(
                         trace_id = tracing.current_trace_id(config)
                         tracing.score("critic_faithful", 1.0 if verdict.faithful else 0.0, trace_id)
                         tracing.score("critic_confidence", verdict.confidence, trace_id)
+                        if verdict.error:
+                            # ADR-0025 round 2 (BLOCKER 1): a critic-tier
+                            # OUTAGE, distinct from a genuine low-confidence
+                            # verdict — `hitl_node` will NOT pause for this
+                            # (see its own docstring), so this score is the
+                            # visible record that LLM-judge coverage was
+                            # lost for this request, mirroring the router's
+                            # own fail-open logging (router.py).
+                            tracing.score("critic_unavailable", 1.0, trace_id)
+                elif node_name == "hitl":
+                    # ADR-0025: only reached on a RESUME (a fresh run either
+                    # pauses via `__interrupt__` above, or passes through
+                    # with no node update at all — `hitl_node`'s no-op
+                    # `return {}}` normalises to `None`/`{}` the same way
+                    # `router`/`critic` already do when disabled). `approve`
+                    # returns `Command(goto="guard_out")` with no `update`
+                    # (verified live: streams as `{"hitl": None}`) — leaves
+                    # `current_answer`/`current_refused` at whatever they
+                    # were seeded to above. `edit`/`reject` DO write
+                    # `answer` (and `reject` writes `refused=True`) —
+                    # captured here the same way `refuse`'s block above
+                    # does, no new event vocabulary needed.
+                    if node_update.get("answer") is not None:
+                        current_answer = node_update["answer"]
+                    if "refused" in node_update:
+                        current_refused = node_update["refused"]
+                    logger.info("node=%s resumed elapsed_ms=%d", node_name, elapsed_ms)
                 elif node_name == "guard_out":
                     # ADR-0021: the final gate, reached on every path. Its
                     # own update only carries "answer"/"refused" when it
@@ -558,6 +653,173 @@ async def _stream_answer(
             int((time.monotonic() - started) * 1000),
         )
         yield _sse("error", {"type": "internal_error"})
+
+
+def _build_run_config(thread_id: str) -> dict:
+    """One config per request: `run_config()` builds a fresh CallbackHandler
+    (or `[]` when tracing is disabled, tracing.py) and a request-scoped
+    session id, so concurrent requests never share a handler instance (see
+    tracing.current_trace_id's docstring on why that matters).
+    `configurable.thread_id` (ADR-0024) rides alongside it — LangGraph reads
+    this key straight off the same config dict, no separate `config=`
+    argument needed. Shared by `/ask` and `/resume` (ADR-0025) — identical
+    shape either way."""
+    config = tracing.run_config(session_id=uuid.uuid4().hex)
+    config["configurable"] = {"thread_id": thread_id}
+    return config
+
+
+async def _stream_answer(
+    question: str,
+    *,
+    session: Session,
+    embeddings: Embeddings,
+    llm: Any,
+    classifier: Any | None,
+    router: Any | None,
+    critic: Any | None,
+    tools: dict[str, Any] | None,
+    checkpointer: Any | None,
+    thread_id: str,
+) -> AsyncIterator[str]:
+    """The `/ask` response body. `classifier`: ADR-0019's layer-2 guard,
+    `None` when disabled (`get_classifier_dependency` above). `router`/
+    `critic`: ADR-0023's two cheap-LLM calls, `None` when disabled — same
+    contract. `checkpointer` is `None` when `lifespan()` hasn't run (e.g. a
+    bare `TestClient(app)`, see `get_checkpointer_dependency`'s docstring),
+    which reproduces today's stateless-per-call behaviour exactly. The
+    `thread` event fires FIRST, before the graph even starts, since the
+    caller already knows `thread_id` by then (server-issued or client-
+    supplied, validated) — this is what lets a client that omitted
+    `thread_id` learn the one the server picked, in time to send it back on
+    the next call (or to resume a pause, ADR-0025)."""
+    yield _sse("thread", {"thread_id": thread_id})
+    graph = build_graph(checkpointer=checkpointer)
+    context = GraphContext(
+        session=session,
+        embeddings=embeddings,
+        llm=llm,
+        classifier=classifier,
+        router=router,
+        critic=critic,
+        tools=tools,
+    )
+    config = _build_run_config(thread_id)
+    async for chunk in _run_graph_and_stream(
+        graph, {"question": question}, context=context, config=config, thread_id=thread_id
+    ):
+        yield chunk
+
+
+async def _require_paused_thread(graph: Any, thread_id: str, interrupt_id: str) -> None:
+    """ADR-0025: `POST /resume`'s pre-flight check. `graph.aget_state(...)`
+    on a thread_id with no checkpointed state at all returns an EMPTY
+    snapshot (`values == {}`) rather than raising — verified live against
+    the installed `langgraph` package — so "no values" is what actually
+    distinguishes 404 (never existed) from 409 (exists, but isn't currently
+    paused: `snapshot.next`/`snapshot.interrupts` both empty means no
+    pending `interrupt()` to resume). A graph compiled with no checkpointer
+    at all (`checkpointer=None`, e.g. `lifespan()` hasn't run) raises
+    `ValueError` from `aget_state` itself — no persistence means no thread
+    can be "known" either, so that's the same 404.
+
+    ADR-0025 round 2 (BLOCKER 2): also checks `interrupt_id` — the caller's
+    claimed pending-interrupt id — against `snapshot.interrupts[0].id`, the
+    ACTUAL one `aget_state` reports right now. A mismatch is 409, same as
+    "not paused": it means the caller is holding a STALE reference (a later
+    `/ask` re-paused this thread on a different question, or a previous
+    `/resume` already resolved this exact interrupt) — never silently
+    applied to a draft the caller never actually reviewed."""
+    try:
+        snapshot = await graph.aget_state({"configurable": {"thread_id": thread_id}})
+    except ValueError:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown thread_id") from None
+    if not snapshot.values:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown thread_id")
+    if not snapshot.next or not snapshot.interrupts:
+        raise HTTPException(status.HTTP_409_CONFLICT, "thread is not paused")
+    if snapshot.interrupts[0].id != interrupt_id:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "interrupt_id does not match the pending review"
+        )
+
+
+async def _reject_if_paused(graph: Any, thread_id: str) -> None:
+    """ADR-0025 round 2 (BLOCKER 2): `/ask`'s pre-flight check on a
+    CLIENT-SUPPLIED (existing) `thread_id` — reproduced live before this
+    fix: calling `graph.astream({"question": ...}, config=same_thread_id)`
+    on a thread currently paused at `hitl` is NOT rejected by LangGraph —
+    it happily starts a brand-new run from `START`, and the new run's
+    checkpoint OVERWRITES the paused one (the original draft, critic
+    verdict, and interrupt vanish with no error). A review-gating feature
+    cannot let a second `/ask` silently supersede a pending review — 409,
+    the same status `/resume` already uses for "not currently paused"
+    (the mirror-image condition). `ValueError` (no checkpointer at all)
+    means nothing could possibly be paused — nothing to reject."""
+    try:
+        snapshot = await graph.aget_state({"configurable": {"thread_id": thread_id}})
+    except ValueError:
+        return
+    if snapshot.next and snapshot.interrupts:
+        raise HTTPException(status.HTTP_409_CONFLICT, "thread is awaiting review; call /resume")
+
+
+async def _stream_resume(
+    decision: str,
+    edited_answer: str | None,
+    *,
+    session: Session,
+    embeddings: Embeddings,
+    llm: Any,
+    classifier: Any | None,
+    router: Any | None,
+    critic: Any | None,
+    tools: dict[str, Any] | None,
+    checkpointer: Any | None,
+    thread_id: str,
+) -> AsyncIterator[str]:
+    """The `/resume` response body (ADR-0025): resumes a run `hitl_node`
+    paused, via `Command(resume=...)` — `hitl_node` re-executes from the top
+    (LangGraph's documented resume semantics), reads the decision back out
+    of `interrupt()`'s return value, and routes to `guard_out` either way
+    (approve/edit unchanged or rewritten answer; reject the fixed refusal).
+    From there this streams the remainder (`guard_out` -> `final`) through
+    the SAME `_run_graph_and_stream` loop `/ask` uses — identical event
+    shapes, no separate "resume" event vocabulary to maintain.
+
+    No `thread` event here (unlike `_stream_answer`): the caller already
+    knows `thread_id` — they supplied it in the request body.
+
+    `GraphContext` is rebuilt fresh from the request's own dependencies,
+    exactly like `/ask` — it is NOT part of checkpointed state (state.py's
+    module docstring: a DB session/LLM client isn't serialisable or meant to
+    be persisted), so a resume needs its own live dependencies the same way
+    a fresh run does, even though the guard_out-only remainder rarely uses
+    most of them. Pre-flight validation (`_require_paused_thread`) already
+    ran in the route handler, BEFORE this generator was ever constructed —
+    an `HTTPException` raised from inside a `StreamingResponse` body would
+    arrive after a 200 and headers were already sent, not as the 404/409 a
+    client needs to see."""
+    graph = build_graph(checkpointer=checkpointer)
+    context = GraphContext(
+        session=session,
+        embeddings=embeddings,
+        llm=llm,
+        classifier=classifier,
+        router=router,
+        critic=critic,
+        tools=tools,
+    )
+    config = _build_run_config(thread_id)
+    # ADR-0025 deliverable D: minimal tracing signal for which decision an
+    # operator made — mirrors the existing one-signal-per-`tracing.score()`
+    # call convention (`refused`, `citation_valid`, ...).
+    tracing.score(f"hitl_{decision}", 1.0, tracing.current_trace_id(config))
+    resume_value = {"decision": decision, "edited_answer": edited_answer}
+    async for chunk in _run_graph_and_stream(
+        graph, Command(resume=resume_value), context=context, config=config, thread_id=thread_id
+    ):
+        yield chunk
 
 
 @asynccontextmanager
@@ -655,6 +917,13 @@ async def ask(
     # client-supplied `thread_id` already passed `AskRequest`'s UUID4
     # validator above.
     thread_id = req.thread_id or str(uuid.uuid4())
+    if req.thread_id:
+        # ADR-0025 round 2 (BLOCKER 2): only a CLIENT-SUPPLIED thread_id can
+        # possibly be paused already — a freshly-minted uuid4 has no prior
+        # state, skip the round-trip for that (the common) case. Validated
+        # BEFORE the streaming response starts, same reasoning `/resume`'s
+        # `_require_paused_thread` call already documents.
+        await _reject_if_paused(build_graph(checkpointer=checkpointer), thread_id)
     generator = _stream_answer(
         req.question,
         session=session,
@@ -676,5 +945,62 @@ async def ask(
         # project's deploy target, docs/ARCHITECTURE.md §6), future-proofs
         # an Nginx swap. Same two headers `sse-starlette` sets by default
         # (ADR-0016), reused here without the dependency.
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/resume")
+async def resume(
+    req: ResumeRequest,
+    _auth: None = Depends(require_api_key),
+    session: Session = Depends(get_session),
+    embeddings: Embeddings = Depends(get_embeddings_dependency),
+    llm: Any = Depends(get_llm_dependency),
+    classifier: Any | None = Depends(get_classifier_dependency),
+    router: Any | None = Depends(get_router_dependency),
+    critic: Any | None = Depends(get_critic_dependency),
+    tools: dict[str, Any] | None = Depends(get_tools_dependency),
+    checkpointer: Any | None = Depends(get_checkpointer_dependency),
+) -> StreamingResponse:
+    """ADR-0025: resumes a run `hitl_node` paused on a low-confidence critic
+    score (the `interrupt` SSE event `/ask` emitted, carrying `thread_id`).
+    Same auth (`X-API-Key`) and rate limit (`SlowAPIMiddleware`, ADR-0016)
+    as `/ask` — every dependency here mirrors that route's, since resuming
+    can run the same LLM-backed nodes a fresh run can (`guard_out` is
+    deterministic, but the graph is rebuilt the same way regardless).
+
+    404 unknown `thread_id` / 409 not currently paused / 409 `interrupt_id`
+    mismatch (round 2, BLOCKER 2 — a stale reference to an already-resolved
+    or already-superseded pause), all raised by `_require_paused_thread`
+    before anything else runs.
+
+    **Known gap (ADR-0016, still open — not solved here):** this API has
+    one shared `X-API-Key` across every caller, so any key holder who
+    knows/guesses a valid `thread_id`+`interrupt_id` pair can resume it —
+    there is no binding between the key that started a run and the key
+    allowed to resolve its pause. Accepted, not fixed, per ADR-0016/
+    ADR-0024's own precedent for the same class of gap."""
+    # Validated HERE, before the streaming response starts (not inside the
+    # generator, see `_stream_resume`'s docstring) — a 404/409 has to be a
+    # real HTTP status, not something raised after a 200 already went out.
+    await _require_paused_thread(
+        build_graph(checkpointer=checkpointer), req.thread_id, req.interrupt_id
+    )
+    generator = _stream_resume(
+        req.decision,
+        req.edited_answer,
+        session=session,
+        embeddings=embeddings,
+        llm=llm,
+        classifier=classifier,
+        router=router,
+        critic=critic,
+        tools=tools,
+        checkpointer=checkpointer,
+        thread_id=req.thread_id,
+    )
+    return StreamingResponse(
+        generator,
+        media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )

@@ -18,6 +18,7 @@ from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import SystemMessage
 from langchain_openai import ChatOpenAI
 from langgraph.runtime import Runtime
+from langgraph.types import Command, interrupt
 from mcp.shared.exceptions import McpError
 
 from compliance_copilot.critic import critique
@@ -649,7 +650,15 @@ def critic_node(state: GraphState, runtime: Runtime[GraphContext]) -> dict:
     `runtime.context.critic is None` (critic disabled, `settings.
     critic_enabled=False`) is a no-op — returns `{}`, leaving
     `state["critic"]` absent. `critique()` (critic.py) never raises past
-    this node — an outage still yields a verdict, a pessimistic one."""
+    this node — an outage still yields a verdict, a pessimistic one, now
+    flagged `error=True` (ADR-0025 round 2, BLOCKER 1) so `hitl_node`
+    doesn't treat a critic-tier OUTAGE the same as a genuine
+    low-faithfulness verdict. Logged HERE (a named `critic_unavailable`
+    guardrail event, not just `critique()`'s own "exception class name
+    only" warning) rather than in `hitl_node`: this node runs exactly once
+    per turn, before any pause, so the event fires once — `hitl_node`
+    re-executes from the top on every resume (idempotency, see its own
+    docstring) and would log it again on every resume if logged there."""
     critic_llm = runtime.context.critic
     if critic_llm is None:
         return {}
@@ -661,7 +670,82 @@ def critic_node(state: GraphState, runtime: Runtime[GraphContext]) -> dict:
         if (cit.regulation, cit.anchor) in by_key
     ]
     verdict = critique(state["question"], answer.answer, contexts, critic_llm)
+    if verdict.error:
+        logger.warning("critic_unavailable reasoning=%s", verdict.reasoning)
     return {"critic": verdict}
+
+
+def hitl_node(state: GraphState) -> dict | Command:
+    """Node between `critic` and `guard_out` (ADR-0025): pauses the run for a
+    human decision when the critic ACTUALLY RAN, did NOT error, and scored
+    below `settings.critic_confidence_min` — otherwise a pure pass-through
+    (`return {}`, same "disabled/not-applicable means no-op" contract
+    `router_node`/`critic_node` already use).
+
+    `critic.error` (ADR-0025 round 2, BLOCKER 1): a critic-tier OUTAGE
+    (`critique()`'s exception path, critic.py) is NOT treated as a genuine
+    low-faithfulness verdict — pausing EVERY request the moment the nano/
+    Haiku tier has a bad day would turn a guard-tier outage into a full
+    product outage, the same availability argument ADR-0019 already made
+    for the classifier's own fail-open. The tradeoff, made explicit: LLM-
+    judge coverage is lost for the duration of the outage (no pause, no
+    extra check beyond `guard_out`'s own deterministic ones) — visible via
+    the `critic_unavailable` guardrail event (`critic_node`, logged once
+    per turn) and Langfuse's `critic_unavailable` score (api.py), not
+    hidden. `guard_out` still runs its independent checks regardless.
+
+    IDEMPOTENCY: takes no `runtime` and makes no LLM call or other side
+    effect before `interrupt()` — LangGraph re-executes a node from the top
+    on resume (verified against the installed `langgraph/types.py`
+    docstring), so anything expensive here would silently re-run on every
+    resume. The confidence/error check above is a cheap comparison over
+    already-checkpointed state, safe to repeat.
+
+    `interrupt(...)` halts the run and checkpoints `payload` (the draft
+    answer, the critic's score/reasoning, and the already-`guard_in`-
+    redacted question — nothing else). This full payload is STATE, read by
+    an operator via `graph.aget_state()` (the CLI `resume` command prints
+    it before applying a decision) — NOT the same thing `/ask`'s `interrupt`
+    SSE event sends the end user, which is deliberately reduced to
+    `{thread_id, interrupt_id, status}` only (ADR-0025 round 2, SHOULD 1:
+    the end user sees "under review", never the draft/confidence/
+    reasoning). On resume, `interrupt()` returns the decision dict
+    `POST /resume` (api.py) or the `resume` CLI command sent as
+    `Command(resume=...)`: `{"decision": "approve"|"edit"|"reject",
+    "edited_answer": str | None}`.
+
+    Every branch returns `Command(goto="guard_out")` — the pause never
+    skips the final gate (ADR-0021's invariant): `approve` leaves `answer`
+    untouched; `edit` swaps in the operator's text but KEEPS the draft's own
+    citations (never trusts operator-supplied citations, and still runs
+    that text through `guard_out`'s placeholder/scaffold/canary/scope
+    checks — a human can introduce the same categories of problem a model
+    can); `reject` writes the SAME fixed refusal shape `refuse_node`
+    produces, `refused=True` (so `guard_out_node` doesn't append this turn
+    to history)."""
+    critic = state.get("critic")
+    if critic is None or critic.error or critic.confidence >= settings.critic_confidence_min:
+        return {}
+    answer = state["answer"]
+    decision = interrupt(
+        {
+            "answer": answer.model_dump(),
+            "confidence": critic.confidence,
+            "reasoning": critic.reasoning,
+            "question": state["question"],
+        }
+    )
+    action = decision["decision"]
+    if action == "approve":
+        return Command(goto="guard_out")
+    if action == "edit":
+        edited = AnswerSchema(answer=decision["edited_answer"], citations=answer.citations)
+        return Command(update={"answer": edited}, goto="guard_out")
+    # "reject"
+    return Command(
+        update={"answer": AnswerSchema(answer=REFUSAL_TEXT, citations=[]), "refused": True},
+        goto="guard_out",
+    )
 
 
 # ADR-0024: how many prior turns `answer_node` replays into the prompt.

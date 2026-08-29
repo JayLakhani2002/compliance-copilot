@@ -25,10 +25,12 @@ import asyncio
 
 import pytest
 from fake_mcp_tools import tools_from_articles
+from langgraph.types import Command
 
 from compliance_copilot.checkpointer import build_checkpointer
+from compliance_copilot.critic import CriticVerdict
 from compliance_copilot.graph.build import build_graph
-from compliance_copilot.graph.state import AnswerSchema, GraphContext
+from compliance_copilot.graph.state import AnswerSchema, Citation, GraphContext
 from compliance_copilot.retriever import RetrievedChunk
 from compliance_copilot.settings import settings
 
@@ -126,3 +128,84 @@ def test_two_turn_conversation_survives_a_fresh_checkpointer_then_erases(
     # a reload finds nothing at all — not just an empty `history` key.
     remaining_state = asyncio.run(_delete_and_reload(thread_id))
     assert remaining_state == {}
+
+
+# --- ADR-0025: human-in-the-loop interrupt/resume, real Postgres ---------
+class FakeCriticLLM:
+    """Stands in for `runtime.context.critic` — forces a confidence below
+    `settings.critic_confidence_min` so `hitl_node` actually pauses."""
+
+    def __init__(self, verdict: CriticVerdict):
+        self._verdict = verdict
+
+    def invoke(self, messages):
+        return self._verdict
+
+
+async def _pause_then_resume_via_fresh_checkpointer(thread_id: str, draft: AnswerSchema) -> dict:
+    """Pauses a run (one `build_checkpointer()` open, mirroring one API/CLI
+    process), then resumes it through a BRAND NEW `build_checkpointer()` —
+    a fresh `AsyncConnectionPool` + `AsyncPostgresSaver`, not the one that
+    paused it — proving the pause survives a "process restart", the same
+    durability claim `_reload_history` above proves for plain multi-turn
+    state. `graph.aget_state` is checked first, the same pre-flight
+    `api.py`'s `_require_paused_thread` runs, before resuming."""
+    tools = tools_from_articles(ARTICLES)
+    config = {"configurable": {"thread_id": thread_id}}
+
+    async with build_checkpointer() as checkpointer:
+        graph = build_graph(checkpointer=checkpointer)
+        context = GraphContext(
+            session=None,
+            embeddings=None,
+            llm=FakeLLM(draft),
+            critic=FakeCriticLLM(CriticVerdict(faithful=False, confidence=0.1, reasoning="low")),
+            tools=tools,
+        )
+        state = await graph.ainvoke(
+            {"question": "What is a high-risk AI system?"}, context=context, config=config
+        )
+        assert "__interrupt__" in state  # sanity: this test's own setup actually paused
+
+    # A GENUINELY different saver instance — `build_graph`'s `lru_cache`
+    # keys on it by identity, so this is a real cache miss, not a reused
+    # compiled graph (same reasoning `_reload_history` above documents).
+    async with build_checkpointer() as checkpointer:
+        graph = build_graph(checkpointer=checkpointer)
+        snapshot = await graph.aget_state(config)
+        assert snapshot.next and snapshot.interrupts  # still paused after the "restart"
+
+        context = GraphContext(session=None, embeddings=None, llm=FakeLLM(draft), tools=tools)
+        return await graph.ainvoke(
+            Command(resume={"decision": "approve", "edited_answer": None}),
+            context=context,
+            config=config,
+        )
+
+
+async def _delete_thread(thread_id: str) -> None:
+    async with build_checkpointer() as checkpointer:
+        await checkpointer.adelete_thread(thread_id)
+
+
+def test_paused_run_survives_a_fresh_checkpointer_then_resumes(test_database_url, monkeypatch):
+    monkeypatch.setattr(settings, "database_url", test_database_url)
+    thread_id = "77777777-7777-4777-8777-777777777777"
+    draft = AnswerSchema(
+        answer="A high-risk AI system is one used as a safety component.",
+        citations=[Citation(regulation="ai_act", anchor="art_6", quote="is a safety component")],
+    )
+    # This test's own DB survives across pytest runs (it's the same
+    # disposable `_test` database `test_database_url` returns, not
+    # recreated per run) — clean up any prior run's leftover state for this
+    # thread_id first, or a stale extra history turn from a PREVIOUS run of
+    # this exact test would make `history`'s length assertion below flaky.
+    asyncio.run(_delete_thread(thread_id))
+
+    final_state = asyncio.run(_pause_then_resume_via_fresh_checkpointer(thread_id, draft))
+
+    assert final_state["answer"].answer == draft.answer
+    assert final_state.get("refused") is not True
+    assert final_state["output_guard"].ok is True
+    assert [t.question for t in final_state["history"]] == ["What is a high-risk AI system?"]
+    assert final_state["history"][0].answer == draft.answer
