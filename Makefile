@@ -1,7 +1,7 @@
 # Makefile — shortcuts for the commands you'll run most while developing.
 # Run `make <target>` from the repo root.
 
-.PHONY: setup lint test db-up db-init api mcp eval-cache quality-gate redteam redteam-fast
+.PHONY: setup lint test db-up db-init api mcp eval-cache quality-gate redteam redteam-fast calibration calibration-build
 
 setup:  ## Install deps (incl. dev tools) and enable the pre-commit git hook.
 	uv sync
@@ -37,3 +37,9 @@ redteam:  ## Full red-team ASR/FPR gate (needs OPENAI_API_KEY, real DB, costs ce
 
 redteam-fast:  ## No-key heuristics-subset red-team check (zero cost, zero network — ADR-0022).
 	uv run python -m evals.run_redteam --subset heuristics --asr-max 0.05
+
+calibration-build:  ## Rebuild evals/calibration/*.jsonl from the real pipeline (needs OPENAI_API_KEY, DB, costs cents — ADR-0027).
+	uv run python -m evals.build_calibration_set
+
+calibration:  ## Judge-vs-human agreement report — reads existing evals/calibration/*.jsonl, zero cost (ADR-0027).
+	uv run python -m evals.run_judge_calibration
