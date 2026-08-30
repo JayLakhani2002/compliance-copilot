@@ -196,6 +196,17 @@ async def _run_ask(question: str, thread_id: str | None = None) -> None:
         pii_entities = state.get("pii_entities") or ()
         if pii_entities:
             print(f"note: PII redacted ({', '.join(pii_entities)})", file=sys.stderr)
+        # ADR-0028: `answer_node`'s answer-model-outage fallback — the
+        # printed `result.answer` text below already says "Service
+        # degraded" plainly, but a stderr note (same channel the PII/thread
+        # lines above use) makes it visible even if a caller only greps
+        # stdout for the answer body and skips reading it closely.
+        if state.get("degraded"):
+            print(
+                "note: service degraded — answer model unavailable, showing "
+                "retrieved articles only",
+                file=sys.stderr,
+            )
         # REFUSAL_TEXT is a fixed, module-level string (graph/nodes.py) —
         # comparing against it is how the CLI tells "the input guard
         # refused this" apart from "the model answered normally with no

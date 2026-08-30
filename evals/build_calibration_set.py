@@ -46,6 +46,7 @@ from compliance_copilot.graph.build import build_graph
 from compliance_copilot.graph.nodes import make_llm
 from compliance_copilot.graph.state import AnswerSchema, CitationError, GraphContext
 from compliance_copilot.guards.classifier import make_classifier_llm
+from compliance_copilot.settings import settings
 from evals.judge import JudgeVerdict, judge
 from evals.run_answer_eval import _JUDGE_MODEL, GoldenAnswer, _contexts_for, load_golden_answers
 from evals.run_redteam import Attack, BenignQuestion, load_attacks, load_benign
@@ -88,7 +89,12 @@ async def _build_golden_items(
     since items.jsonl needs the text a human reads, not just a pass/fail."""
     embeddings = get_embeddings()
     answer_llm = make_llm()
-    judge_llm = ChatOpenAI(model=_JUDGE_MODEL, temperature=0)
+    # ADR-0028: explicit timeout so an unbounded call can't hang a CI job —
+    # same reasoning as every other LLM client in this app, see
+    # settings.judge_timeout_s's comment.
+    judge_llm = ChatOpenAI(
+        model=_JUDGE_MODEL, temperature=0, timeout=settings.judge_timeout_s, max_retries=1
+    )
     tools = await make_mcp_tools()
 
     items: list[CalibrationItem] = []
@@ -141,7 +147,12 @@ async def _build_pipeline_items(
     embeddings = get_embeddings()
     answer_llm = make_llm()
     classifier_llm = make_classifier_llm()
-    judge_llm = ChatOpenAI(model=_JUDGE_MODEL, temperature=0)
+    # ADR-0028: explicit timeout so an unbounded call can't hang a CI job —
+    # same reasoning as every other LLM client in this app, see
+    # settings.judge_timeout_s's comment.
+    judge_llm = ChatOpenAI(
+        model=_JUDGE_MODEL, temperature=0, timeout=settings.judge_timeout_s, max_retries=1
+    )
     tools = await make_mcp_tools()
 
     requests: list[tuple[str, str, str]] = [

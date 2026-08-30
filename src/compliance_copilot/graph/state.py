@@ -205,6 +205,14 @@ class GraphState(TypedDict):
     (there's no substantive claim to critique) and when the critic is
     disabled (`GraphContext.critic=None`).
 
+    `degraded` (ADR-0028): set `True` only by `answer_node`'s answer-model-
+    outage fallback (after `make_llm()`'s own bounded SDK retry already gave
+    up) — the same per-turn-reset/narrow-check-set treatment `refused`
+    already gets: `critic_node`/`hitl_node` no-op on it (nothing was
+    drafted to critique or pause a review on), `guard_out_node` exempts it
+    from the citation-shaped checks a fallback structurally cannot pass,
+    and a degraded turn is never appended to `history`.
+
     `history` (ADR-0024): a plain (not `Annotated`/reducer) key — `guard_out_
     node` is the ONLY node that ever writes it, once per run, so "last write
     wins" (LangGraph's default merge for a key with no reducer) is already
@@ -234,6 +242,7 @@ class GraphState(TypedDict):
     articles: NotRequired[list[RetrievedChunk]]
     recitals: NotRequired[list[RetrievedChunk]]
     answer: NotRequired[AnswerSchema | None]
+    degraded: NotRequired[bool]
     draft: NotRequired[AnswerSchema | None]
     citation_error: NotRequired[str | None]
     attempts: NotRequired[int]

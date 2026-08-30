@@ -35,6 +35,21 @@ curl -sN -X POST localhost:8000/ask -H "Content-Type: application/json" \
 
 Set `LANGFUSE_PUBLIC_KEY`/`LANGFUSE_SECRET_KEY`/`LANGFUSE_BASE_URL` to enable tracing (Langfuse Cloud, EU) — unset by default, so the app runs with zero tracing until you do.
 
+### Health and readiness (ADR-0028)
+
+```bash
+curl localhost:8000/healthz  # liveness: process alive, no DB/LLM work — "should this container restart?"
+curl localhost:8000/readyz   # readiness: SELECT 1 against Postgres — "should traffic route here?" (200 or 503)
+```
+
+Both are unauthenticated and unrate-limited (orchestrator probes, not
+product traffic). `/ask` itself degrades gracefully on an answer-model
+outage (a `degraded: true` final event with the retrieved articles listed,
+zero citations) rather than a bare error, and ends the stream with a typed
+`{"type": "timeout"}` event if the whole request runs past
+`REQUEST_TIMEOUT_S` (default 60s) or `{"type": "dependency_unavailable"}` if
+Postgres is unreachable mid-request.
+
 ### Conversations (`thread_id`, ADR-0024)
 
 Omit `thread_id` on the first call — the response's very first SSE event is

@@ -30,6 +30,7 @@ from compliance_copilot.graph import CitationError, make_mcp_tools
 from compliance_copilot.graph import ask as ask_graph
 from compliance_copilot.graph.nodes import make_llm
 from compliance_copilot.graph.state import AnswerSchema
+from compliance_copilot.settings import settings
 from evals.judge import JudgeVerdict, judge
 
 GOLDEN_ANSWERS_PATH = Path(__file__).parent / "golden_answers.jsonl"
@@ -169,7 +170,12 @@ async def _run_goldens(goldens: list[GoldenAnswer]) -> list[QuestionOutcome]:
     sessions, tool list built once" design (ADR-0007's Day-17 amendment)."""
     embeddings = get_embeddings()
     answer_llm = make_llm()
-    judge_llm = ChatOpenAI(model=_JUDGE_MODEL, temperature=0)
+    # ADR-0028: explicit timeout so an unbounded call can't hang a CI job —
+    # same reasoning as every other LLM client in this app, see
+    # settings.judge_timeout_s's comment.
+    judge_llm = ChatOpenAI(
+        model=_JUDGE_MODEL, temperature=0, timeout=settings.judge_timeout_s, max_retries=1
+    )
     tools = await make_mcp_tools()
 
     outcomes: list[QuestionOutcome] = []

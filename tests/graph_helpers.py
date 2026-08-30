@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import asyncio
 
+import httpx
+import openai
 from fake_mcp_tools import tools_from_articles
 from langgraph.types import Command
 
@@ -111,6 +113,32 @@ class RaisingLLM:
 
     def invoke(self, messages):
         raise ConnectionError("simulated outage")
+
+
+def _fake_timeout_error() -> openai.APITimeoutError:
+    """A real `openai.APITimeoutError` instance (needs an `httpx.Request` —
+    verified live via `inspect.signature`) — used as `DegradingLLM`'s default
+    so tests exercise the actual exception class `answer_node` catches
+    (`_ANSWER_OUTAGE_EXCEPTIONS`, ADR-0028), not a stand-in type."""
+    return openai.APITimeoutError(request=httpx.Request("POST", "https://api.openai.com/v1/x"))
+
+
+class DegradingLLM:
+    """Stands in for `runtime.context.llm` on the answer-model-outage path
+    (ADR-0028) — raises an exception `answer_node` treats as "the model
+    never answered at all, even after the SDK's own bounded retry" on every
+    `.invoke()` call. Defaults to `openai.APITimeoutError` (the shape a real
+    outage takes AFTER `make_llm()`'s `max_retries` is exhausted); pass a
+    different member of `_ANSWER_OUTAGE_EXCEPTIONS` to exercise another
+    branch of that tuple."""
+
+    def __init__(self, exc: BaseException | None = None):
+        self._exc = exc if exc is not None else _fake_timeout_error()
+        self.calls = 0
+
+    def invoke(self, messages):
+        self.calls += 1
+        raise self._exc
 
 
 class CountingLLM:

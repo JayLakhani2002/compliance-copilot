@@ -8,14 +8,19 @@
 # with no external services.
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 import uuid
 
+import httpx
+import openai
 import pytest
 from fake_mcp_tools import tools_from_articles
 from fastapi.testclient import TestClient
+from graph_helpers import FakeCriticLLM
 from langgraph.checkpoint.memory import InMemorySaver
+from sqlalchemy.exc import OperationalError
 
 from compliance_copilot.api import (
     app,
@@ -28,9 +33,11 @@ from compliance_copilot.api import (
     get_tools_dependency,
     limiter,
 )
+from compliance_copilot.critic import CriticVerdict
 from compliance_copilot.db import get_session
 from compliance_copilot.graph.state import AnswerSchema, Citation
 from compliance_copilot.retriever import RetrievedChunk
+from compliance_copilot.router import RouterVerdict
 from compliance_copilot.settings import settings
 
 API_KEY = "test-secret-key-not-a-real-secret"
@@ -1308,4 +1315,256 @@ def test_resume_rate_limited_like_ask(client, monkeypatch):
     # proves `SlowAPIMiddleware` (not the thread-state check) is what fires
     # once the 2/minute budget is spent.
     assert codes[0] == 200
+    assert codes[1] == 409
     assert codes[2] == 429
+
+
+# --- ADR-0028: resilience — timeouts, degraded fallback, /readyz --------
+class OutageLLM:
+    """Stands in for `runtime.context.llm` on the answer-model-outage path —
+    same shape as `graph_helpers.DegradingLLM`, duplicated here rather than
+    imported (this file has no other reason to depend on that module, same
+    precedent `FakeLLM`/`StatefulLLM` above already set)."""
+
+    def invoke(self, messages):
+        raise openai.APITimeoutError(request=httpx.Request("POST", "https://api.openai.com/v1/x"))
+
+
+def test_answer_llm_outage_emits_degraded_final_event_no_critic_or_hitl(client, monkeypatch):
+    """A 200-shaped stream, not an unhandled exception reaching the generic
+    `internal_error` branch: `guard_out` still runs (`ok=True` — the
+    degraded fallback is exempt from the citation-shaped checks it
+    structurally can't pass), no `critic`/`hitl` node event fires (nothing
+    was drafted to critique), and `final` carries `degraded: true`."""
+    # Critic enabled here specifically to prove it's SKIPPED, not merely
+    # absent-by-default the way every other test in this file leaves it.
+    critic = FakeCriticLLM(CriticVerdict(faithful=True, confidence=0.9, reasoning="unused"))
+    app.dependency_overrides[get_critic_dependency] = lambda: critic
+    _use_llm(OutageLLM())
+
+    with client.stream(
+        "POST",
+        "/ask",
+        json={"question": "What is a high-risk AI system?"},
+        headers=_auth_headers(),
+    ) as resp:
+        assert resp.status_code == 200
+        body = "".join(resp.iter_text())
+
+    events = _parse_sse(body)
+    node_events = [e for e in events if e[0] == "node"]
+    assert "critic" not in [e[1].get("node") for e in node_events]
+    guard_out_events = [e for e in node_events if e[1]["node"] == "guard_out"]
+    assert len(guard_out_events) == 1
+    assert guard_out_events[0][1]["ok"] is True
+
+    final = events[-1]
+    assert final[0] == "final"
+    assert final[1]["degraded"] is True
+    assert final[1]["refused"] is False
+    assert final[1]["citations"] == []
+    assert "art_6" in final[1]["answer"]
+    assert critic.messages is None  # never invoked
+
+
+def test_request_deadline_emits_timeout_event_and_ends_stream(client, monkeypatch):
+    """`settings.request_timeout_s` bounds the WHOLE request, not any one
+    LLM call — a node that's slower than the deadline must end the stream
+    with a typed `timeout` error event, not hang past it. Bounded so the
+    test itself can't hang: the fake node sleeps for longer than the
+    deadline, but both numbers are small (well under a second)."""
+    monkeypatch.setattr(settings, "request_timeout_s", 0.05)
+
+    class SlowLLM:
+        def invoke(self, messages):
+            time.sleep(0.3)
+            return AnswerSchema(answer="...", citations=[])
+
+    _use_llm(SlowLLM())
+
+    with client.stream(
+        "POST",
+        "/ask",
+        json={"question": "What is a high-risk AI system?"},
+        headers=_auth_headers(),
+    ) as resp:
+        body = "".join(resp.iter_text())
+
+    events = _parse_sse(body)
+    assert "final" not in [e[0] for e in events]
+    assert events[-1] == ("error", {"type": "timeout"})
+
+
+def test_slow_consumer_between_chunks_does_not_trigger_timeout(monkeypatch):
+    """ADR-0028 round 2 (reviewer BLOCKER 1): a slow CONSUMER — time spent
+    between pulls on the generator by whoever drives it (a slow-reading SSE
+    client, socket backpressure) — must never count against the request
+    deadline; only slow GRAPH work may. `TestClient.stream(...).iter_text()`
+    reads the whole body eagerly with no artificial gap between pulls, so
+    it can't exercise this — drive `_run_graph_and_stream` directly instead,
+    sleeping (for longer than the deadline) between each `__anext__()` call.
+    A pre-fix implementation (`asyncio.timeout` wrapping the `yield` too)
+    would have this same single task cancelled while parked in THIS sleep,
+    never reaching `_run_graph_and_stream`'s own `except TimeoutError:` —
+    this test fails loudly (a raised `CancelledError`/`TimeoutError`
+    escaping `asyncio.run`) against that shape instead of silently passing."""
+    from compliance_copilot.api import _run_graph_and_stream
+    from compliance_copilot.graph import GraphContext
+    from compliance_copilot.graph.build import build_graph
+
+    monkeypatch.setattr(settings, "request_timeout_s", 0.05)
+
+    async def _drive() -> list[tuple[str, dict]]:
+        answer = AnswerSchema(
+            answer="A high-risk AI system is one used as a safety component.",
+            citations=[
+                Citation(regulation="ai_act", anchor="art_6", quote="is a safety component")
+            ],
+        )
+        graph = build_graph()
+        context = GraphContext(
+            session=None, embeddings=None, llm=FakeLLM(answer), tools=tools_from_articles(ARTICLES)
+        )
+        config = {"configurable": {"thread_id": "manual-drive-0000000000001"}}
+        agen = _run_graph_and_stream(
+            graph,
+            {"question": "What is a high-risk AI system?"},
+            context=context,
+            config=config,
+            thread_id="manual-drive-0000000000001",
+        )
+        events: list[tuple[str, dict]] = []
+        async for chunk in agen:
+            events.append(_parse_sse(chunk)[0])
+            # The slow consumer: this sleep happens BETWEEN pulls, entirely
+            # outside `_run_graph_and_stream`'s own `asyncio.timeout(...)`
+            # scope (which only ever wraps a single `anext()` call) — longer
+            # than the 0.05s deadline, on every one of the ~5 chunks.
+            await asyncio.sleep(0.1)
+        return events
+
+    events = asyncio.run(_drive())
+
+    assert [e[0] for e in events] == ["node", "node", "node", "node", "final"]
+    assert "error" not in [e[0] for e in events]
+
+
+def test_request_deadline_is_cumulative_across_many_fast_then_slow_chunks(monkeypatch):
+    """The request budget is a `used`-time ACCUMULATOR: it grows only by the
+    measured duration of each `anext()` (graph work), never by gaps where
+    the consumer is slow — so many fast chunks followed by one slow one
+    must still trip the timeout, because their durations add up.
+    """
+
+    class SlowRouterLLM:
+        def invoke(self, messages):
+            time.sleep(0.1)
+            return RouterVerdict(regulation="both", reason="slow")
+
+    class SlowAnswerLLM:
+        def invoke(self, messages):
+            time.sleep(0.1)
+            return AnswerSchema(answer="...", citations=[])
+
+    class SlowCriticLLM:
+        def invoke(self, messages):
+            time.sleep(0.1)
+            return CriticVerdict(faithful=True, confidence=0.9, reasoning="slow")
+
+    monkeypatch.setattr(settings, "request_timeout_s", 0.2)
+    app.dependency_overrides[get_router_dependency] = lambda: SlowRouterLLM()
+    app.dependency_overrides[get_critic_dependency] = lambda: SlowCriticLLM()
+    _use_llm(SlowAnswerLLM())
+
+    with TestClient(app).stream(
+        "POST",
+        "/ask",
+        json={"question": "What is a high-risk AI system?"},
+        headers=_auth_headers(),
+    ) as resp:
+        body = "".join(resp.iter_text())
+
+    events = _parse_sse(body)
+    assert "final" not in [e[0] for e in events]
+    assert events[-1] == ("error", {"type": "timeout"})
+
+
+def test_operational_error_emits_dependency_unavailable_event(client):
+    """`sqlalchemy.exc.OperationalError` (a DB-unreachable signal) gets its
+    own SSE event type — distinct from the generic `internal_error` any
+    other unexpected exception still gets — so a client/operator can tell
+    "the database is down" apart from "there's a bug" without a traceback."""
+
+    class DBDownLLM:
+        def invoke(self, messages):
+            raise OperationalError("SELECT 1", {}, Exception("connection refused"))
+
+    _use_llm(DBDownLLM())
+
+    with client.stream(
+        "POST",
+        "/ask",
+        json={"question": "What is a high-risk AI system?"},
+        headers=_auth_headers(),
+    ) as resp:
+        body = "".join(resp.iter_text())
+
+    events = _parse_sse(body)
+    assert "final" not in [e[0] for e in events]
+    assert events[-1] == ("error", {"type": "dependency_unavailable"})
+
+
+def _raising_session():
+    """A fake DB session dependency whose `.execute()` always raises
+    `OperationalError` — `/readyz`'s override for a DB-unreachable test."""
+
+    class _Session:
+        def execute(self, *a, **kw):
+            raise OperationalError("SELECT 1", {}, Exception("connection refused"))
+
+    yield _Session()
+
+
+def test_readyz_returns_503_when_db_unreachable(client):
+    from compliance_copilot.db import get_session as real_get_session
+
+    app.dependency_overrides[real_get_session] = _raising_session
+    resp = client.get("/readyz")
+    assert resp.status_code == 503
+    assert resp.json() == {"status": "unavailable"}
+
+
+def test_healthz_still_200_with_the_same_db_override_in_place(client):
+    """Pairs with the test above: `/healthz` must not depend on the DB at
+    all — the exact same broken `get_session` override that 503s `/readyz`
+    must leave `/healthz` at 200, proving liveness genuinely doesn't share
+    fate with readiness."""
+    from compliance_copilot.db import get_session as real_get_session
+
+    app.dependency_overrides[real_get_session] = _raising_session
+    resp = client.get("/healthz")
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ok"}
+
+
+def _working_session():
+    """A fake DB session whose `.execute()` succeeds — `/readyz`'s override
+    for the "DB reachable" case (the `_fakes` fixture's default override
+    yields `None`, which has no `.execute()` method at all — fine for every
+    OTHER route here, since nothing else in this test suite calls session
+    methods, but `/readyz` genuinely does)."""
+
+    class _Session:
+        def execute(self, *a, **kw):
+            return None
+
+    yield _Session()
+
+
+def test_readyz_returns_200_when_db_reachable(client):
+    from compliance_copilot.db import get_session as real_get_session
+
+    app.dependency_overrides[real_get_session] = _working_session
+    resp = client.get("/readyz")
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ok"}

@@ -38,4 +38,15 @@ def get_embeddings() -> Embeddings:
         from compliance_copilot.cached_embeddings import CachedEmbeddings
 
         return CachedEmbeddings()
-    return OpenAIEmbeddings(model=settings.embedding_model)
+    # ADR-0028: explicit timeout + bounded retry — mirrors `make_llm()`'s
+    # reasoning (graph/nodes.py): an un-timeout'd client can hang
+    # indefinitely on a stalled connection, blocking `retrieve_node`'s
+    # search the same way a hung answer call blocks `answer_node`.
+    # `max_retries=2`: an embedding call is idempotent (same text in, same
+    # vector out) and has no fallback path today, so it's worth a couple
+    # more bounded attempts before giving up (see settings.py's comment).
+    return OpenAIEmbeddings(
+        model=settings.embedding_model,
+        timeout=settings.embedding_timeout_s,
+        max_retries=settings.embedding_max_retries,
+    )

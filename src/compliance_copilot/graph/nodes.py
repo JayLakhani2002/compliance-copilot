@@ -14,6 +14,8 @@ import time
 import uuid
 from typing import Any
 
+import anthropic
+import openai
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import SystemMessage
 from langchain_openai import ChatOpenAI
@@ -80,6 +82,13 @@ REFUSAL_TEXT = (
 _PER_TURN_RESET: dict[str, Any] = {
     "answer": None,
     "refused": False,
+    # ADR-0028: same reasoning as `refused` above — `degraded` is set only
+    # by `answer_node`'s outage branch below. Without this reset, a turn
+    # that degraded would leave `degraded=True` sitting in state for the
+    # NEXT turn's `guard_out_node`/`critic_node` to read before either of
+    # them has run for that turn, wrongly exempting a real answer from
+    # `check_output`'s citation checks or skipping a real critic call.
+    "degraded": False,
     "draft": None,
     "citation_error": None,
     "attempts": 0,
@@ -600,7 +609,19 @@ def answer_node(state: GraphState, runtime: Runtime[GraphContext]) -> dict:
     instead of raising — `route_after_answer` (build.py) sends the graph
     back to this node once with that context appended as extra turns,
     giving the model one chance to self-correct (ADR-0015) before
-    `fail_node` raises the same hard `CitationError` ADR-0014 always did."""
+    `fail_node` raises the same hard `CitationError` ADR-0014 always did.
+
+    ADR-0028: `_ANSWER_OUTAGE_EXCEPTIONS` on `.invoke()` (AFTER `make_llm()`'s
+    own bounded SDK retry already gave up, `settings.answer_max_retries`) is
+    a DIFFERENT failure than a citation error — the model never answered at
+    all, so there is nothing for `_validate_citations` to check. Returns a
+    degraded `AnswerSchema` (`_degraded_answer`) instead of raising: never a
+    bare 500, never a fake confident answer stitched from nothing (lesson
+    23). `degraded=True` routes through the SAME `route_after_answer` edge
+    a real answer does (`state["answer"]` is set) — `critic_node`/
+    `hitl_node` both skip on it (nothing was drafted to critique), and
+    `guard_out_node` exempts it from the citation-shaped checks a fallback
+    answer structurally cannot pass, the same way it exempts `refused`."""
     messages = _build_messages(state)
     if state.get("citation_error"):
         # Retry turn: echo the failed draft as an "ai" turn, then our
@@ -619,8 +640,17 @@ def answer_node(state: GraphState, runtime: Runtime[GraphContext]) -> dict:
             )
         )
 
-    result: AnswerSchema = runtime.context.llm.invoke(messages)
     attempts = state.get("attempts", 0) + 1
+    try:
+        result: AnswerSchema = runtime.context.llm.invoke(messages)
+    except _ANSWER_OUTAGE_EXCEPTIONS as exc:
+        logger.warning("answer llm outage after sdk retries, degrading: %s", type(exc).__name__)
+        return {
+            "answer": _degraded_answer(state["articles"]),
+            "degraded": True,
+            "citation_error": None,
+            "attempts": attempts,
+        }
 
     try:
         _validate_citations(result, state["articles"], state["recitals"])
@@ -658,7 +688,15 @@ def critic_node(state: GraphState, runtime: Runtime[GraphContext]) -> dict:
     only" warning) rather than in `hitl_node`: this node runs exactly once
     per turn, before any pause, so the event fires once — `hitl_node`
     re-executes from the top on every resume (idempotency, see its own
-    docstring) and would log it again on every resume if logged there."""
+    docstring) and would log it again on every resume if logged there.
+
+    ADR-0028: also a no-op when `answer_node` degraded (`state["degraded"]`)
+    — same "nothing to critique" reasoning the refusal path already has
+    (the fixed fallback text was never drafted from the excerpts, there is
+    no faithfulness claim to check), and it saves the LLM call entirely
+    rather than spending one on text that isn't a real answer."""
+    if state.get("degraded"):
+        return {}
     critic_llm = runtime.context.critic
     if critic_llm is None:
         return {}
@@ -748,6 +786,45 @@ def hitl_node(state: GraphState) -> dict | Command:
     )
 
 
+# ADR-0028: exceptions that mean "the answer model never answered at all"
+# after `make_llm()`'s own bounded SDK retry (`settings.answer_max_retries`)
+# already ran and gave up — a real network/provider outage, not a citation
+# the model got wrong. Both providers' SDKs are covered (`ChatOpenAI`'s
+# raise this from `openai`, `ChatAnthropic`'s from `anthropic` — confirmed
+# via `dir()` on both installed packages: identical class names, disjoint
+# hierarchies), so this stays correct if `settings.llm_provider` ever flips
+# to "anthropic" (ADR-0002's target) without another code change here.
+# `APIStatusError`/generic `APIError` are deliberately NOT included: those
+# cover client-side mistakes (4xx other than 429) that will fail identically
+# on a retry — masking one as "degraded" would hide a real bug behind a
+# user-facing "service degraded" message instead of surfacing it as the
+# `internal_error` `/ask` already gives any other unexpected exception.
+_ANSWER_OUTAGE_EXCEPTIONS = (
+    openai.APITimeoutError,
+    openai.APIConnectionError,
+    openai.RateLimitError,
+    anthropic.APITimeoutError,
+    anthropic.APIConnectionError,
+    anthropic.RateLimitError,
+)
+
+
+def _degraded_answer(articles: list[RetrievedChunk]) -> AnswerSchema:
+    """Builds the fallback `AnswerSchema` for an answer-model outage
+    (lesson 23's "fall back" — a worse-but-honest answer beats both a hang
+    and a fake confident one). Zero citations, by construction: nothing was
+    actually drafted, so `check_output`'s citation-shaped checks structurally
+    cannot apply to this text (`guard_out_node` exempts it the same way it
+    exempts `refused`, see that node's docstring). Lists regulation+anchor
+    only — never chunk text — same "don't inflate the response with content
+    nobody asked to see echoed back" restraint the rest of this module
+    already applies to logs/errors."""
+    listing = ", ".join(f"{a.regulation} {a.anchor}" for a in articles) or "none retrieved"
+    return AnswerSchema(
+        answer=f"Service degraded — showing retrieved articles only: {listing}", citations=[]
+    )
+
+
 # ADR-0024: how many prior turns `answer_node` replays into the prompt.
 # Bounds both token cost and prompt-cache stability (ADR-0002/ADR-0007's
 # stable-prefix note) — unbounded history would grow the prefix every turn,
@@ -797,14 +874,24 @@ def guard_out_node(state: GraphState) -> dict:
     articles = state.get("articles") or []
     retrieved_keys = {(c.regulation, c.anchor) for c in articles} or None
     refused = state.get("refused", False)
-    verdict = check_output(state["answer"], retrieved_keys=retrieved_keys, refused=refused)
+    # ADR-0028: `degraded` (answer_node's outage fallback) is exempted from
+    # `check_output`'s citation-shaped checks the SAME way `refused` is —
+    # see `check_output`'s docstring (guards/output.py) for exactly which
+    # checks that skips and why (canary/scaffold leak checks still run
+    # regardless: a fallback path must never become an unguarded shortcut).
+    degraded = state.get("degraded", False)
+    verdict = check_output(
+        state["answer"], retrieved_keys=retrieved_keys, refused=refused, degraded=degraded
+    )
 
     if verdict.ok:
-        if refused:
-            # A refused turn is not remembered: replaying a flagged (e.g.
-            # injection-attempt) question as "prior context" for the next
-            # three turns would hand it a second, unscreened way into the
-            # prompt. History holds answered questions only.
+        if refused or degraded:
+            # A refused OR degraded turn is not remembered: replaying a
+            # flagged question (or a fallback that never actually answered
+            # anything) as "prior context" for the next three turns would
+            # either hand an injection attempt a second, unscreened way in,
+            # or teach a later turn's prompt that this fallback text was a
+            # real exchange. History holds genuinely answered questions only.
             return {"output_guard": verdict}
         return {
             "output_guard": verdict,
@@ -813,15 +900,17 @@ def guard_out_node(state: GraphState) -> dict:
 
     logger.info("guard_out blocked reason=%s", verdict.reason)
 
-    if verdict.reason == "citation_not_retrieved" or refused:
+    if verdict.reason == "citation_not_retrieved" or refused or degraded:
         # An invariant broke, not a policy violation to quietly refuse:
         # `answer_node` already claims to have validated every citation
         # (ADR-0014) — one appearing here anyway means THAT check is
         # buggy, not this question. A refusal (REFUSAL_TEXT verbatim, zero
-        # citations, by construction) failing ANY check at all means
-        # REFUSAL_TEXT/refuse_node's own invariant is broken. Either way, a
-        # silent second refusal would hide a real bug behind a user-facing
-        # "no" instead of surfacing it — raise, don't swallow.
+        # citations, by construction) or a degraded fallback (fixed-shape
+        # text built only from retrieved regulation/anchor ids, ADR-0028)
+        # failing ANY check at all means THAT construction is broken, not
+        # this question. Either way, a silent second refusal would hide a
+        # real bug behind a user-facing "no" instead of surfacing it —
+        # raise, don't swallow.
         raise OutputGuardError(verdict.reason)
 
     # Policy violation (scaffold/canary/placeholder leak, unsupported
@@ -866,12 +955,32 @@ def make_llm(model: str | None = None) -> Any:
     # Per-provider default so LLM_PROVIDER alone is a complete switch — an
     # explicit ANSWER_MODEL (or `model` arg) still wins.
     model = model or settings.answer_model or _DEFAULT_MODELS[provider]
+    # ADR-0028: explicit timeout + bounded retry — this is the one call
+    # every request actually waits on end-to-end, so an un-timeout'd client
+    # (the pre-ADR-0028 state here) could hang indefinitely on a stalled
+    # connection (verified against installed `langchain_openai`/`openai`:
+    # omitting `timeout` passes `None` through as a literal "no timeout",
+    # not a sentinel that falls back to a default). `max_retries=1` makes
+    # the SDK's retry an explicit choice instead of `openai`'s implicit
+    # `DEFAULT_MAX_RETRIES=2` — see `settings.answer_timeout_s`'s comment.
     if provider == "openai":
         # 2048, not 1024: structured output spends tokens on JSON scaffolding
         # plus every verbatim quote — 1024 was exhausted on real questions
         # (openai.LengthFinishReasonError), even with the "keep quotes short"
         # instruction above as the primary control. Ceiling, not target.
-        llm = ChatOpenAI(model=model, temperature=0, max_tokens=2048)
+        llm = ChatOpenAI(
+            model=model,
+            temperature=0,
+            max_tokens=2048,
+            timeout=settings.answer_timeout_s,
+            max_retries=settings.answer_max_retries,
+        )
     else:
-        llm = ChatAnthropic(model=model, temperature=0, max_tokens=2048)
+        llm = ChatAnthropic(
+            model=model,
+            temperature=0,
+            max_tokens=2048,
+            timeout=settings.answer_timeout_s,
+            max_retries=settings.answer_max_retries,
+        )
     return llm.with_structured_output(AnswerSchema, method="json_schema")

@@ -30,6 +30,7 @@ from graph_helpers import (
     ARTICLES,
     ROUTER_FIXTURE,
     CountingLLM,
+    DegradingLLM,
     FakeCriticLLM,
     FakeLLM,
     FakeRouterLLM,
@@ -611,6 +612,96 @@ def test_citation_not_retrieved_invariant_raises_output_guard_error(monkeypatch)
                 tools=tools_from_articles(ARTICLES),
             )
         )
+
+
+# --- ADR-0028: answer-model outage -> degraded fallback -----------------
+def test_answer_llm_outage_returns_degraded_answer_listing_retrieved_articles():
+    """After `make_llm()`'s own bounded SDK retry gives up (simulated here
+    by `DegradingLLM` raising on every `.invoke()`), `answer_node` must
+    never let that exception bubble up — it returns a degraded answer
+    naming the retrieved articles' regulation+anchor, zero citations."""
+    state = _run(DegradingLLM())
+
+    assert state["degraded"] is True
+    assert state["answer"].citations == []
+    assert "ai_act art_6" in state["answer"].answer
+    assert "ai_act art_9" in state["answer"].answer
+    assert state.get("refused") is not True
+
+
+def test_degraded_answer_passes_guard_out_without_citation_checks():
+    """The degraded fallback has zero citations and is longer than
+    `_SCOPE_LENGTH_THRESHOLD` with none of the "can't answer" marker words
+    (guards/output.py) — exactly the shape `scope_unsupported` would
+    otherwise wrongly block. `guard_out` must exempt it, the same way it
+    exempts `refused`."""
+    state = _run(DegradingLLM())
+
+    assert state["output_guard"] == OutputVerdict(ok=True, reason=None)
+    assert state["answer"].answer != REFUSAL_TEXT
+
+
+def test_degraded_answer_trajectory_visits_critic_and_guard_out_but_skips_critic_llm_call():
+    """The graph still statically visits `critic`/`hitl` (no new conditional
+    edge was added, ADR-0028) — but `critic_node` no-ops on a degraded
+    answer, so the critic LLM itself is never invoked and the run never
+    pauses."""
+    critic = CountingLLM(CriticVerdict(faithful=True, confidence=0.9, reasoning="unused"))
+
+    nodes_visited = _run_stream(DegradingLLM(), critic=critic)
+
+    assert nodes_visited == [
+        "guard_in",
+        "router",
+        "retrieve",
+        "answer",
+        "critic",
+        "hitl",
+        "guard_out",
+    ]
+    assert critic.calls == 0
+
+
+def test_degraded_turn_is_not_added_to_history():
+    """Mirrors `test_refused_turn_is_not_added_to_history` — a fallback that
+    never actually answered anything must not be replayed as prior context
+    into the next turn's prompt."""
+    graph = build_graph(checkpointer=InMemorySaver())
+    thread_id = "degraded-history-0000000000001"
+
+    state1 = _run_turn(graph, DegradingLLM(), "What is a high-risk AI system?", thread_id=thread_id)
+    assert state1["degraded"] is True
+    assert not state1.get("history")
+
+    good = AnswerSchema(
+        answer="A high-risk AI system is one used as a safety component.",
+        citations=[Citation(regulation="ai_act", anchor="art_6", quote="is a safety component")],
+    )
+    state2 = _run_turn(graph, FakeLLM(good), "A follow-up question?", thread_id=thread_id)
+    # Turn 1 degraded and was never remembered — turn 2's history holds
+    # exactly ITS OWN exchange, not a two-entry list carrying turn 1's
+    # fallback text forward too.
+    assert state2["history"] == [Turn(question="A follow-up question?", answer=good.answer)]
+
+
+def test_degraded_resets_between_turns():
+    """ADR-0024's per-turn reset (`_PER_TURN_RESET`) now also covers
+    `degraded` — a turn that degrades must not leave `degraded=True` sitting
+    in state for the NEXT turn's `guard_out_node`/`critic_node` to
+    misinterpret before that turn's own `answer_node` has even run."""
+    graph = build_graph(checkpointer=InMemorySaver())
+    thread_id = "degraded-reset-00000000000001"
+
+    state1 = _run_turn(graph, DegradingLLM(), "What is a high-risk AI system?", thread_id=thread_id)
+    assert state1["degraded"] is True
+
+    good = AnswerSchema(
+        answer="A risk management system shall be established.",
+        citations=[Citation(regulation="ai_act", anchor="art_9", quote="risk management system")],
+    )
+    state2 = _run_turn(graph, FakeLLM(good), "A follow-up question?", thread_id=thread_id)
+    assert state2.get("degraded") is not True
+    assert state2["answer"] is good
 
 
 # --- ADR-0007 Day-17 amendment: retrieve_node's MCP tool-calling policy ---

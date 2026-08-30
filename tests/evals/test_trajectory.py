@@ -23,6 +23,7 @@ from fake_mcp_tools import tools_from_articles
 from graph_helpers import (
     ARTICLES,
     ROUTER_FIXTURE,
+    DegradingLLM,
     FakeCriticLLM,
     FakeLLM,
     FakeRouterLLM,
@@ -292,6 +293,52 @@ def test_guard_out_canary_leak_refusal_trajectory():
     assert state["refused"] is True
     assert state["answer"].answer == REFUSAL_TEXT
     assert state["output_guard"].reason == "canary_leak"
+
+
+def test_answer_outage_trajectory_degrades_without_pausing_or_calling_critic():
+    """(9, ADR-0028) An answer-model outage (`DegradingLLM`, after
+    `make_llm()`'s own bounded SDK retry already gave up) takes the exact
+    same static path a real answer does — `critic`/`hitl` are still
+    VISITED (no new conditional edge exists for this) — but `critic_node`
+    no-ops on `state["degraded"]`, so the critic LLM is never actually
+    invoked and nothing pauses."""
+    critic_llm = FakeCriticLLM(CriticVerdict(faithful=True, confidence=0.9, reasoning="unused"))
+    counted_critic = CountingInvoke(critic_llm)
+
+    nodes_visited = _run_stream(DegradingLLM(), critic=counted_critic)
+
+    assert "__interrupt__" not in nodes_visited
+    assert nodes_visited == [
+        "guard_in",
+        "router",
+        "retrieve",
+        "answer",
+        "critic",
+        "hitl",
+        "guard_out",
+    ]
+    assert counted_critic.calls == 0
+
+
+def test_answer_outage_trajectory_makes_fewer_llm_calls_than_the_ceiling():
+    """(10, ADR-0028) A degraded run spends the answer call ONCE (no
+    citation-retry loop — there's no draft to retry) and skips the critic
+    call entirely — strictly fewer LLM calls than a full-ceiling run
+    (`test_retry_path_llm_call_count_never_exceeds_ceiling` above), proving
+    the fallback path is cheaper, not just "no worse", per lesson 23's cost
+    note."""
+    classifier = CountingInvoke(FakeClassifierLLM(_ALLOW_VERDICT))
+    router = CountingInvoke(FakeRouterLLM(RouterVerdict(regulation="ai_act", reason="fixture")))
+    llm = CountingInvoke(DegradingLLM())
+    critic = CountingInvoke(
+        FakeCriticLLM(CriticVerdict(faithful=True, confidence=0.9, reasoning=""))
+    )
+
+    _run(llm, classifier=classifier, router=router, critic=critic)
+
+    total = classifier.calls + router.calls + llm.calls + critic.calls
+    assert total < MAX_LLM_CALLS_PER_REQUEST
+    assert critic.calls == 0
 
 
 # --- (B) call-count ceiling ----------------------------------------------

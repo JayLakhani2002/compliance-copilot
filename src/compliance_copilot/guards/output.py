@@ -115,6 +115,7 @@ def check_output(
     *,
     retrieved_keys: set[tuple[str, str]] | None,
     refused: bool,
+    degraded: bool = False,
 ) -> OutputVerdict:
     """Deterministic output-side checks, in priority order — returns the
     FIRST failing reason, never a full checklist (a pass/fail gate, not a
@@ -127,7 +128,15 @@ def check_output(
     `refused`: `True` only for the fixed refusal shape (`refuse_node`'s
     output, or a citation-retry exhaustion) — a narrower check set applies,
     since a refusal is `REFUSAL_TEXT` verbatim, zero citations, by
-    construction.
+    construction. `degraded` (ADR-0028): `True` only for `answer_node`'s
+    answer-model-outage fallback (`_degraded_answer`, graph/nodes.py) — the
+    SAME narrower check set as `refused` applies, for the same reason: this
+    text was never drafted from the excerpts (nothing to cite, nothing that
+    could ever satisfy `citation_not_retrieved`/`scope_unsupported`'s
+    "did this answer actually use what it cited" checks), it's fixed-shape
+    text built only from retrieved regulation/anchor ids. Canary/scaffold
+    leak checks (below) still run for BOTH `refused` and `degraded` — a
+    fallback path must never become an unguarded shortcut past those.
 
     The caller (`guard_out_node`, graph/nodes.py) turns this into one of
     three outcomes: `ok=True` -> pass through unchanged; `ok=False` with a
@@ -151,13 +160,15 @@ def check_output(
     if any(marker in norm for marker in _SCAFFOLD_SUBSTRINGS):
         return OutputVerdict(ok=False, reason="scaffold_leak")
 
-    if refused:
-        # A refusal is REFUSAL_TEXT verbatim, zero citations, by
-        # construction — nothing past this point applies to it. Any of the
-        # three checks above tripping HERE means REFUSAL_TEXT itself (or
-        # whatever produced this "refusal") is broken, which is exactly why
-        # guard_out_node escalates ANY failure on a refused answer to a hard
-        # error rather than treating it as a policy call.
+    if refused or degraded:
+        # A refusal is REFUSAL_TEXT verbatim, and a degraded fallback is
+        # fixed-shape text built only from retrieved regulation/anchor ids
+        # (ADR-0028) — zero citations, by construction, in both cases —
+        # nothing past this point applies to either. Any of the three
+        # checks above tripping HERE means the construction itself (or
+        # whatever produced this refusal/fallback) is broken, which is
+        # exactly why `guard_out_node` escalates ANY failure on either to a
+        # hard error rather than treating it as a policy call.
         return OutputVerdict(ok=True, reason=None)
 
     if _PLACEHOLDER_RE.search(norm):

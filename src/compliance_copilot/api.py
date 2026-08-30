@@ -36,6 +36,8 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 from slowapi.util import get_remote_address
+from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.responses import Response
@@ -385,6 +387,18 @@ async def _run_graph_and_stream(
     (`hitl_node`, graph/nodes.py) — this is a narrower SSE projection of
     it, not a narrower checkpoint.
 
+    ADR-0028: the whole `graph.astream(...)` loop below runs inside
+    `asyncio.timeout(settings.request_timeout_s)` — ONE deadline for the
+    whole request (every node this run visits), distinct from any single
+    LLM call's own per-call timeout (`answer_timeout_s` etc., settings.py).
+    A `TimeoutError` raised inside (stdlib — `asyncio.TimeoutError` has been
+    the same class as the builtin since Python 3.11) is caught below and
+    turned into a typed `{"type": "timeout"}` error event, same "never a
+    stack trace, never a silently-dropped connection" convention every
+    other `error` event here already follows. Shared by `/resume` for
+    free: `_stream_resume` calls this same function, so a resumed run gets
+    the same deadline with no separate wiring.
+
     Resuming (`initial_input` is a `Command`) starts this SAME loop
     part-way through the graph — `answer_node`/`critic_node` already ran
     (and were streamed) in the EARLIER call that paused, so THIS stream
@@ -398,14 +412,62 @@ async def _run_graph_and_stream(
     trace_emitted = False
     current_answer = None
     current_refused = False
+    # ADR-0028: mirrors `current_refused`'s seeding above — a resume whose
+    # paused turn had already degraded (can't happen today, `hitl_node`
+    # never pauses on a degraded turn since `critic_node` no-ops on it, but
+    # seeding it the same way costs nothing and avoids a silent assumption).
+    current_degraded = False
     if isinstance(initial_input, Command):
         snapshot = await graph.aget_state(config)
         current_answer = snapshot.values.get("answer")
         current_refused = snapshot.values.get("refused", False)
+        current_degraded = snapshot.values.get("degraded", False)
+    # ADR-0028 round 2 (reviewer BLOCKER 1): a plain `async with
+    # asyncio.timeout(...): async for update in graph.astream(...): ...
+    # yield ...` wraps a `yield` INSIDE the timeout scope — when the
+    # generator is parked at that `yield` waiting on a SLOW CONSUMER (a
+    # slow SSE client, socket backpressure), `Task.cancel()` still fires at
+    # the deadline (it targets the Task, not a specific frame), but the
+    # `CancelledError` lands wherever the Task is actually suspended right
+    # then — the consumer's own await (Starlette's `await send(...)`), not
+    # here. `except TimeoutError:` below never runs, no `{"type":
+    # "timeout"}` event is ever sent, and the un-`aclose()`d generator gets
+    # `GeneratorExit` thrown into it later at GC/shutdown — inside a scope
+    # whose deadline already elapsed, which raised an actual
+    # `RuntimeError: async generator ignored GeneratorExit` in testing
+    # (reviewer-reproduced, not theoretical). Fix: put `asyncio.timeout()`
+    # around ONLY the "get the next update" step (`anext`) each iteration —
+    # never around a `yield`.
+    #
+    # `used` (not a fixed `deadline = start + budget`, which was ROUND 2's
+    # first, still-wrong attempt): a plain wall-clock deadline keeps
+    # ticking during the gap between one `yield` and the consumer's next
+    # pull too — it can't tell "the graph was slow" apart from "the
+    # consumer was slow to ask for the next chunk", so it silently
+    # re-introduces the exact bug this fix exists to remove. `used`
+    # instead accumulates ONLY the measured duration of each individual
+    # `anext()` call (the `finally` below) — time spent between calls
+    # (however long a slow consumer takes) is never added to it. A slow
+    # CLIENT therefore never counts against this budget (that's ASGI/
+    # proxy territory, a separate concern) — only slow GRAPH work does,
+    # cumulatively across every `anext` call, never reset per chunk.
+    used = 0.0
+    astream_iter = graph.astream(
+        initial_input, context=context, config=config, stream_mode="updates"
+    ).__aiter__()
     try:
-        async for update in graph.astream(
-            initial_input, context=context, config=config, stream_mode="updates"
-        ):
+        while True:
+            remaining = settings.request_timeout_s - used
+            if remaining <= 0:
+                raise TimeoutError
+            started_wait = time.monotonic()
+            try:
+                async with asyncio.timeout(remaining):
+                    update = await anext(astream_iter)
+            except StopAsyncIteration:
+                break
+            finally:
+                used += time.monotonic() - started_wait
             if "__interrupt__" in update:
                 payload = update["__interrupt__"][0]
                 draft = payload.value
@@ -530,7 +592,11 @@ async def _run_graph_and_stream(
                     )
                     yield _sse(
                         "node",
-                        {"node": node_name, "attempt": attempts, "citation_error": citation_error},
+                        {
+                            "node": node_name,
+                            "attempt": attempts,
+                            "citation_error": citation_error,
+                        },
                     )
                     answer = node_update.get("answer")
                     if answer is not None:
@@ -539,10 +605,22 @@ async def _run_graph_and_stream(
                         # `guard_out` runs next and emits it.
                         current_answer = answer
                         current_refused = False
-                        # First quality signal on the dashboard (ADR-0009
-                        # amendment, Day 10 builds eval scores on top of
-                        # this): a validated answer scores 1.0.
-                        tracing.score("citation_valid", 1.0, tracing.current_trace_id(config))
+                        # ADR-0028: `answer_node` sets "degraded" only on
+                        # its outage-fallback branch — absent (a normal
+                        # validated answer) defaults False here the same
+                        # way every other optional key in this loop does.
+                        current_degraded = node_update.get("degraded", False)
+                        if current_degraded:
+                            # A degraded turn didn't validate any
+                            # citations — the "counted, not hidden" signal
+                            # lesson 23 calls for, distinct from the
+                            # citation_valid score below.
+                            tracing.score("degraded", 1.0, tracing.current_trace_id(config))
+                        else:
+                            # First quality signal on the dashboard (ADR-0009
+                            # amendment, Day 10 builds eval scores on top of
+                            # this): a validated answer scores 1.0.
+                            tracing.score("citation_valid", 1.0, tracing.current_trace_id(config))
                 elif node_name == "critic":
                     # ADR-0023: absent when the critic is disabled
                     # (`GraphContext.critic=None`) or on a refused path (the
@@ -608,6 +686,13 @@ async def _run_graph_and_stream(
                     if node_update.get("answer") is not None:
                         current_answer = node_update["answer"]
                         current_refused = node_update.get("refused", True)
+                        # ADR-0028: `guard_out_node`'s rewrite branch
+                        # (a policy-violation block) never sets
+                        # "degraded" — defaulting False here is what
+                        # correctly clears a stale True from the
+                        # `answer` branch above once a degraded fallback
+                        # gets rewritten into a plain refusal.
+                        current_degraded = node_update.get("degraded", False)
                     logger.info(
                         "node=%s ok=%s reason=%s elapsed_ms=%d",
                         node_name,
@@ -620,7 +705,42 @@ async def _run_graph_and_stream(
                     )
                     if not verdict.ok:
                         tracing.score("output_blocked", 1.0, tracing.current_trace_id(config))
-                    yield _sse("final", {**current_answer.model_dump(), "refused": current_refused})
+                    yield _sse(
+                        "final",
+                        {
+                            **current_answer.model_dump(),
+                            "refused": current_refused,
+                            "degraded": current_degraded,
+                        },
+                    )
+    except TimeoutError:
+        # ADR-0028 round 2: either `anext(astream_iter)`'s own
+        # `asyncio.timeout(remaining)` expired (that one node call was
+        # slow), or `remaining <= 0` was already true at the top of an
+        # iteration (the SUM of every prior `anext()`'s own measured
+        # duration — `used` — already exhausted the budget, even though no
+        # single call individually did) — both raise `TimeoutError` from a
+        # point that's INSIDE this `try`, never from a `yield`, so this
+        # clause always actually runs (round 1's first-attempt bug: a slow
+        # CONSUMER, not slow graph work, could previously starve this
+        # clause entirely). Same "type only, never a stack trace"
+        # convention as every other `error` event here.
+        logger.warning("request_timeout elapsed_ms=%d", int((time.monotonic() - started) * 1000))
+        yield _sse("error", {"type": "timeout"})
+        tracing.score("timeout", 1.0, tracing.current_trace_id(config))
+    except OperationalError:
+        # ADR-0028: the DB is unreachable — a distinct, actionable signal
+        # from the generic `internal_error` catch-all below (an operator
+        # reading `dependency_unavailable` knows to check Postgres, not to
+        # start reading a stack trace for a code bug). Never logged with
+        # `.exception()` here: `OperationalError`'s own message can embed
+        # the connection string (the "no PII in logs" hard rule already
+        # applies to secrets too), so only the elapsed time is logged.
+        logger.error(
+            "dependency_unavailable elapsed_ms=%d", int((time.monotonic() - started) * 1000)
+        )
+        yield _sse("error", {"type": "dependency_unavailable"})
+        tracing.score("dependency_unavailable", 1.0, tracing.current_trace_id(config))
     except OutputGuardError as exc:
         # `guard_out_node` (graph/nodes.py) raised — an internal invariant
         # broke (a citation `answer_node` claims it already validated, or a
@@ -653,6 +773,18 @@ async def _run_graph_and_stream(
             int((time.monotonic() - started) * 1000),
         )
         yield _sse("error", {"type": "internal_error"})
+    finally:
+        # ADR-0028 round 2: `async for`/manual iteration never auto-closes
+        # an async generator on early exit (a `return`, a `break`, or an
+        # exception escaping the loop) — without this, `astream_iter`
+        # (LangGraph's own `Pregel.astream` generator) sits open until GC
+        # or `loop.shutdown_asyncgens()` eventually throws `GeneratorExit`
+        # into it, which reviewer testing showed can surface as a real
+        # `RuntimeError: async generator ignored GeneratorExit` at
+        # shutdown. Runs on EVERY exit path (normal completion, the
+        # `return` on `__interrupt__`, and all five `except` clauses
+        # above) — `aclose()` on an already-exhausted iterator is a no-op.
+        await astream_iter.aclose()
 
 
 def _build_run_config(thread_id: str) -> dict:
@@ -898,6 +1030,24 @@ async def healthz() -> dict:
     liveness probe must not depend on anything that can fail independently
     of the process being alive, or be throttled alongside real traffic."""
     return {"status": "ok"}
+
+
+@app.get("/readyz")
+@limiter.exempt
+async def readyz(session: Session = Depends(get_session)) -> JSONResponse:
+    """ADR-0028: **readiness**, not liveness — "should traffic be routed to
+    this instance right now," a different question from `/healthz`'s
+    "should this container be restarted." Runs a trivial `SELECT 1` through
+    the same `get_session` dependency every real request uses, so a DB
+    outage this route can't reach is exactly the DB outage `/ask` couldn't
+    reach either. No auth (same reasoning as `/healthz` — an orchestrator's
+    probe, not a client of the product) and no rate limit (`@limiter.exempt`,
+    mirroring `/healthz`)."""
+    try:
+        session.execute(text("SELECT 1"))
+    except OperationalError:
+        return JSONResponse({"status": "unavailable"}, status_code=503)
+    return JSONResponse({"status": "ok"})
 
 
 @app.post("/ask")

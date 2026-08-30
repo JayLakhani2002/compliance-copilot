@@ -199,5 +199,52 @@ class Settings(BaseSettings):
     # millisecond-scale latency.
     mcp_tool_timeout_s: float = 30.0
 
+    # ADR-0028: `make_llm()`'s (graph/nodes.py) answer-model client — the ONE
+    # call every request actually waits on end-to-end, so it gets the most
+    # generous per-call budget of any LLM client in this app (contrast the
+    # guard-tier clients below, which fail open/pessimistic on their own
+    # outage and so only need a tight timeout, not a retry budget). 30s is
+    # headroom over a normal structured-output completion; `max_retries=1`
+    # makes the SDK's own (previously implicit, `openai`'s
+    # `DEFAULT_MAX_RETRIES=2`) retry an explicit, deliberate choice — one
+    # bounded retry for a transient blip, not stacked with a second retry
+    # layer anywhere else (lesson 23's "don't stack retries" rule).
+    answer_timeout_s: float = 30.0
+    answer_max_retries: int = 1
+
+    # ADR-0028: `get_embeddings()` (embeddings.py) — a query-time embedding
+    # call blocks `retrieve`'s search the same way a hung answer call blocks
+    # `answer`. 10s matches the guard-tier clients' budget (a single short
+    # text, not a multi-thousand-token completion, so it needs far less
+    # headroom than `answer_timeout_s`); `max_retries=2` (not 1) because an
+    # embedding call has no side effect worth worrying about re-running
+    # (idempotent by construction — same text in, same vector out) and no
+    # fallback path exists yet if it fails, so paying for a couple more
+    # bounded retries before giving up is the right trade.
+    embedding_timeout_s: float = 10.0
+    embedding_max_retries: int = 2
+
+    # ADR-0028: the offline judge (evals/judge.py's `judge()`, constructed in
+    # evals/run_answer_eval.py + evals/build_calibration_set.py) — a
+    # dev/CI-only batch call, not a request a user is waiting on, but still
+    # worth an explicit budget rather than an unbounded hang stalling a CI
+    # job. Matches the other nano-tier guard clients' timeout.
+    judge_timeout_s: float = 10.0
+
+    # ADR-0028: the ONE request-wide deadline `_run_graph_and_stream`
+    # (api.py, shared by `/ask` and `/resume`) enforces across every
+    # `graph.astream(...)` node it visits — distinct from any single LLM
+    # call's own timeout above: this bounds the WHOLE request (guard_in +
+    # router + retrieve + up to `MAX_ATTEMPTS` answer calls + critic,
+    # build.py's `MAX_LLM_CALLS_PER_REQUEST`), not any one call in it. 60s
+    # is comfortably above `answer_timeout_s` plus every other call's own
+    # budget summed, so a healthy request never trips this — it's a
+    # backstop against the whole chain running unusually long, not a tight
+    # budget nodes are expected to race against. ADR-0028 round 2: this
+    # bounds the app's OWN graph-compute time only — a slow SSE client
+    # reading the response never counts against it (see the ADR for why a
+    # naive wall-clock deadline gets that wrong).
+    request_timeout_s: float = 60.0
+
 
 settings = Settings()
