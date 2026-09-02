@@ -34,6 +34,19 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      # No OPENAI_API_KEY in this job. Constructing OpenAIEmbeddings requires a
+      # key even when no call is ever made (FastAPI resolves the embeddings
+      # dependency before body validation, and the MCP lifespan builds it at
+      # startup) — the cached provider constructs key-free and these tests
+      # never embed anything (fakes/monkeypatches). Mirrors quality-gate's env.
+      EMBEDDINGS_PROVIDER: cached
+      # ChatOpenAI also validates key presence at CONSTRUCTION (FastAPI
+      # dependency wiring builds the llm/router/critic clients before any 422
+      # short-circuits). A dummy satisfies construction; no call is ever made
+      # in this job — every test marked `integration` (incl. all real-LLM
+      # tests) is deselected here, so the dummy can never leak into a request.
+      OPENAI_API_KEY: ci-dummy-key-never-used
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -78,6 +91,7 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     env:
+      EMBEDDINGS_PROVIDER: cached  # same reasoning as the test job; real-LLM tests remain key-gated and skip
       # +psycopg driver, matching settings.py's default DSN scheme.
       DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/postgres
       # Explicit disposable test DB (tests/conftest.py's TEST_DATABASE_URL
