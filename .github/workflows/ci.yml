@@ -1,6 +1,7 @@
 # .github/workflows/ci.yml — CI gate. Runs on every push/PR to main or
-# develop: installs deps with uv, lints, checks formatting, and runs the
-# non-integration test suite. Must be green before a PR merges (project rule).
+# develop: installs deps with uv, audits dependencies for known CVEs, lints,
+# checks formatting, and runs the non-integration test suite. Must be green
+# before a PR merges (project rule).
 # setup-uv docs: https://github.com/astral-sh/setup-uv
 #
 # `integration` job runs the DB tests that need a real Postgres+pgvector
@@ -58,6 +59,34 @@ jobs:
 
       - name: Install dependencies
         run: uv sync
+
+      # ADR-0030 (Day 25 security review): blocking, not continue-on-error
+      # — a real, fixable CVE should fail the build the same way a lint
+      # error does. `--locked` asserts uv.lock isn't silently re-resolved
+      # mid-audit. The three `--ignore` flags below are a dated, written
+      # allowlist (docs/decisions/ADR-0030), not a standing exemption:
+      # `cryptography` 48.0.1 is pinned transitively by
+      # `presidio-anonymizer==2.2.364`'s own `cryptography<49.0.0` upper
+      # bound (verified: no newer presidio-anonymizer release relaxes it,
+      # checked 2026-09-02) — nothing this project's own pyproject.toml can
+      # bump directly. All three CVEs are in `cryptography`'s X.509
+      # certificate-chain-building/PKCS#7-decrypt code paths
+      # (GHSA-g6cj-pr64-35w5, GHSA-jwv3-5hgf-82ww, GHSA-m2h6-j472-rp4c) —
+      # this app never verifies an X.509 chain or decrypts PKCS#7
+      # EnvelopedData with `cryptography` itself (it's a transitive
+      # dependency of `presidio-anonymizer`'s AES anonymizer and
+      # `mcp[crypto]`'s JWT support, neither of which touches those code
+      # paths), so none of the three are reachable through this app's own
+      # code. Re-check `uv audit --locked` (drop an `--ignore` the moment
+      # `uv lock --upgrade-package cryptography` picks up >=49.0.0 on its
+      # own, i.e. once presidio-anonymizer relaxes its pin) rather than
+      # carrying these forever.
+      - name: Audit dependencies (uv audit, known CVEs)
+        run: >-
+          uv audit --locked
+          --ignore GHSA-g6cj-pr64-35w5
+          --ignore GHSA-jwv3-5hgf-82ww
+          --ignore GHSA-m2h6-j472-rp4c
 
       - name: Lint
         run: uv run ruff check .

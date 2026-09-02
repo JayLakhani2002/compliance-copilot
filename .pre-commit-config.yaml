@@ -12,3 +12,42 @@ repos:
         args: [--fix]
       # Formatter (replaces black).
       - id: ruff-format
+
+  # ADR-0030 (Day 25 security review): blocking secret-scan hook — the
+  # second, provider-independent layer alongside GitHub's own push
+  # protection (a repo-settings toggle, not a code change), same
+  # "heuristics AND a second check, neither alone" layering this project's
+  # guard_in already uses (ADR-0018/0019). Chosen over `gitleaks`: a
+  # pure-Python tool that installs the same way every other dev dependency
+  # here does (`uv sync`, `pyproject.toml`'s `dev` group), vs. a separate
+  # Go-binary download step `gitleaks`'s own pre-commit hook needs — no new
+  # install mechanism for a repo this size (docs/decisions/ADR-0030).
+  #
+  # `.secrets.baseline` (committed, run `detect-secrets scan` to refresh)
+  # was audited by hand — every finding in it is `"is_secret": false`,
+  # confirmed a false positive: the CI job's dummy `OPENAI_API_KEY:
+  # ci-dummy-key-never-used` (deliberate, never a real key — see
+  # .github/workflows/ci.yml's own comment), `.env.example`'s/
+  # `docker-compose.yml`'s/`settings.py`'s placeholder
+  # "user:password"-shaped local dev DSNs (never real credentials, `.env`
+  # itself stays gitignored), the test suite's own fixture constant
+  # (`tests/test_api.py`'s `API_KEY = "test-secret-key-not-a-real-secret"`),
+  # and base64-encoded prompt-injection ATTACK TEXT used as eval/test
+  # fixtures (`tests/test_guards_injection.py`, `evals/redteam.jsonl`) that
+  # only LOOKS high-entropy to the Base64 heuristic. None of these are
+  # excluded from the scan (unlike the cached-embedding-vector noise
+  # below) — they're deliberately still visible in the baseline, labelled,
+  # so a genuinely new secret accidentally added to one of these same
+  # files still gets caught.
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.5.0
+    hooks:
+      - id: detect-secrets
+        args: ['--baseline', '.secrets.baseline']
+        # evals/embeddings_cache/*.jsonl holds cached embedding VECTORS
+        # (raw floats, base64/hex-shaped by coincidence) — hundreds of
+        # false "high entropy string" hits, pure noise, not secrets.
+        # Excluded here AND at scan time (`detect-secrets scan
+        # --exclude-files 'evals/embeddings_cache/.*'`, how this baseline
+        # was generated) so refreshing the baseline never re-adds them.
+        exclude: ^evals/embeddings_cache/

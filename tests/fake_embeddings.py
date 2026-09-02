@@ -29,7 +29,7 @@ class FakeEmbeddings(Embeddings):
 
     def _embed(self, text: str) -> list[float]:
         seed = int(hashlib.sha256(text.encode("utf-8")).hexdigest(), 16) % (2**32)
-        rng = random.Random(seed)
+        rng = random.Random(seed)  # noqa: S311 — deterministic test fixture, not a security use
         vector = [rng.gauss(0, 1) for _ in range(self.size)]
         norm = math.sqrt(sum(x * x for x in vector))
         return [x / norm for x in vector]

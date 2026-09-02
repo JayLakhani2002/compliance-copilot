@@ -35,7 +35,7 @@ def test_init_db_insert_and_nearest_neighbour_query(test_engine):
 
         # random.random() (0.0-1.0), not normalised — fine here since this
         # test only checks the round trip, not embedding quality.
-        vector = [random.random() for _ in range(1536)]
+        vector = [random.random() for _ in range(1536)]  # noqa: S311 — test fixture data, not crypto
         chunk = Chunk(
             document_id=doc.id,
             kind="article",

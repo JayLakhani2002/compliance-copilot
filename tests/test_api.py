@@ -1568,3 +1568,51 @@ def test_readyz_returns_200_when_db_reachable(client):
     resp = client.get("/readyz")
     assert resp.status_code == 200
     assert resp.json() == {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# ADR-0030 (Day 25 security review): HTTP hardening middleware — security
+# headers, X-Request-ID, and TrustedHostMiddleware. `/healthz` (no auth, no
+# DB, no rate limit) is a convenient plain-response probe for the
+# always-on headers; `/ask` is what actually exercises the `/ask`-and-
+# `/resume`-only `Cache-Control: no-store` override.
+# ---------------------------------------------------------------------------
+def test_security_headers_present_on_every_response(client):
+    resp = client.get("/healthz")
+    assert resp.status_code == 200
+    assert resp.headers["X-Content-Type-Options"] == "nosniff"
+    assert resp.headers["Referrer-Policy"] == "no-referrer"
+    # A uuid4 hex string with dashes, echoed back — not asserting the exact
+    # value (a fresh one is minted per request), just that it's present and
+    # shaped like one.
+    request_id = resp.headers["X-Request-ID"]
+    assert uuid.UUID(request_id)
+
+
+def test_ask_response_uses_no_store_not_no_cache(client):
+    """ADR-0030: `SecurityHeadersMiddleware` must win the reconciliation —
+    the route handler's own `Cache-Control: no-cache` (ADR-0016, set for
+    SSE anti-buffering) is the wrong default for a response that can carry
+    a redacted-but-still-sensitive answer; `no-store` is strictly
+    stronger and is what a client should actually see."""
+    answer = AnswerSchema(answer="...", citations=[])
+    _use_llm(FakeLLM(answer))
+
+    with client.stream(
+        "POST",
+        "/ask",
+        json={"question": "What is a high-risk AI system?"},
+        headers=_auth_headers(),
+    ) as resp:
+        "".join(resp.iter_text())  # drain the stream before reading headers/status
+        assert resp.headers["Cache-Control"] == "no-store"
+        assert "X-Request-ID" in resp.headers
+
+
+def test_trusted_host_middleware_rejects_unexpected_host_header(client):
+    """`TestClient`'s default `Host: testserver` is in `settings.
+    allowed_hosts` (the whole reason "testserver" is in that default list)
+    — a request claiming a DIFFERENT, unlisted host must be rejected before
+    it ever reaches routing/auth."""
+    resp = client.get("/healthz", headers={"Host": "evil.example.com"})
+    assert resp.status_code == 400
