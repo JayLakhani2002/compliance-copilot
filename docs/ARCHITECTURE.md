@@ -206,16 +206,22 @@ The most important boundary for a legal-RAG system specifically is #1→#2: ever
 
 - **Corpus.** EUR-Lex text is public EU legislation; no residency concern on the source data itself.
 - **User questions and generated answers.** May contain PII if a user pastes it in (e.g., "does GDPR let my employer do X to me, an example being [name/detail]"); `guard_in` runs PII detection/redaction (Presidio, ADR-0006) before the question is used in any downstream call, including the third-party LLM call.
-- **LLM inference.** ADR-0002 defaults to the Anthropic API directly for development speed; the documented **production path** is AWS Bedrock in `eu-central-1` (Frankfurt) specifically so inference happens inside the EU. This is a real gap to be explicit about: Anthropic's direct API is not itself an EU-region-pinned service the way Bedrock eu-central-1 is, so "EU residency" as a claim is only true once the Bedrock path is live, not on day one with the direct API. Document this honestly in any portfolio write-up rather than overclaiming.
+- **LLM inference.** ADR-0002's 2026-08-24 amendment ships OpenAI (`gpt-4.1-mini`/`nano`) as the interim provider via the `LLM_PROVIDER` switch, with Anthropic as the documented target; the documented **production path** is AWS Bedrock in `eu-central-1` (Frankfurt) specifically so inference happens inside the EU. This is a real gap to be explicit about: Anthropic's direct API is not itself an EU-region-pinned service the way Bedrock eu-central-1 is, so "EU residency" as a claim is only true once the Bedrock path is live, not on day one with the direct API. Document this honestly in any portfolio write-up rather than overclaiming.
 - **Embeddings.** Same pattern — OpenAI `text-embedding-3-small` by default (US), Cohere `embed-multilingual-v3` via Bedrock `eu-central-1` as the documented production option (ADR-0004).
 - **Everything else** (Postgres, Langfuse + its ClickHouse/Redis/MinIO dependencies, the API, the MCP server) runs on a Hetzner VPS physically located in Germany (ADR-0010) — no data leaves the EU through these components.
 - **Bottom line:** the architecture's EU-residency story is "storage and observability are EU by construction (Hetzner DE); inference and embeddings are EU by *choice of provider/region*, and that choice is the Bedrock/eu-central-1 path, not the cheaper default path used for day-to-day development." A portfolio write-up should state this distinction rather than imply the whole system is EU-only from the first commit.
 
-## 9. Cost model sketch
+## 9. Cost model — measured (ADR-0029)
 
-Rough, for a low-traffic portfolio deployment (not production load). All figures approximate and meant to be revisited once real usage numbers exist — treat this as a first-order sanity check, not a budget commitment.
+Superseded the original hand-estimated Claude-tier sketch: the shipped
+system runs on OpenAI (`gpt-4.1-mini`/`gpt-4.1-nano`, ADR-0002's 2026-08-24
+amendment), and `evals/run_cost_report.py` now measures real per-question
+token usage instead of assuming counts. Anthropic/Bedrock stays the
+documented **alternative** production path (below), priced from ADR-0002's
+recorded figures, not re-measured here.
 
-**Fixed monthly costs (infrastructure):**
+**Fixed monthly costs (infrastructure)** — unchanged, still a sketch (no
+deployed instance to measure against yet):
 
 | Item | Approx. cost/month |
 |---|---|
@@ -223,18 +229,54 @@ Rough, for a low-traffic portfolio deployment (not production load). All figures
 | Domain + TLS | ~€1 (Caddy automates TLS via Let's Encrypt, free) |
 | **Total fixed** | **~€20–30/month** |
 
-**Variable costs (usage-based):**
+**Variable costs — measured, n=10 golden questions, 2026-09-02** (full
+detail and methodology: `docs/EVALS.md`'s "Cost per question" section):
 
-| Item | Driver | Notes |
-|---|---|---|
-| Claude Haiku calls (router + critic/judge) | 2 calls/request, small prompts | $1/$5 per MTok in/out (as of this doc) — cheap per call, dominates only at high volume |
-| Claude Sonnet calls (final answer) | 1 call/request, larger prompt (retrieved chunks + question) | $3/$15 per MTok — the main per-request cost driver |
-| Embeddings | 1 call/query (question) + ingestion (one-off, ~2 documents' worth of chunks) | text-embedding-3-small is inexpensive; ingestion cost is a one-time/rare cost, not per-request |
-| Ragas/LLM-judge eval runs | Per CI run (GitHub Actions merge gate), on the golden set only | Bounded by golden-set size × PRs/week, not by user traffic |
+| Model | Role | USD (10 questions) | Cached fraction |
+|---|---|---|---|
+| `gpt-4.1-mini` | answer (the one call a user reads) | $0.01163 | 81.7% |
+| `gpt-4.1-nano` | classifier + router + critic, pooled (share one model id) | $0.00249 | 34.7% |
+| `text-embedding-3-small` | one query embedding/question | rounding error next to the above | n/a (no prefix cache) |
 
-**Ballpark per-question cost:** with a Haiku router call (~500 in / 100 out tokens), a Sonnet answer call (~3,000 in with retrieved context / 500 out), and a Haiku critic call (~1,000 in / 150 out), total is well under $0.02/question at current per-token prices — cost is not the constraining factor for a portfolio-scale deployment; the fixed VPS cost dominates at low volume. **Prompt caching** (caching the stable system prompt / tool descriptions across requests, per ADR-0002/ADR-0007) reduces the input-token cost further on the Sonnet call in particular, since the retrieved-chunk context and tool schema are the same shape across many requests even though the specific chunks differ per query — caching mainly saves on the system prompt and fixed instructions, not on the retrieved content itself.
+**Measured: €0.130 per 100 questions** (€0.00130/question, n=10 — see
+`docs/EVALS.md` for the small-sample caveat and the one golden question
+that reproduced a citation-validation refusal). This replaces the old
+"well under $0.02/question" hand estimate with an actual number; both
+pointed the same direction (cost is not the constraining factor at
+portfolio scale — the fixed VPS cost dominates at low volume), but this one
+is measured, not assumed. `gpt-4.1-mini` (the answer call) is 82% of the
+measured chat-model spend — the same "don't underspend on the call a user
+actually reads" reasoning ADR-0002 already argues for, now with a number
+behind it.
 
-**What would change this model:** GitHub Actions minutes if the eval suite grows large and runs on every push (mitigate: run the full Ragas suite only on PRs targeting `develop`/`main`, not every commit); Langfuse trace volume growing ClickHouse storage over months (mitigate: configure a trace retention/TTL policy, not part of the default self-host compose file — flagged as an operational follow-up, not solved in this document).
+**Prompt caching — what was actually observed, not theorized:** OpenAI's
+automatic prefix caching engages once a prompt prefix exceeds roughly
+1,024 tokens. The answer call's prompt is ordered system-prompt-first
+(`_build_messages`/`_system_message`, `graph/nodes.py`) specifically so
+that stable prefix gets cached across calls, and the measured 81.7% cached
+fraction on `gpt-4.1-mini` confirms it's actually happening. The
+guard-tier calls (`gpt-4.1-nano`) cache at a much lower 34.7% — their
+prompts are shorter, so a larger share of individual calls likely falls
+under the threshold and misses the cache. Caching mainly pays off on the
+system prompt and fixed instructions, not on the retrieved content itself
+(which differs per query and can't be a shared cached prefix).
+
+**Anthropic/Bedrock — the documented alternative, not shipped:** ADR-0002's
+target path (Haiku `$1.00/$5.00` per MTok, Sonnet `$3.00/$15.00`, recorded
+2026-08-23 — reverify before this path ships) remains the EU-residency
+production option (§8). `compliance_copilot.costing.PRICES` carries both
+Anthropic model rows for exactly this reason — switching `LLM_PROVIDER`
+is a one-line config change (ADR-0002's "how to reverse"), and the same
+`evals/run_cost_report.py` would re-measure real numbers on that path the
+day a real `ANTHROPIC_API_KEY` exists, rather than re-estimating by hand.
+
+**What would change this model:** a corpus/traffic scale-up (this is n=10,
+not a load-tested number); GitHub Actions minutes if the eval suite grows
+large and runs on every push (mitigate: run the full Ragas/answer-quality
+suite only on PRs targeting `develop`/`main`, not every commit); Langfuse
+trace volume growing ClickHouse storage over months (mitigate: configure a
+trace retention/TTL policy, not part of the default self-host compose file
+— flagged as an operational follow-up, not solved in this document).
 
 ## References
 

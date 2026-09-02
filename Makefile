@@ -1,7 +1,7 @@
 # Makefile — shortcuts for the commands you'll run most while developing.
 # Run `make <target>` from the repo root.
 
-.PHONY: setup lint test db-up db-init api mcp eval-cache quality-gate redteam redteam-fast calibration calibration-build
+.PHONY: setup lint test db-up db-init api mcp eval-cache quality-gate redteam redteam-fast calibration calibration-build cost-report
 
 setup:  ## Install deps (incl. dev tools) and enable the pre-commit git hook.
 	uv sync
@@ -43,3 +43,6 @@ calibration-build:  ## Rebuild evals/calibration/*.jsonl from the real pipeline 
 
 calibration:  ## Judge-vs-human agreement report — reads existing evals/calibration/*.jsonl, zero cost (ADR-0027).
 	uv run python -m evals.run_judge_calibration
+
+cost-report:  ## Measured €/question over the golden set — full call shape, real spend (ADR-0029).
+	uv run python -m evals.run_cost_report

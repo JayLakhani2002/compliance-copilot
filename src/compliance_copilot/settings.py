@@ -246,5 +246,14 @@ class Settings(BaseSettings):
     # naive wall-clock deadline gets that wrong).
     request_timeout_s: float = 60.0
 
+    # ADR-0029: `costing.estimate_cost()`'s USD->EUR multiplier — a
+    # point-in-time snapshot (ECB reference rate, 2026-08-30 ≈ 0.92 EUR per
+    # USD), NOT a live FX feed. Same staleness discipline as `costing.
+    # PRICES`'s dated rows: this drifts as the real exchange rate moves, so
+    # re-check it before quoting a euro figure anyone will act on months
+    # from now — that's the honest scope for a portfolio project (no paid
+    # FX API, no live feed dependency for a number this small).
+    eur_usd_rate: float = 0.92
+
 
 settings = Settings()
