@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 import secrets
@@ -40,6 +41,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.responses import Response
 
 from compliance_copilot import embeddings as embeddings_module
@@ -330,6 +332,112 @@ class BodySizeLimitMiddleware(BaseHTTPMiddleware):
         if length > settings.max_body_bytes:
             return JSONResponse({"detail": "request body too large"}, status_code=413)
         return await call_next(request)
+
+
+# ---------------------------------------------------------------------------
+# ADR-0030 (Day 25 security review): a per-request correlation id, so a
+# caller ("my request failed around 14:32") or an operator reading logs can
+# pull every line ONE request touched, across every node/guard the graph
+# visited, without threading a `request_id` parameter through every
+# function signature in the graph.
+#
+# `contextvars.ContextVar`, not a plain module-level variable: each request
+# in this async app can interleave with others on the same event loop —
+# a global would let one request's id leak into another's log lines. A
+# `ContextVar` is copied into whatever asyncio Task reads it at creation
+# time (verified against Starlette's installed `BaseHTTPMiddleware.__call__`,
+# `.venv/lib/python3.12/site-packages/starlette/middleware/base.py`: the
+# actual request handling — and therefore every node's own logging — runs
+# inside a `task_group.start_soon(coro)` child task spawned from INSIDE
+# `call_next()`, i.e. after this middleware's `dispatch` has already called
+# `_request_id_ctx.set(...)`, so that child task's own context snapshot
+# already carries the id; resetting it in THIS coroutine's `finally`
+# afterward only affects this coroutine's own context, never the already-
+# spawned child's).
+#
+# `RequestIdFilter` mutates `record.msg` directly, the same trick
+# `logging_filter.py`'s `PiiScrubFilter` already uses — this app configures
+# no root `Formatter`/handler anywhere (relies on Python's own default
+# logging), so stamping a separate `record.request_id` attribute would be
+# invisible in the actual emitted output; editing the message text itself
+# shows up regardless of whatever handler eventually prints it.
+# ---------------------------------------------------------------------------
+_request_id_ctx: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "request_id", default=None
+)
+
+
+class RequestIdFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        request_id = _request_id_ctx.get()
+        if request_id is not None and isinstance(record.msg, str):
+            record.msg = f"request_id={request_id} {record.msg}"
+        return True
+
+
+def _install_request_id_filter() -> None:
+    """Idempotent, same reasoning as `install_pii_scrub` (logging_filter.py)
+    — called from `lifespan()` below, guards against stacking duplicate
+    filters if `lifespan()` ever runs more than once in a process (tests)."""
+    root = logging.getLogger()
+    if not any(isinstance(f, RequestIdFilter) for f in root.filters):
+        root.addFilter(RequestIdFilter())
+
+
+class RequestIdMiddleware(BaseHTTPMiddleware):
+    """Mints one `uuid.uuid4()` per request, echoes it as the `X-Request-ID`
+    response header (so a caller can quote it back when reporting an
+    issue), and makes it available to `RequestIdFilter` above for the
+    request's whole duration — added OUTER of every other middleware below
+    (see the registration order comment near `app.add_middleware` calls)
+    so even an early rejection (bad host, rate-limited, oversized body)
+    still gets a correlatable id and a logged, id-stamped line."""
+
+    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
+        request_id = str(uuid.uuid4())
+        token = _request_id_ctx.set(request_id)
+        try:
+            response = await call_next(request)
+        finally:
+            _request_id_ctx.reset(token)
+        response.headers["X-Request-ID"] = request_id
+        return response
+
+
+# ---------------------------------------------------------------------------
+# ADR-0030: baseline security headers on every response, plus a stronger
+# `Cache-Control` specifically on `/ask`/`/resume` (round out the SSE
+# stream's own anti-buffering headers, set below in each route). No
+# `Strict-Transport-Security` here: TLS terminates at Caddy (ADR-0010), and
+# this app has no verified `X-Forwarded-Proto` trust boundary today — an
+# app-level HSTS header would be an unverifiable claim about a hop this
+# process can't see, so it's a proxy-level decision, not an app one
+# (docs/SECURITY.md records this as a named gap, not a silent one).
+# ---------------------------------------------------------------------------
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
+        response = await call_next(request)
+        # nosniff: stop a browser from MIME-sniffing a response into
+        # executable content — this API never serves anything a browser
+        # should render, so there's no legitimate reason to allow it.
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        # No cross-origin browser page should ever be the one asking this
+        # API a question — a leaked `Referer` header naming an internal
+        # tool URL is pure downside.
+        response.headers["Referrer-Policy"] = "no-referrer"
+        if request.url.path in ("/ask", "/resume"):
+            # `no-store` (never write to ANY cache, including a private
+            # browser/proxy cache) is strictly stronger than the SSE
+            # stream's own `Cache-Control: no-cache` (set by the route
+            # handlers below, for anti-buffering — WHATWG SSE convention,
+            # ADR-0016) — `no-cache` still permits caching as long as the
+            # cache revalidates first, the wrong default for a body that
+            # can carry a redacted-but-still-sensitive answer. This
+            # middleware runs AFTER the route handler already set its own
+            # `Cache-Control`, so this assignment is the one that survives
+            # — `no-store` wins, per this feature's own review (ADR-0030).
+            response.headers["Cache-Control"] = "no-store"
+        return response
 
 
 def _sse(event: str, data: dict) -> str:
@@ -961,6 +1069,9 @@ async def lifespan(app: FastAPI):
     # docstring) — installed once at process startup, before any request
     # can log anything.
     install_pii_scrub()
+    # ADR-0030: same "install once at startup" reasoning for the
+    # request-id-stamping filter above.
+    _install_request_id_filter()
     # ADR-0024: the durable-state pool+saver, opened once for the process's
     # whole lifetime (`build_checkpointer()`'s `async with` closes the pool
     # on the way out of THIS function, i.e. on shutdown) and stored on
@@ -1004,11 +1115,46 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 # SlowAPIMiddleware (not the `@limiter.limit` decorator, see the "Rate
 # limiting" comment above) — real ASGI middleware, runs before routing/auth
 # for every request, so unauthenticated/wrong-key traffic is throttled too.
+# Middleware registration order (ADR-0016's existing two, plus ADR-0030's
+# three below): `Starlette.add_middleware` PREPENDS to the internal list
+# (verified in installed `starlette/applications.py`'s `add_middleware`:
+# `self.user_middleware.insert(0, ...)`), so the LAST call here ends up
+# OUTERMOST at request time. Calling them in this order —
+# SlowAPI, BodySizeLimit, SecurityHeaders, RequestId, TrustedHost — makes
+# the actual outer-to-inner request path: TrustedHost (reject a spoofed/
+# unexpected Host header before spending any other work on the request) ->
+# RequestId (assign the id everything downstream, including a later
+# rejection, gets tagged with) -> SecurityHeaders (decorate every response,
+# including an error one) -> BodySizeLimit -> SlowAPI -> routing.
 app.add_middleware(SlowAPIMiddleware)
 app.add_middleware(BodySizeLimitMiddleware)
+app.add_middleware(SecurityHeadersMiddleware)
+# ADR-0030: `allowed_hosts` defaults to localhost/127.0.0.1 (local dev) plus
+# "testserver" (the fixed `Host` header FastAPI's/httpx's `TestClient`
+# sends unless overridden — verified live: every existing test in this
+# suite uses a bare `TestClient(app)`, which would otherwise start getting
+# 400s from this middleware) — never a wildcard. A real deploy (Railway EU
+# / Hetzner, docs/ARCHITECTURE.md §6) MUST set `ALLOWED_HOSTS` to its real
+# public hostname(s); this default rejects everything else, closing a
+# Host-header-injection class of attack a bare FastAPI app doesn't guard
+# against on its own.
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=settings.allowed_hosts)
+# RequestId is registered LAST → outermost of the app's own middlewares, so
+# even TrustedHost's bad-`Host` 400 rejection carries a correlatable
+# X-Request-ID (review round 1 caught the reversed order). One response
+# class still escapes it, structurally: an exception no handler catches is
+# rendered by Starlette's ServerErrorMiddleware, which is unconditionally
+# outermost of everything — that bare 500 has no request id. Accepted
+# (ADR-0030): every error the app itself produces (401/403/413/422/429/503,
+# SSE error events) is inside this middleware and carries the header.
+app.add_middleware(RequestIdMiddleware)
 # No CORSMiddleware added anywhere in this module — FastAPI has no CORS
 # unless explicitly configured, so the absence of that middleware IS the
-# default-off state (ADR-0016).
+# default-off state (ADR-0016). Deliberate, not an oversight (ADR-0030): no
+# browser is ever expected to call this API cross-origin — it's a
+# key-authenticated, server-to-server API (`X-API-Key`, ADR-0016), so
+# there's no legitimate origin to allow, and permissive CORS would only
+# ever widen the attack surface for zero benefit.
 
 
 @app.exception_handler(RequestValidationError)

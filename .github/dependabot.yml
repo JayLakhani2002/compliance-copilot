@@ -1,0 +1,21 @@
+# .github/dependabot.yml — automated dependency-bump PRs (ADR-0030, Day 25
+# security review). Two ecosystems: `uv` for this project's own Python
+# dependencies (pyproject.toml/uv.lock — verified against GitHub's own docs,
+# Context7 /github/docs, that `uv` is a directly-supported
+# `package-ecosystem` value, not a `pip` workaround), and `github-actions`
+# for the pinned action versions in .github/workflows/ci.yml (e.g.
+# `astral-sh/setup-uv`'s commit-SHA pin) — an outdated Action is as much a
+# supply-chain risk as an outdated library. Weekly, not daily: this is a
+# portfolio project with no on-call, so a bump PR queue that outruns review
+# capacity is worse than a day's extra staleness.
+version: 2
+updates:
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"

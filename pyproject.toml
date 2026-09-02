@@ -41,6 +41,12 @@ dev = [
     "pytest>=8.3",
     "ruff>=0.16",
     "pre-commit>=4.0",
+    # ADR-0030 (Day 25 security review): pre-commit secret-scanning hook.
+    # Chosen over `gitleaks` — pure-Python, installs the same way every
+    # other dev tool here does (`uv sync`), no separate binary-download
+    # step in `.pre-commit-config.yaml` for marginal benefit over this repo's
+    # small, single-language codebase.
+    "detect-secrets>=1.5.0",
 ]
 
 [build-system]
@@ -57,8 +63,10 @@ line-length = 100
 
 [tool.ruff.lint]
 # E = pycodestyle errors, F = pyflakes, I = import sorting (isort),
-# B = flake8-bugbear (common bug patterns), UP = pyupgrade (modern syntax).
-select = ["E", "F", "I", "B", "UP"]
+# B = flake8-bugbear (common bug patterns), UP = pyupgrade (modern syntax),
+# S = flake8-bandit (security lint: hardcoded passwords, weak hashes,
+# `assert` in shipped code, etc. — ADR-0030 security review, Day 25).
+select = ["E", "F", "I", "B", "UP", "S"]
 
 # FastAPI's own `Depends(...)`/`Security(...)` calls as parameter defaults
 # are the documented dependency-injection pattern (api.py), not the mutable-
@@ -66,6 +74,13 @@ select = ["E", "F", "I", "B", "UP"]
 # this exact ruff config to stop flagging it.
 [tool.ruff.lint.flake8-bugbear]
 extend-immutable-calls = ["fastapi.Depends", "fastapi.Security"]
+
+# S101 (assert-statement use) fires on every pytest `assert` — that's the
+# whole test-writing idiom, not a security smell, so it's the one blanket
+# per-file ignore (ADR-0030): every other S finding in tests/ still gets a
+# real fix or a per-line `# noqa: S### — reason`.
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101"]
 
 # Pytest config. Docs: https://docs.pytest.org/en/stable/reference/reference.html#ini-options-ref
 [tool.pytest.ini_options]

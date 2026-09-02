@@ -246,6 +246,16 @@ class Settings(BaseSettings):
     # naive wall-clock deadline gets that wrong).
     request_timeout_s: float = 60.0
 
+    # ADR-0030 (Day 25 security review): `TrustedHostMiddleware`'s
+    # (api.py) allowlist — a request whose `Host` header isn't in this list
+    # gets a 400 before routing even runs. Defaults cover local dev
+    # (localhost/127.0.0.1) and the fixed "testserver" host FastAPI's/
+    # httpx's `TestClient` sends, so the test suite stays green with no
+    # special-casing. A real deploy MUST override this to its actual public
+    # hostname(s) — this default has no wildcard and rejects everything
+    # else, deliberately.
+    allowed_hosts: list[str] = ["localhost", "127.0.0.1", "testserver"]
+
     # ADR-0029: `costing.estimate_cost()`'s USD->EUR multiplier — a
     # point-in-time snapshot (ECB reference rate, 2026-08-30 ≈ 0.92 EUR per
     # USD), NOT a live FX feed. Same staleness discipline as `costing.

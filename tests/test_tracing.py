@@ -101,7 +101,7 @@ def test_importing_tracing_never_imports_langfuse():
         "assert 'langfuse' not in sys.modules\n"
         "print('OK')\n"
     )
-    result = subprocess.run(
+    result = subprocess.run(  # noqa: S603 — args are a hardcoded literal script + sys.executable, not untrusted input
         [sys.executable, "-c", script],
         capture_output=True,
         text=True,

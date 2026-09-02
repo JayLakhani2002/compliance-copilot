@@ -21,7 +21,11 @@ db-init:  ## Create the vector extension, tables, and HNSW index.
 	uv run python -m compliance_copilot.cli init-db
 
 api:  ## Run the FastAPI app locally (needs API_KEY set in .env).
-	uv run uvicorn compliance_copilot.api:app --host 127.0.0.1 --port 8000 --reload
+	# --no-server-header (ADR-0030, Day 25 security review): don't advertise
+	# "uvicorn" + its version in every response's Server header — free
+	# reconnaissance for an attacker fingerprinting this service for a
+	# known CVE, for zero functional benefit.
+	uv run uvicorn compliance_copilot.api:app --host 127.0.0.1 --port 8000 --reload --no-server-header
 
 mcp:  ## Run the MCP server (stdio by default — MCP_TRANSPORT=streamable-http to switch).
 	uv run python -m compliance_copilot.mcp_server
