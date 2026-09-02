@@ -53,7 +53,7 @@ C4Container
     Container_Boundary(vps, "Hetzner VPS (Germany)") {
         Container(caddy, "Caddy", "reverse proxy", "TLS termination, routes api.example.com")
         Container(api, "api", "FastAPI + LangGraph, Python 3.12", "Guardrails, graph orchestration, SSE streaming, API-key auth, rate limiting")
-        Container(mcp, "mcp-server", "Python, mcp SDK v2 (FastMCP-style)", "search_regulation, get_article, cite tools")
+        Container(mcp, "mcp-server", "Python, mcp SDK 1.29.1 (FastMCP)", "search_regulation, get_article, cite tools")
         ContainerDb(pg, "postgres", "PostgreSQL 16 + pgvector", "documents, chunks+embeddings, LangGraph checkpoints, eval results")
         Container(langfuse_web, "langfuse (web+worker)", "Langfuse self-host", "Tracing UI + ingestion API")
         ContainerDb(clickhouse, "clickhouse", "ClickHouse", "Langfuse trace/analytics store (Langfuse's own dependency, not app data)")
@@ -85,26 +85,39 @@ C4Container
 
 A **node** is a Python function that reads and updates shared state; an **edge** decides which node runs next. **Interrupt** means the graph pauses mid-run and waits for external input (a human) before resuming — LangGraph persists the paused state to the Postgres checkpointer so the pause can outlast the process.
 
+**ADR-0024 (Day 19):** the Postgres checkpointer described above is live for *every* run today — `build_graph(checkpointer=...)` compiles with an `AsyncPostgresSaver` in the API/CLI (`InMemorySaver` in unit tests), keyed by the `thread_id` a client sends back on `/ask`. This is what makes a follow-up question ("and what about deployers?") see the prior turn's question/answer, capped to the last 3 turns and rendered into the prompt after the system prompt, before the current excerpts. It is also a prerequisite for `interrupt()` (§ below) — LangGraph raises if `Command(resume=...)` is used without one.
+
+**ADR-0025 (Day 20):** `hitl` is a real node, between `critic` and `guard_out`. It calls `interrupt()` only when the critic ran, did NOT error (a critic-tier outage is fail-open — no pause, same reasoning ADR-0019 gives the classifier's own outage — round 2 fix), AND scored below `settings.critic_confidence_min` — otherwise it is a pass-through. All edges below are the actual compiled graph (`graph/build.py`,
+`grep -rn "add_node" src/compliance_copilot/graph/build.py` is the source of truth).
+
 ```mermaid
 flowchart TD
-    START([START]) --> guard_in[guard_in\nprompt-injection heuristics + Haiku classifier\nPII detection/redaction · topic/scope check]
-    guard_in -- blocked --> refuse_in[refusal response]
-    refuse_in --> guard_out
-    guard_in -- clean --> router[router\nHaiku: classify question type\n+ pick retrieval strategy]
-    router --> retrieve[retrieve\ncalls MCP tools:\nsearch_regulation / get_article]
-    retrieve --> answer[answer\nSonnet drafts answer\nPydantic structured output + citations]
-    answer --> critic[critic\nHaiku LLM-judge: citation exists?\nfaithful to retrieved text? confidence score]
-    critic -- confidence >= threshold --> guard_out[guard_out\ncitation-must-exist check\nPydantic schema validation\nrefusal policy]
-    critic -- confidence < threshold --> hitl[["interrupt()\npause, persist state to Postgres checkpoint,\nsurface draft + reasoning to operator"]]
-    hitl -- operator approves / edits --> guard_out
-    hitl -- operator rejects --> refuse_out[refusal response]
-    refuse_out --> guard_out
+    START([START]) --> guard_in[guard_in\nprompt-injection heuristics + Haiku classifier\nPII detection/redaction]
+    guard_in -- blocked --> refuse[refuse\nfixed refusal text, AnswerSchema shape]
+    guard_in -- clean --> router[router\nHaiku/nano: ai_act / gdpr / both / out_of_scope\nADR-0023]
+    router -- out_of_scope --> refuse
+    router -- ai_act / gdpr / both --> retrieve[retrieve\nMCP client: search_regulation + get_article\nregulation filter from router, ADR-0007/0023]
+    retrieve --> answer[answer\nSonnet/GPT drafts answer\nstructured output + citations\nself-validates, retries once]
+    answer -- citation invalid, retry left --> answer
+    answer -- retries exhausted --> fail[["fail\nraises CitationError"]]
+    answer -- citations valid --> critic[critic\nHaiku/nano LLM-judge: faithful to cited excerpts?\nconfidence score, ADR-0023]
+    critic --> hitl{hitl\nconfidence < critic_confidence_min\nAND critic did not error?\nADR-0025}
+    hitl -- no: disabled, errored, or confident --> guard_out[guard_out\ncanary / scaffold / PII-placeholder leak checks\nscope heuristic · citation-retrieved invariant]
+    hitl -- yes: interrupt(), pause --> paused[["paused\nPostgres checkpoint holds draft + confidence + reasoning\nuntil POST /resume (interrupt_id checked)"]]
+    paused -- approve / edit / reject via /resume --> guard_out
+    refuse --> guard_out
     guard_out --> END([END, streamed to client])
 ```
 
-State carried through the graph (conceptually — the actual `TypedDict`/Pydantic schema is defined in code, not here): the original question, redacted question, classification, retrieved chunks with article IDs, draft answer, citation list, critic confidence score and reasoning, and a running list of guardrail events (for the trace and for the refusal message if one is needed).
+State carried through the graph (conceptually — the actual `TypedDict`/Pydantic schema is defined in code, not here): the original question, redacted question, router label, retrieved chunks with article IDs, draft answer, citation list, critic confidence score and reasoning, and a running list of guardrail events (for the trace and for the refusal message if one is needed).
 
-Why `interrupt()` and not just a low-confidence label in the response: the eval-gated CI pipeline (ADR-0005) measures faithfulness and citation correctness on a golden set, but at *runtime*, on questions outside that golden set, a human review step is the guardrail of last resort before an uncertain legal-adjacent answer reaches a user. This is also the strongest "I built durable, resumable agent state" demonstration for the target job market (see `docs/research/market_research.md`).
+Why `interrupt()` and not just a low-confidence label in the response: the eval-gated CI pipeline (ADR-0005) measures faithfulness and citation correctness on a golden set, but at *runtime*, on questions outside that golden set, a human review step is the guardrail of last resort before an uncertain legal-adjacent answer reaches a user — a label in a response body is something a client can just as easily ignore as read; `interrupt()` structurally cannot continue without a decision. This is also the strongest "I built durable, resumable agent state" demonstration for the target job market (see `docs/research/market_research.md`).
+
+`hitl`'s three resume decisions (ADR-0025) all converge on the SAME `guard_out` gate `refuse`/`answer` already do — an operator's edited text is never exempt from the citation/scaffold/canary/placeholder checks a model's own draft has to pass:
+
+- **approve** — the draft proceeds to `guard_out` unchanged.
+- **edit** — the operator's text replaces the draft's `answer`, but the draft's own (already-validated) `citations` are kept; the resulting `AnswerSchema` still runs through `guard_out` like anything else.
+- **reject** — resolves to the same fixed refusal `refuse_node` produces; not added to conversation history.
 
 ## 5. Request flow (sequence diagram)
 
@@ -126,26 +139,38 @@ sequenceDiagram
         G-->>API: refusal
         API-->>U: SSE: refusal message
     else clean
-        G->>LLM: router classification (Haiku)
-        LLM-->>G: question type + strategy
-        G->>M: search_regulation(query, filters)
-        M->>PG: vector similarity search
-        PG-->>M: top-k chunks + metadata
-        M-->>G: chunks with article refs
-        G->>LLM: draft answer (Sonnet, chunks as context)
-        LLM-->>G: structured answer + citations
-        G->>LLM: critic / LLM-judge (Haiku)
-        LLM-->>G: confidence score + reasoning
-        G-->>LF: trace: full run, cost, latency, scores
-        alt confidence high
-            G->>G: guard_out (citation-exists check, schema validate)
-            G-->>API: final answer
-            API-->>U: SSE: streamed answer + citations
-        else confidence low
-            G->>G: interrupt() — persist checkpoint to PG
-            G-->>API: run paused (thread_id)
-            API-->>U: SSE: "under review" status
-            Note over G,PG: operator resumes later via separate endpoint
+        G->>LLM: router (nano/Haiku): ai_act / gdpr / both / out_of_scope
+        LLM-->>G: regulation label
+        alt out_of_scope
+            G-->>API: refusal (no retrieval spend)
+            API-->>U: SSE: refusal message
+        else in scope
+            G->>M: search_regulation(query, regulation filter)
+            M->>PG: vector similarity search
+            PG-->>M: top-k chunks + metadata
+            M-->>G: chunks with article refs
+            G->>LLM: draft answer (Sonnet, chunks as context)
+            LLM-->>G: structured answer + citations
+            G->>LLM: critic (nano/Haiku): faithful to cited excerpts?
+            LLM-->>G: confidence score + reasoning
+            G-->>LF: trace: full run, cost, latency, scores (incl. critic_faithful/critic_confidence)
+            alt confidence >= critic_confidence_min, critic disabled, or critic errored (ADR-0025 round 2)
+                G->>G: guard_out (citation-exists check, schema validate)
+                G-->>API: final answer
+                API-->>U: SSE: streamed answer + citations
+            else confidence below threshold, critic did NOT error
+                G->>PG: interrupt() — checkpoint holds draft + confidence + reasoning
+                G-->>API: {"__interrupt__": ...}
+                API-->>U: SSE: interrupt {thread_id, interrupt_id, status: "under_review"}
+                Note over U,API: end-user-facing — NO draft/confidence/reasoning<br/>on this channel (ADR-0025 round 2, SHOULD 1);<br/>stream ends here, no final event yet
+                U->>API: POST /resume {thread_id, interrupt_id, decision, edited_answer?}
+                API->>PG: aget_state — validate thread is known, still paused,<br/>and interrupt_id matches the pending one
+                API->>G: graph.astream(Command(resume={decision, edited_answer}))
+                G->>G: hitl resumes: approve/edit/reject -> guard_out
+                G->>G: guard_out (same checks, regardless of who supplied the text)
+                G-->>API: final answer (or fixed refusal, if rejected/blocked)
+                API-->>U: SSE: streamed answer + citations
+            end
         end
     end
 ```
@@ -168,11 +193,12 @@ The most important boundary for a legal-RAG system specifically is #1→#2: ever
 
 | Failure | Detection | Behavior |
 |---|---|---|
-| **LLM timeout / provider 5xx** (Anthropic or Bedrock) | SDK-level timeout/retry (exponential backoff, per ADR-0002's client config) exhausted | Node raises; graph run ends in an `error` state, not a silent partial answer. API returns HTTP 502 with a generic message; full exception + `request_id` goes to structured logs and to the Langfuse trace (marked `error`), never to the user. No partial/unfaithful answer is ever streamed. |
-| **DB down** (Postgres unreachable) | Connection error on first query (retrieval or checkpoint read/write) | Retrieval: graph run fails closed — no answer is generated from an LLM's un-grounded memory, because that would defeat the entire "cite your source" premise of the project. Checkpointing: if a run cannot even *start* a checkpoint, `interrupt()` cannot function — the graph runs without HITL for that request only if the design explicitly allows a checkpointer-less fallback (default: it does **not**; the request fails fast with 503 instead). |
+| **LLM timeout / provider 5xx** (`APITimeoutError`/`APIConnectionError`/`RateLimitError`) | `answer_timeout_s`-bounded SDK call + one explicit SDK retry (`answer_max_retries`, ADR-0028) exhausted | `answer_node` catches it and returns a DEGRADED answer — the retrieved articles' regulation+anchor, zero citations, `degraded: true` on the `final` SSE event — never a bare 500, never a fake confident answer. `guard_out` still runs (canary/scaffold checks apply, citation-shaped checks are exempted the same way a `refused` answer's are); `critic`/`hitl` skip (nothing was drafted to critique); the turn isn't added to conversation history. Full exception class name goes to structured logs and a `degraded` Langfuse score, never a raw exception to the client. Separately, `settings.request_timeout_s` (ADR-0028) bounds the WHOLE request (every node, not just the answer call) via `asyncio.timeout` — its own timeout yields `{"type": "timeout"}` instead. |
+| **DB down** (Postgres unreachable) | `sqlalchemy.exc.OperationalError` on first query (retrieval or checkpoint read/write), or on `/readyz`'s `SELECT 1` (ADR-0028) | Mid-request: `_run_graph_and_stream` catches `OperationalError` specifically (before the generic handler) and emits `{"type": "dependency_unavailable"}` — distinct from a generic `internal_error`, so an operator doesn't need a stack trace to tell "DB is down" from "there's a bug." Retrieval still fails closed either way — no answer is generated from an LLM's un-grounded memory. `GET /readyz` (new, ADR-0028) gives an orchestrator a direct 200/503 readiness probe against the same DB the request path depends on; `/healthz` stays DB-free (a liveness probe must not depend on anything that can fail independently of the process itself — proven by a test that keeps `/healthz` at 200 under the same broken-DB override that 503s `/readyz`). Checkpointing: if a run cannot even *start* a checkpoint, `interrupt()` cannot function — the graph runs without HITL for that request only if the design explicitly allows a checkpointer-less fallback (default: it does **not**; the request fails fast instead). |
 | **Prompt injection detected** (`guard_in`) | Heuristic pattern match + Haiku classifier flags the input | Request refused before it reaches the router node — never reaches retrieval or the main LLM call. Refusal is logged (event, not full raw content) and traced. No retry-with-different-prompt on the same request; the user must resubmit. |
 | **No citation found** (`guard_out`) | Pydantic validator checks every claim in the answer has a matching `article` reference that exists in the retrieved-chunks list from this run (not just "looks like a citation") | Answer is not returned as-is. Two configurable behaviors, chosen at merge time via the golden-set eval, default = **refuse**: return a fixed "I couldn't find a specific article to support this" message rather than emit an uncited legal claim. (Regenerate-once-then-refuse is the stretch option, not the default, to keep the guardrail's behavior simple and auditable.) |
-| **Critic confidence low** | LLM-judge score below threshold | Not a failure exactly — the designed HITL path (§4): `interrupt()`, operator reviews, resumes or rejects. If no operator responds within a configured timeout, the run stays paused (LangGraph checkpoints don't expire on their own) — an ops-facing TODO is to add a background job that auto-expires stale paused runs, out of scope for the 6-week build. |
+| **Critic confidence low** | LLM-judge score below `settings.critic_confidence_min`, AND the critic did NOT error | Not a failure exactly — the shipped HITL path (§4, ADR-0025): `hitl_node` calls `interrupt()`, the run pauses (Postgres checkpoint), `/ask`'s stream ends with an `interrupt` event `{thread_id, interrupt_id, status}` (no draft/confidence/reasoning — round 2, SHOULD 1 — and no `final`), and `POST /resume {thread_id, interrupt_id, decision, edited_answer?}` continues it: approve/edit/reject, all still gated by `guard_out`. A stale/wrong `interrupt_id`, or a `thread_id` that's already paused when `/ask` is called again, is rejected (409) rather than silently superseding a pending review (round 2, BLOCKER 2). If no operator ever resumes it, the run stays paused indefinitely — LangGraph checkpoints don't expire on their own, and no expiry/retention job exists yet (`# ponytail:` in ADR-0025) — an ops-facing TODO, out of scope for the 6-week build. |
+| **Critic tier outage** (rate limit, timeout, provider 5xx during the critic's own LLM call) | `critique()`'s exception path (critic.py), flagged `CriticVerdict.error=True` | Fails OPEN, not to a pause — round 2 fix (ADR-0025, BLOCKER 1): pausing every request during a critic outage would turn a guard-tier outage into a full product outage (same reasoning ADR-0019 already applies to the classifier). The run proceeds straight to `guard_out` (its independent checks still run); a `critic_unavailable` guardrail event is logged and scored so the coverage gap is visible, not hidden. |
 | **Rate limit hit** (slowapi) | Per-API-key request counter | HTTP 429 with `Retry-After` header. No graph run is started — cheapest possible rejection point. |
 | **MCP server unreachable** | Connection/timeout from `langchain-mcp-adapters` client | Treated the same as DB-down for retrieval purposes (the MCP server's tools are the *only* path to Postgres for the graph) — run fails closed, 503. |
 

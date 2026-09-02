@@ -1,0 +1,47 @@
+# ADR-0020 — PII redaction: detect-and-redact with Presidio, one control point in `guard_in`
+
+**Status:** accepted 2026-08-25
+
+## Context
+Users paste real situations into questions, not abstractions: "my client Hans Müller, hans@firma.de, IBAN DE89… — does GDPR let his employer do X?" That sentence contains a name, an email, and a bank account number, none of which the AI Act/GDPR retrieval task needs to answer the legal question. Left unredacted, it leaks in three places: the answer LLM call (crosses the trust boundary out of the EU-hosted VPS to the model provider, `docs/ARCHITECTURE.md` §6 boundary #5), the Langfuse trace, and application logs.
+
+## Options considered
+1. **Detect-and-redact in `guard_in`, before retrieval/LLM/tracing** — `guards/pii.py`: Microsoft Presidio's `AnalyzerEngine` (regex/checksum for email/IBAN/credit-card/IP, spaCy NER for names) finds spans; `AnonymizerEngine` swaps each for a `<TYPE>` placeholder. The redacted text overwrites `question` in graph state — every node downstream (retrieve, answer, tracing) only ever sees it.
+2. **Block outright** — refuse any question containing PII. Rejected: punishes the normal way people ask real legal questions (a name in a hypothetical is not malicious intent), and the answer to "does GDPR let an employer do X to my named client" and "...to `<PERSON>`" is identical, so blocking trades nothing for a real cost.
+3. **Redact at the Langfuse layer only** (`Langfuse(mask=fn)`) — rejected as the *primary* mechanism: it would only clean the trace, leaving the LLM call itself unredacted (the highest-value leak — the third party actually reading the text), and would split "what reaches a trace/log" ownership across two places instead of one. Kept unwired per ADR-0009's existing decision (see `tracing.py`'s comment) — `guard_in`'s redaction is the single point of control; a second, independent mask hook is a defense-in-depth idea worth revisiting only if evidence shows a gap it would close, not a reason to duplicate control ownership today.
+4. **Large spaCy models** (`en_core_web_lg`/`de_core_news_md`, 380MB+) instead of `_sm` — rejected for a single-VPS portfolio deploy: `en_core_web_sm` (12.2 MiB) + `de_core_news_sm` (14.0 MiB) ≈ 26 MiB combined is negligible image weight; the `_sm` models' lower name-recall is an accepted, measured trade (see "Residual risks" below), not an oversight.
+
+## Decision
+Option 1. `guard_in_node` (graph/nodes.py) runs redaction as **layer 3**, after the heuristic detector (ADR-0018, layer 1) and the LLM classifier (ADR-0019, layer 2) have both judged the RAW, un-redacted question — an attacker can't hide an injection payload inside PII-looking text to dodge those checks, since redaction never runs before them. Only a question layers 1–2 have already allowed reaches redaction; a question that's already refusing is never redacted (`refuse_node` never reads `question`).
+
+**Entity set:** `PERSON`, `EMAIL_ADDRESS`, `PHONE_NUMBER`, `IBAN_CODE`, `CREDIT_CARD`, `IP_ADDRESS`. `DATE_TIME`/`LOCATION`/`NRP`/`URL` are excluded by passing `entities=` to `analyze()` (not filtered after the fact) — this corpus's own subject matter is full of dates ("Article 6 enters into force on..."), places, and nationality/political/religious terms that would false-positive constantly; the same `entities=` restriction is what keeps "GDPR"/"AI Act" from being tagged `ORGANIZATION` at all, with no denylist needed for that specific case.
+
+**Score threshold: 0.4, not the researcher-suggested 0.5.** Verified empirically against installed `presidio_analyzer/predefined_recognizers/generic/phone_recognizer.py`: `PhoneRecognizer.SCORE = 0.4` is a hard constant — every phone match scores exactly 0.4 unless a context word ("phone"/"Telefon"/"cell") sits nearby, which a bare pasted number ("+49 151 23456789") never has. At 0.5, PHONE_NUMBER detection silently fails on every realistic case, including this project's own live-test question. 0.4 is still comfortably below every other entity's achieved score here (PERSON 0.85, EMAIL/IBAN/CREDIT_CARD 1.0, IP 0.95), so lowering the global threshold costs nothing on their precision while fixing a real false negative.
+
+**Legal-identifier denylist post-filter:** tokens matching `^(Article|Art\.?|Regulation|Annex|Recital|Chapter|Section)\b`, and all-caps acronyms ≤6 chars, are stripped from analyzer results before anonymizing — cheap defence-in-depth for a phrasing the fixture set didn't happen to hit (empirically, the `entities=` restriction alone already kept the tested fixture set clean; see "Verification" below).
+
+**GDPR anchors:** redacting before the question reaches retrieval/the LLM/a trace directly implements **Art. 5(1)(c) data minimisation** (`gdpr:art_5`) — only the data necessary for the RAG task should propagate downstream, and a pasted name/IBAN is not necessary to answer a regulation question. Making this a mandatory, structural step in `guard_in` (not an opt-in setting a caller can forget) implements **Art. 25 data protection by design and by default** (`gdpr:art_25`).
+
+**Langfuse mask stays unwired** — reaffirming ADR-0009's amendment and `tracing.py`'s existing comment: `guard_in` owns "what reaches a trace/log downstream of the question", not `tracing.py`; a second, independent mask hook there would split that ownership for no measured gain, since the redacted text is already what `graph.astream(...)` passes to the callback handler.
+
+## Why not the others
+Covered inline above per option — block-outright fails the "same answer either way" test; a Langfuse-only mask leaves the highest-value leak (the LLM call) unredacted; large models buy recall this deploy doesn't need at 15x the image cost.
+
+## Verification (empirical findings, not assumed)
+- The full false-positive set ("Article 6", "Art. 3(1)", "CELEX 32024R1689", "Regulation (EU) 2016/679", "GDPR", "AI Act") returns zero entities at threshold 0.4, both with and without the denylist filter active — the `entities=` restriction alone was sufficient on this set.
+- **Mitigated after review — en+de PERSON union.** `redact()` on German text also runs `en_core_web_sm` for PERSON and keeps spans passing a name-shape filter (2–3 capitalised tokens, no leading German determiner such as "Mein"); this catches "Hans Müller" in the sentence below while rejecting the en model's German false positives ("Mein Mandant", "zur Bewertung von Bewerbern" — the latter would have deleted the question's meaning). Legal-identifier filtering is per-token so "GDPR Art. 22" is never treated as a name (review found the whole-span check let it through). Pinned by `test_german_person_name_redacted_via_en_model_union` and `test_german_lowercase_phrase_not_over_redacted`. The original finding, kept for the record:
+- A German name directly preceded by "Mein Mandant" ("Mein Mandant Hans Müller (...)") is **missed entirely** by `de_core_news_sm` — confirmed at `score_threshold=0.0` (zero PERSON candidates returned, not a threshold cutoff). Isolated ("Hans Müller"), or phrased "Mein Mandant ist Hans Müller" / "Hans Müller (...)" without the leading possessive-noun-name run-on, the same model catches it correctly. This is the exact "small-model name recall" gap flagged as an accepted trade in option 4 above, now backed by a concrete reproduction rather than a hypothetical.
+- Invalid-checksum IBANs (`DE00 1234 5678 9012 3456 78`) are correctly **not** flagged as `IBAN_CODE` — Presidio's recognizer validates the mod-97 checksum, not just the shape.
+
+## Security & cost implications
+- **Cost:** spaCy model load (`get_analyzer()`, `lru_cache(maxsize=1)`) is a one-time ~1s-per-language process-startup cost; per-question `analyze()`+`anonymize()` is single-digit milliseconds (measured). Image size: +~60 MiB installed (spacy 22M + en_core_web_sm 15M + de_core_news_sm 22M + presidio_analyzer 1.1M + presidio_anonymizer 0.2M).
+- **Security:** Presidio runs fully offline — no network call, no third party sees the text being analyzed. A logging backstop (`logging_filter.py`'s `PiiScrubFilter`, three compiled regexes: email/IBAN/phone) is installed on the root logger at process startup as defence-in-depth, explicitly NOT the primary control — the primary control is "never log the raw question" (an existing, unconditional rule) plus this feature's redaction running before any node that might log something question-derived.
+- **Residual risk (honest, not hidden):** small-model name recall — see "Verification" above, a real, reproduced miss, not a hypothetical. PII in a language other than EN/DE is not detected at all (`detect_language()` only distinguishes those two, and `get_analyzer()` only has models for them). The German-name case is mitigated by the en+de union above (names of unusual shape — single-token, lowercase, or four-plus tokens — can still be missed); non-EN/DE PII remains unaddressed. Both are visible in this ADR rather than swept under "it works."
+
+## How to reverse
+`PII_REDACTION_ENABLED=false` — `guard_in_node` skips `redact()` entirely, one env var, no code change.
+
+## References
+- `presidio-analyzer`/`presidio-anonymizer` 2.2.364 (PyPI, verified 2026-08-25); Context7 `/data-privacy-stack/presidio`.
+- `en_core_web_sm-3.8.0`/`de_core_news_sm-3.8.0` wheels, `explosion/spacy-models` GitHub Releases.
+- ADR-0006 (guardrail layering), ADR-0009 amendment + `tracing.py` (mask decision), ADR-0018/0019 (layers 1–2), `docs/THREAT_MODEL.md`.

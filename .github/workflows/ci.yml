@@ -13,15 +13,40 @@
 
 name: CI
 
+# `pull_request.types` adds "labeled" (GitHub's default types when `types:`
+# is omitted are opened/synchronize/reopened — verified against
+# docs.github.com/en/actions/using-workflows/events-that-trigger-workflows
+# — so they're listed explicitly here alongside "labeled") so adding the
+# "quality-gate" label to a PR re-triggers this workflow; `answer-quality`'s
+# own `if:` (below) is what actually gates on that label — every other job
+# has no such `if:`, so a normal push/PR still runs them exactly as before.
+# `workflow_dispatch`/`schedule` are `answer-quality`'s other two triggers.
 on:
   push:
     branches: [main, develop]
   pull_request:
     branches: [main, develop]
+    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * *' # nightly answer-quality run (ADR-0017)
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      # No OPENAI_API_KEY in this job. Constructing OpenAIEmbeddings requires a
+      # key even when no call is ever made (FastAPI resolves the embeddings
+      # dependency before body validation, and the MCP lifespan builds it at
+      # startup) — the cached provider constructs key-free and these tests
+      # never embed anything (fakes/monkeypatches). Mirrors quality-gate's env.
+      EMBEDDINGS_PROVIDER: cached
+      # ChatOpenAI also validates key presence at CONSTRUCTION (FastAPI
+      # dependency wiring builds the llm/router/critic clients before any 422
+      # short-circuits). A dummy satisfies construction; no call is ever made
+      # in this job — every test marked `integration` (incl. all real-LLM
+      # tests) is deselected here, so the dummy can never leak into a request.
+      OPENAI_API_KEY: ci-dummy-key-never-used
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -66,6 +91,7 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     env:
+      EMBEDDINGS_PROVIDER: cached  # same reasoning as the test job; real-LLM tests remain key-gated and skip
       # +psycopg driver, matching settings.py's default DSN scheme.
       DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/postgres
       # Explicit disposable test DB (tests/conftest.py's TEST_DATABASE_URL
@@ -90,3 +116,143 @@ jobs:
 
       - name: Integration test (real Postgres + pgvector)
         run: uv run pytest -m integration
+
+  # quality-gate (ADR-0017): the retrieval eval, gated on every PR, with
+  # ZERO OpenAI cost or network call — EMBEDDINGS_PROVIDER=cached swaps in
+  # CachedEmbeddings (both for ingesting the corpus and for embedding the
+  # 30 golden questions at retrieval time), reading REAL vectors committed
+  # under evals/embeddings_cache/ (refreshed locally via `make eval-cache`).
+  # The two raw regulation XHTML files are committed under
+  # evals/corpus_snapshot/ (data/raw/ itself is gitignored) and copied into
+  # data/raw/ so eurlex.py's fetch_xhtml() takes its cache-first, no-network
+  # path (ADR-0012 permits committing this derived/source text).
+  quality-gate:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/postgres
+      # CI only (embeddings.py's get_embeddings()) — no OPENAI_API_KEY in
+      # this job at all, so a fallback to a live API call is impossible,
+      # not just avoided.
+      EMBEDDINGS_PROVIDER: cached
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Copy committed corpus snapshot into data/raw (cache-first fetch, no network)
+        run: |
+          mkdir -p data/raw
+          cp evals/corpus_snapshot/*.xhtml data/raw/
+
+      - name: Init DB
+        run: uv run python -m compliance_copilot.cli init-db
+
+      - name: Ingest both regulations (cached embeddings)
+        run: uv run python -m compliance_copilot.cli ingest --regulation all
+
+      - name: Retrieval quality gate (hit@5 + MRR, cached query embeddings)
+        run: >-
+          uv run python -m evals.run_retrieval_eval
+          --embeddings cached --hit5-min 0.93 --mrr-min 0.80
+
+  # answer-quality (ADR-0017): the LLM-as-judge faithfulness gate. Needs a
+  # real OPENAI_API_KEY (secret) for the answer + judge LLM calls, so it
+  # does NOT run on every push — nightly, on manual dispatch, or on a PR
+  # that's been given the "quality-gate" label (a deliberate, visible
+  # opt-in for a PR that touches prompts/retrieval/judge logic and wants
+  # this checked before merge, without burning API spend on every commit).
+  answer-quality:
+    runs-on: ubuntu-latest
+    # Enumerate the allowed events explicitly: a plain `!= 'pull_request'`
+    # would also match this workflow's `push` trigger and run the paid job
+    # on every merge (found in review).
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'schedule' ||
+      (github.event_name == 'pull_request' &&
+       contains(github.event.pull_request.labels.*.name, 'quality-gate'))
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/postgres
+      # Corpus ingestion still uses the cached corpus vectors (no reason to
+      # spend on re-embedding 587 chunks just to score 10 answers) — only
+      # the answer/judge LLM calls below need OPENAI_API_KEY.
+      EMBEDDINGS_PROVIDER: cached
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Copy committed corpus snapshot into data/raw (cache-first fetch, no network)
+        run: |
+          mkdir -p data/raw
+          cp evals/corpus_snapshot/*.xhtml data/raw/
+
+      - name: Init DB
+        run: uv run python -m compliance_copilot.cli init-db
+
+      - name: Ingest both regulations (cached embeddings)
+        run: uv run python -m compliance_copilot.cli ingest --regulation all
+
+      - name: Answer-quality gate (real LLM + LLM-as-judge)
+        run: uv run python -m evals.run_answer_eval --faithfulness-min 0.8
+
+      # Red-team ASR/FPR gate (ADR-0022): folded into this job, not a new
+      # one — same reasoning as the answer-quality step above (real key,
+      # ingested DB, and same nightly/dispatch/label trigger already here).
+      # The no-key heuristics subset runs on every PR as a plain pytest test
+      # (tests/evals/test_redteam.py) — this is the paid, full-pipeline tier.
+      - name: Red-team gate (ASR/FPR, real LLM)
+        run: >-
+          uv run python -m evals.run_redteam
+          --subset all --asr-max 0.05 --fpr-max 0.10 --json redteam.json
+
+      - name: Upload red-team report
+        # always(): the report is exactly what you need when the gate fails.
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: redteam-report
+          path: redteam.json
