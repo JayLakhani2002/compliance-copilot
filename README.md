@@ -1,15 +1,119 @@
 # Compliance Copilot
 
-Agentic RAG over the EU AI Act and GDPR: an LLM agent that answers compliance
-questions grounded in the actual regulatory text, with retrieval/answer
-quality measured by evals and guardrails enforced against prompt injection
-and hallucination — all gated by CI so a broken change can't merge.
+[![CI](https://github.com/JayLakhani2002/compliance-copilot/actions/workflows/ci.yml/badge.svg)](https://github.com/JayLakhani2002/compliance-copilot/actions/workflows/ci.yml)
 
-**Status:** Phase 1 scaffolding — repo structure, tooling, and CI are in
-place; no application code yet. See `docs/ARCHITECTURE.md` for the system
-design and `docs/research/market_research.md` for why this project was chosen.
+Agentic RAG over the EU AI Act and GDPR: a LangGraph agent that answers
+compliance questions grounded in the actual regulatory text, with every
+citation checked against the excerpt it claims to quote. The differentiator
+isn't the RAG pipeline itself — it's that every release is gated by measured
+evals (retrieval, faithfulness, red-team attack success rate, trajectory),
+guardrails are layered and red-team-tested rather than assumed, and a run
+that pauses for human review survives a process restart rather than losing
+state.
 
-## How to run
+This is a portfolio project, built solo with an AI-assisted builder/reviewer
+workflow (see the footer). It is not a production service handling real
+user data.
+
+## Headline numbers
+
+All measured, none aspirational — see the source column for how to
+reproduce each one.
+
+| Metric | Value | Source |
+|---|---|---|
+| Retrieval hit@5 / MRR | 1.000 / 0.881 | `evals/golden_retrieval.jsonl`, `make quality-gate` — [ADR-0013](docs/decisions/ADR-0013-retrieval-strategy-articles-first.md) |
+| Answer faithfulness (LLM-judge) | 1.000 (n=10) | `make quality-gate` then `uv run python -m evals.run_answer_eval` — [ADR-0017](docs/decisions/ADR-0017-quality-gate-cached-embeddings-custom-judge.md) |
+| Judge calibration vs. human, `faithful` / `relevant` | κ 1.000 / κ 0.634 | n=20, **provisional labels** — [ADR-0027](docs/decisions/ADR-0027-judge-calibration.md), [docs/EVALS.md](docs/EVALS.md) |
+| Red-team attack success rate | 0/40 | `make redteam` — [ADR-0022](docs/decisions/ADR-0022-redteam-asr-gate.md) |
+| Red-team false positive rate | 0/20 | `make redteam` — [ADR-0022](docs/decisions/ADR-0022-redteam-asr-gate.md) |
+| Benign citation errors (after fuzzy-quote fix) | 1/20 (was 6/20) | [ADR-0031](docs/decisions/ADR-0031-fuzzy-quote-matching.md) |
+| Cost | €0.130 / 100 questions (63% cached input) | `make cost-report`, n=10 — [ADR-0029](docs/decisions/ADR-0029-cost-engineering.md) |
+| Unit tests | 426 | `uv run pytest -m "not integration" -q` |
+| ADRs | 33 | `docs/decisions/` |
+
+Two numbers are marked provisional on purpose: the judge-calibration labels
+above are the builder agent's own labels, not a human's — see
+[Limitations](#limitations). Everything else is measured against the
+committed fixtures/corpus in this repo, at the sample sizes stated (n=10 or
+n=20 in most cases) — a snapshot against this project's own history, not a
+claim that generalizes past it.
+
+## Architecture
+
+```mermaid
+flowchart TD
+    START([START]) --> guard_in[guard_in: injection heuristics<br/>+ classifier + PII redaction]
+    guard_in -- blocked --> refuse[refuse]
+    guard_in -- clean --> router[router: ai_act / gdpr / both / out_of_scope]
+    router -- out_of_scope --> refuse
+    router -- in scope --> retrieve[retrieve: MCP search_regulation + get_article]
+    retrieve --> answer[answer: drafts + self-validates citations]
+    answer --> critic[critic: faithfulness + confidence]
+    critic --> hitl{hitl: confident?}
+    hitl -- yes --> guard_out[guard_out: final gate, every path]
+    hitl -- no --> paused[[paused: Postgres checkpoint]]
+    paused -- /resume --> guard_out
+    refuse --> guard_out
+    guard_out --> END([END])
+```
+
+Containers (one Hetzner VPS): **Caddy** (TLS, the only exposed container) →
+**api** (FastAPI + LangGraph; the MCP server runs inside it as a stdio
+subprocess, not a separate container) → **Postgres+pgvector** (documents,
+chunks, LangGraph checkpoints) + a **backup** sidecar. Tracing goes to
+**Langfuse Cloud (EU region)**, not a self-hosted stack. Full diagrams
+(C4 context/container, sequence diagram, trust boundaries, failure-mode
+table) in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+## Five engineering stories
+
+**Evals as merge gates, not a dashboard nobody reads.** Retrieval quality
+(hit@5/MRR) runs on every PR against committed, real, cached embeddings —
+no API key, no network call, no excuse to skip it. Faithfulness and the
+red-team suite need a real key, so they run nightly / on-demand / on a
+labelled PR instead of gating every push, an honest cost tradeoff, not a
+missing gate. [ADR-0005](docs/decisions/ADR-0005-evaluation-pytest-ragas-llm-judge.md) ·
+[ADR-0017](docs/decisions/ADR-0017-quality-gate-cached-embeddings-custom-judge.md) ·
+[ADR-0022](docs/decisions/ADR-0022-redteam-asr-gate.md) ·
+[ADR-0026](docs/decisions/ADR-0026-trajectory-evals.md)
+
+**Layered guardrails, proven by an original red-team set, not assumed.**
+Heuristics → cheap-LLM classifier → PII redaction → a final output gate that
+runs on every path regardless of how a run got there — four independent
+layers, each with its own fixture set. A 40-attack, 20-benign red-team suite
+measures the *stack*, not each layer in isolation, and it found a real gap:
+6/20 benign legal questions were failing citation validation on cosmetic
+punctuation drift, not a security hole — fixed with a two-condition
+fuzzy-match rule (a similarity floor *and* no added words) after a first
+version was reviewed and found to still admit negation flips and appended
+clauses. [ADR-0018](docs/decisions/ADR-0018-input-guard-heuristics.md)–[ADR-0022](docs/decisions/ADR-0022-redteam-asr-gate.md) ·
+[ADR-0031](docs/decisions/ADR-0031-fuzzy-quote-matching.md)
+
+**Durable state and a human-in-the-loop pause that survives a restart.**
+Every run is checkpointed to Postgres, keyed by `thread_id` — a low-confidence
+critic verdict pauses the graph with `interrupt()` instead of shipping an
+uncertain answer, and that pause is a real database row, not in-memory
+state: it outlives a container restart and resumes exactly where it left
+off via `/resume`. [ADR-0024](docs/decisions/ADR-0024-durable-state-postgres-checkpointer.md) ·
+[ADR-0025](docs/decisions/ADR-0025-human-in-the-loop-interrupt.md)
+
+**Tools behind MCP, not hand-rolled into the graph.** Retrieval
+(`search_regulation`, `get_article`, `cite`) is a standalone MCP server, so
+the tool contract is decoupled from the agent framework — any MCP client
+(Claude Desktop, another agent) can point at the same server.
+[ADR-0007](docs/decisions/ADR-0007-tools-via-mcp.md)
+
+**Cost measured, not estimated — and EU residency stated honestly, not
+oversold.** €0.130/100 questions is a real number from a real run, not a
+hand-computed token estimate. The residency story is stated as plainly as
+the architecture doc does: storage and observability are EU by
+construction (Hetzner, Langfuse Cloud EU); inference and embeddings run on
+OpenAI's direct API today (not EU-region-pinned) — the documented
+production path is AWS Bedrock `eu-central-1`, not shipped yet.
+[ADR-0029](docs/decisions/ADR-0029-cost-engineering.md) · [docs/ARCHITECTURE.md §8](docs/ARCHITECTURE.md#8-data-residency-notes)
+
+## Quickstart (dev)
 
 ```bash
 make setup   # uv sync + install the pre-commit git hook (one-time)
@@ -19,12 +123,7 @@ make db-init # create the vector extension, tables, and HNSW index
 make test    # uv run pytest -m "not integration"
 ```
 
-DB integration tests (`tests/test_db_integration.py`) need a real Postgres —
-they're skipped automatically unless `DATABASE_URL` is set, and run in
-GitHub CI's `integration` job against a `pgvector/pgvector:pg16` service
-container regardless of what's set up locally.
-
-## Run the API
+Run the API:
 
 ```bash
 # set API_KEY in .env first (see .env.example)
@@ -33,29 +132,43 @@ curl -sN -X POST localhost:8000/ask -H "Content-Type: application/json" \
   -H "X-API-Key: $API_KEY" -d '{"question":"When is an AI system high-risk?"}'
 ```
 
-Set `LANGFUSE_PUBLIC_KEY`/`LANGFUSE_SECRET_KEY`/`LANGFUSE_BASE_URL` to enable tracing (Langfuse Cloud, EU) — unset by default, so the app runs with zero tracing until you do.
+Set `LANGFUSE_PUBLIC_KEY`/`LANGFUSE_SECRET_KEY`/`LANGFUSE_BASE_URL` to enable
+tracing (Langfuse Cloud, EU) — unset by default, so the app runs with zero
+tracing until you do.
 
-### Health and readiness (ADR-0028)
+## Run in production
+
+See [docs/DEPLOY.md](docs/DEPLOY.md) ([ADR-0033](docs/decisions/ADR-0033-deploy-runbook-and-iac-stub.md))
+for the full Hetzner runbook — provisioning, hardening, DNS, `.env`, first
+run, backup/restore drill, update/rollback, and an EU-residency checklist —
+plus `deploy/deploy.sh` to automate the hardening/install steps, and
+`infra/terraform/` for a validated-but-never-applied AWS `eu-central-1`
+stub.
 
 ```bash
-curl localhost:8000/healthz  # liveness: process alive, no DB/LLM work — "should this container restart?"
-curl localhost:8000/readyz   # readiness: SELECT 1 against Postgres — "should traffic route here?" (200 or 503)
+cp .env.example .env   # fill in real secrets + DEPLOY_HOSTNAME/ALLOWED_HOSTS/POSTGRES_*
+docker compose -f docker-compose.prod.yml up -d
+docker compose -f docker-compose.prod.yml exec api python -m compliance_copilot.cli init-db
+docker compose -f docker-compose.prod.yml exec api python -m compliance_copilot.cli ingest --regulation all
 ```
 
-Both are unauthenticated and unrate-limited (orchestrator probes, not
-product traffic). `/ask` itself degrades gracefully on an answer-model
-outage (a `degraded: true` final event with the retrieved articles listed,
-zero citations) rather than a bare error, and ends the stream with a typed
-`{"type": "timeout"}` event if the whole request runs past
-`REQUEST_TIMEOUT_S` (default 60s) or `{"type": "dependency_unavailable"}` if
-Postgres is unreachable mid-request.
+`docker-compose.prod.yml` ([ADR-0032](docs/decisions/ADR-0032-production-compose.md))
+is the deployed shape: Caddy (TLS, the only exposed container), `api`
+(this repo's `Dockerfile`), `postgres`, and a `backup` sidecar dumping
+daily with 7-day retention (`make backup-now` runs one on demand).
 
-### Conversations (`thread_id`, ADR-0024)
+## API usage
 
-Omit `thread_id` on the first call — the response's very first SSE event is
-`event: thread`, `data: {"thread_id": "<uuid>"}`, the id the server just
-minted. Send that same id back on the next call to continue the
-conversation (up to the last 3 turns are replayed into the prompt):
+Health/readiness ([ADR-0028](docs/decisions/ADR-0028-resilience-timeouts-fallbacks.md)):
+
+```bash
+curl localhost:8000/healthz  # liveness — process alive, no DB/LLM work
+curl localhost:8000/readyz   # readiness — SELECT 1 against Postgres, 200 or 503
+```
+
+**Conversations (`thread_id`).** Omit it on the first call — the response's
+first SSE event is `event: thread`, `data: {"thread_id": "<uuid>"}`. Send
+that id back to continue (last 3 turns replayed into the prompt):
 
 ```bash
 curl -sN -X POST localhost:8000/ask -H "Content-Type: application/json" \
@@ -63,107 +176,34 @@ curl -sN -X POST localhost:8000/ask -H "Content-Type: application/json" \
   -d '{"question":"And what about GDPR?","thread_id":"<uuid from the first response>"}'
 ```
 
-A client-supplied `thread_id` must be a syntactically valid UUID4 (422
-otherwise) — but note this doesn't grant per-caller privacy: this API has
-one shared `X-API-Key`, so any key holder can supply any validly-shaped
-`thread_id` and resume that conversation (ADR-0024's security note, an
-open gap ADR-0016 already named). Erase a conversation's checkpointed state
-with `python -m compliance_copilot.cli delete-thread <uuid>`.
-
-### Human review on low confidence (`interrupt`/`/resume`, ADR-0025)
-
-When the critic scores its confidence in a drafted answer below
-`CRITIC_CONFIDENCE_MIN` (default 0.6) — and the critic itself didn't error;
-a critic-tier outage fails OPEN (no pause), see ADR-0025's round 2 note —
-the run pauses instead of streaming a `final` event. `/ask`'s stream ends
-with:
+**Human review on low confidence (`interrupt`/`/resume`).** When the critic
+scores below `CRITIC_CONFIDENCE_MIN` (default 0.6), the run pauses instead
+of streaming a `final` event:
 
 ```
 event: interrupt
 data: {"thread_id": "<uuid>", "interrupt_id": "...", "status": "under_review"}
 ```
 
-That's deliberately all the END USER sees — no draft, confidence, or
-reasoning on this channel (ADR-0025 round 2). An **operator** reviews the
-full payload via the CLI, which reads it straight off the checkpointed
-state and prints it before applying anything:
+That's deliberately all an end user sees — no draft, confidence, or
+reasoning on this channel. An operator reviews the full payload and
+resolves it:
 
 ```bash
 python -m compliance_copilot.cli resume <thread-id> --decision approve|edit|reject [--answer TEXT]
-# prints: interrupt_id / question / draft answer / critic confidence / critic reasoning
-# THEN applies the decision — the operator sees what they're approving.
+# or: POST /resume {"thread_id":..., "interrupt_id":..., "decision":"approve"|"edit"|"reject", "edited_answer":"..."}
 ```
 
-Or resolve it over the API with `POST /resume` — note `interrupt_id` (from
-the `interrupt` event above) is required:
+`/resume` streams the same events `/ask` does; 404 on an unknown thread,
+409 if it isn't currently paused or `interrupt_id` doesn't match the
+pending review. Full detail (edit semantics, exit codes, the shared-key
+caveat): [ADR-0024](docs/decisions/ADR-0024-durable-state-postgres-checkpointer.md),
+[ADR-0025](docs/decisions/ADR-0025-human-in-the-loop-interrupt.md).
 
-```bash
-curl -sN -X POST localhost:8000/resume -H "Content-Type: application/json" \
-  -H "X-API-Key: $API_KEY" \
-  -d '{"thread_id":"<uuid>","interrupt_id":"<uuid>","decision":"approve"}'
-# or: {"thread_id":"<uuid>","interrupt_id":"<uuid>","decision":"edit","edited_answer":"..."}
-# or: {"thread_id":"<uuid>","interrupt_id":"<uuid>","decision":"reject"}
-```
-
-`/resume` streams the same `node`/`final` events `/ask` does once resumed.
-404 if `thread_id` is unknown; 409 if it isn't currently paused, or if
-`interrupt_id` doesn't match the pending review (a stale reference —
-someone already resumed it, or a later `/ask` re-paused the same thread on
-a different question). `/ask` itself now also 409s if called again with a
-`thread_id` that's currently paused — it never silently starts a new run
-over a pending review. An `edit`'s replacement text still has to pass
-every `guard_out` check a model's own draft does — never trusted just
-because a human wrote it. Same shared-`X-API-Key` caveat as `thread_id`
-above: any key holder who knows/guesses a paused `thread_id`+`interrupt_id`
-pair can resume it (ADR-0016, not solved by this feature). `ask` prints
-`under review (thread_id ...)` instead of an answer when it pauses, and
-409s (exit 9) if you `--thread-id` back into a thread that's already
-paused — run `resume` instead.
-
-## Run in production
-
-See `docs/DEPLOY.md` (ADR-0033) for the full Hetzner runbook — provisioning,
-hardening, DNS, `.env`, first run, backup/restore drill, update/rollback,
-and an EU-residency checklist — plus `deploy/deploy.sh` to automate the
-hardening/install steps, and `infra/terraform/` for a validated-but-never-
-applied AWS `eu-central-1` stub.
-
-`docker-compose.prod.yml` (ADR-0032) is the deployed shape: Caddy (TLS +
-reverse proxy, the only exposed container), `api` (this repo's `Dockerfile`
-— the MCP server runs inside it as a stdio subprocess, ADR-0007, not a
-separate container), `postgres`, and a `backup` sidecar. Langfuse tracing
-(if configured) goes to Langfuse Cloud EU, not a self-hosted service — see
-ADR-0009's amendment.
-
-```bash
-cp .env.example .env   # fill in real secrets + DEPLOY_HOSTNAME/ALLOWED_HOSTS/POSTGRES_* (see comments)
-docker compose -f docker-compose.prod.yml up -d
-docker compose -f docker-compose.prod.yml exec api python -m compliance_copilot.cli init-db
-# Ingest both regulations (one-off; embeds ~590 chunks — this calls the
-# OpenAI embeddings API and costs a few cents, so it needs a funded
-# OPENAI_API_KEY in .env):
-docker compose -f docker-compose.prod.yml exec api python -m compliance_copilot.cli ingest --regulation all
-```
-
-`ALLOWED_HOSTS` must be set to the real public hostname(s) — the compiled-in
-default only accepts `localhost`/`127.0.0.1`/`testserver` and rejects
-everything else (ADR-0030). Backups: the `backup` service dumps `postgres`
-daily to a named volume (`backups`), keeping the last 7 days; `make
-backup-now` runs one on demand. Restore (dump lives in `backup`'s
-container, not `postgres`'s — copy it across first):
-
-```bash
-docker compose -f docker-compose.prod.yml cp backup:/backups/<file>.dump ./restore.dump
-docker compose -f docker-compose.prod.yml cp ./restore.dump postgres:/tmp/restore.dump
-docker compose -f docker-compose.prod.yml exec postgres \
-  pg_restore -U "$POSTGRES_USER" -d "$POSTGRES_DB" --clean /tmp/restore.dump
-```
-
-## MCP server
+### MCP server
 
 `make mcp` starts a standalone MCP server (`search_regulation`, `get_article`,
-`cite`) over stdio — the same tools an MCP client can point at, e.g. Claude
-Desktop's config:
+`cite`) over stdio — pointable from any MCP client, e.g. Claude Desktop:
 
 ```json
 {
@@ -176,20 +216,68 @@ Desktop's config:
 }
 ```
 
-Set `MCP_TRANSPORT=streamable-http` (internal network only — no auth today, see ADR-0007) to switch transports.
+## Eval suite
 
-## Quality gates
+| Command | What it runs | Needs a key? |
+|---|---|---|
+| `make quality-gate` | Retrieval hit@5/MRR, cached embeddings | No |
+| `uv run python -m evals.run_answer_eval` | LLM-judge faithfulness on the golden set | Yes |
+| `make redteam-fast` | Heuristics-only subset, 20+ attacks, plain pytest | No |
+| `make redteam` | Full 40-attack + 20-benign pipeline, ASR/FPR gate | Yes |
+| `make calibration` | Judge-vs-human agreement (κ) report | No (report step) |
+| `make cost-report` | €/question, cached-token fraction | Yes |
+| `make eval-cache` | Refresh committed embedding cache after a golden-set/corpus change | Yes |
 
-Two CI gates: **`quality-gate`** (retrieval hit@5/MRR) runs on every PR against
-committed, real, cached embeddings — no API key, no network call. **`answer-quality`**
-(LLM-as-judge faithfulness) needs a real key, so it only runs nightly, on
-manual dispatch, or on a PR labelled `quality-gate`. Refresh the committed
-embedding cache after changing the golden sets, the corpus, or the embedding
-model with `make eval-cache` (needs `OPENAI_API_KEY`); run the gates locally
-with `make quality-gate` and `uv run python -m evals.run_answer_eval`.
+Every gate, threshold, and where it runs: [docs/EVALS.md](docs/EVALS.md).
 
-A third gate, the **red-team ASR/FPR check** (ADR-0022), runs 40 original attacks
-against the full guard stack: a no-key heuristics subset (`make redteam-fast`) is a
-plain pytest test that runs on every PR for free, and the full-pipeline run
-(`make redteam`, needs `OPENAI_API_KEY`) folds into the same `answer-quality` CI job.
-Gate: ASR ≤ 5%, FPR ≤ 10%.
+## Project structure
+
+```
+src/compliance_copilot/
+  graph/          LangGraph nodes + build (guard_in, router, retrieve, answer, critic, hitl, guard_out)
+  guards/         injection heuristics, PII redaction, output guard, quote matching
+  ingest/         EUR-Lex fetch + chunk + embed pipeline
+  api.py          FastAPI app: /ask, /resume, /healthz, /readyz
+  cli.py          ask / resume / delete-thread / ingest / init-db
+  mcp_server.py   search_regulation / get_article / cite, over MCP
+  checkpointer.py Postgres-backed LangGraph checkpointer
+  router.py critic.py  cheap-LLM nodes (scope routing, faithfulness scoring)
+  costing.py      per-model pricing + cost estimation
+evals/            golden sets, red-team set, judge, cost report, calibration
+tests/            426 unit tests + integration tests (pytest -m integration)
+docs/decisions/   33 ADRs — the record of every non-trivial choice
+```
+
+## Limitations
+
+Named on purpose, not discovered by a reviewer — full detail in
+[docs/SECURITY.md](docs/SECURITY.md).
+
+- **One shared API key.** No per-caller identity — any key holder can
+  resume or read any `thread_id`'s conversation. Fine for a single-tenant
+  portfolio deployment; would need per-caller keys to close.
+  ([ADR-0016](docs/decisions/ADR-0016-api-streaming-auth-ratelimit.md))
+- **A paused human-review run never expires.** No TTL on a checkpointed
+  pause — a thread nobody resumes stays paused indefinitely. Add a cleanup
+  job when real traffic makes stale pauses accumulate.
+  ([ADR-0025](docs/decisions/ADR-0025-human-in-the-loop-interrupt.md))
+- **Judge calibration is provisional.** The κ numbers above are the coder
+  agent's own labels, not a human reviewer's — they prove the calibration pipeline works
+  end to end, not that the judge is validated against a careful human read.
+  ([ADR-0027](docs/decisions/ADR-0027-judge-calibration.md))
+- **MCP per-call session spawns can wedge under load.** Observed after
+  15–20 tool calls in one run; the request-wide timeout bounds how long a
+  request waits but doesn't fix the underlying transport issue — backlogged
+  as a persistent shared MCP session or a hard PID-level kill.
+  ([ADR-0029](docs/decisions/ADR-0029-cost-engineering.md))
+- **Deploy is dry-validated, not run against a real server.** The Hetzner
+  runbook is written and reviewed against the compose file and official
+  docs, but no VPS has actually run it yet.
+  ([docs/DEPLOY.md](docs/DEPLOY.md))
+
+## How this was built
+
+Built solo with an AI-assisted builder/reviewer workflow: Claude drafted
+code and docs from specs written for each feature, a separate review pass
+caught real issues (see ADR-0025's round 2, ADR-0031's round 2), and every
+non-trivial decision is recorded as an ADR rather than left implicit.
