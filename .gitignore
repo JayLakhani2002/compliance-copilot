@@ -34,6 +34,14 @@ data/raw/
 .vscode/
 .idea/
 
+# Terraform (infra/terraform/ — ADR-0033): local plan/provider cache, never
+# committed. .terraform.lock.hcl IS committed (pins provider versions).
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+
 # Local-only workflow/teaching files (kept on disk, never published)
 TEACHER.md
 PROMPT.md

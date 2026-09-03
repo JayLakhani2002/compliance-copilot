@@ -122,6 +122,12 @@ paused — run `resume` instead.
 
 ## Run in production
 
+See `docs/DEPLOY.md` (ADR-0033) for the full Hetzner runbook — provisioning,
+hardening, DNS, `.env`, first run, backup/restore drill, update/rollback,
+and an EU-residency checklist — plus `deploy/deploy.sh` to automate the
+hardening/install steps, and `infra/terraform/` for a validated-but-never-
+applied AWS `eu-central-1` stub.
+
 `docker-compose.prod.yml` (ADR-0032) is the deployed shape: Caddy (TLS +
 reverse proxy, the only exposed container), `api` (this repo's `Dockerfile`
 — the MCP server runs inside it as a stdio subprocess, ADR-0007, not a
