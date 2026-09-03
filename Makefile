@@ -1,7 +1,7 @@
 # Makefile — shortcuts for the commands you'll run most while developing.
 # Run `make <target>` from the repo root.
 
-.PHONY: setup lint test db-up db-init api mcp eval-cache quality-gate redteam redteam-fast calibration calibration-build cost-report
+.PHONY: setup lint test db-up db-init api mcp eval-cache quality-gate redteam redteam-fast calibration calibration-build cost-report backup-now
 
 setup:  ## Install deps (incl. dev tools) and enable the pre-commit git hook.
 	uv sync
@@ -50,3 +50,7 @@ calibration:  ## Judge-vs-human agreement report — reads existing evals/calibr
 
 cost-report:  ## Measured €/question over the golden set — full call shape, real spend (ADR-0029).
 	uv run python -m evals.run_cost_report
+
+backup-now:  ## Run an on-demand pg_dump into the prod `backups` volume (ADR-0032).
+	docker compose -f docker-compose.prod.yml exec -T backup sh -c \
+		'pg_dump -h postgres -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -F c -f "/backups/$$(date +%F-%H%M).dump"'

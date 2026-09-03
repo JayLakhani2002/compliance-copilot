@@ -1,0 +1,25 @@
+# .dockerignore — keeps the build context small and never sends .env/.git
+# to the daemon. The Dockerfile only COPYs pyproject.toml/uv.lock/src/
+# explicitly, so nothing here changes what ends up IN the image — this is
+# purely about not uploading gigabytes of local cruft on every `docker build`.
+.git/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.env
+.env.*
+!.env.example
+chathistory/
+docs/handoffs/
+docs/lessons/
+evals/embeddings_cache/
+data/
+
+# review NITs: never in the image even if COPY widens later
+tests/
+CLAUDE.md
+PROMPT.md
+TEACHER.md
+docs/CURRICULUM.md
