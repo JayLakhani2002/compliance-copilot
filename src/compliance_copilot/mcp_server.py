@@ -30,7 +30,7 @@ from sqlalchemy.orm import Session
 
 from compliance_copilot.db import Chunk, Document, get_engine
 from compliance_copilot.embeddings import get_embeddings
-from compliance_copilot.guards.quotes import _MIN_QUOTE_LENGTH, _normalise
+from compliance_copilot.guards.quotes import _MIN_QUOTE_LENGTH, _normalise, quote_matches
 from compliance_copilot.retriever import retrieve
 from compliance_copilot.settings import settings
 
@@ -173,12 +173,12 @@ def cite(
     ctx: Context,
 ) -> dict[str, Any]:
     """Checks whether `quote` appears verbatim (whitespace/case/quote-style
-    insensitive) in the given article or recital, across all of its stored
-    parts.
+    insensitive), or close enough to verbatim after cosmetic drift, in the
+    given article or recital, across all of its stored parts.
 
     regulation: which regulation the anchor belongs to.
     anchor: the article/recital anchor id, e.g. "art_6".
-    quote: the exact excerpt to verify — at least 20 characters after
+    quote: the excerpt to verify — at least 20 characters after
     normalisation.
     """
     if not _ANCHOR_RE.match(anchor):
@@ -193,18 +193,23 @@ def cite(
         parts = session.execute(stmt).scalars().all()
     if not parts:
         return {"valid": False, "reason": "not found"}
-    # Reuses guards/quotes.py's normalisation (same whitespace/case/curly-
-    # quote handling and minimum-length floor `answer_node` (graph/nodes.py)
-    # already enforces) rather than a second implementation that could
-    # silently drift from it (ADR-0007's Day-17 amendment: moved out of
-    # graph.nodes so this server process doesn't import langchain-anthropic/
-    # langchain-openai just for a string-normalisation helper).
+    # Reuses guards/quotes.py's normalisation AND fuzzy fallback (ADR-0031)
+    # — same minimum-length floor and the SAME `quote_matches` function
+    # `_validate_citations` (graph/nodes.py) calls, rather than a second
+    # implementation that could silently drift from it (ADR-0007's Day-17
+    # amendment: moved out of graph.nodes so this server process doesn't
+    # import langchain-anthropic/langchain-openai just for a string-
+    # normalisation helper; ADR-0031 keeps that "one function, two callers"
+    # contract for the fuzzy fallback too).
     normalised_quote = _normalise(quote)
     if len(normalised_quote) < _MIN_QUOTE_LENGTH:
         return {"valid": False, "reason": "quote too short to verify"}
-    if any(normalised_quote in _normalise(text) for text in parts):
-        return {"valid": True, "reason": None}
-    return {"valid": False, "reason": "quote not found verbatim"}
+    matches = [quote_matches(quote, text) for text in parts]
+    if any(m.ok for m in matches):
+        fuzzy_hit = next((m for m in matches if m.ok and m.score is not None), None)
+        reason = f"fuzzy match, score={fuzzy_hit.score:.3f}" if fuzzy_hit else None
+        return {"valid": True, "reason": reason}
+    return {"valid": False, "reason": "quote not found verbatim or close enough"}
 
 
 def main() -> None:

@@ -97,7 +97,10 @@ def test_cite_valid_and_invalid_against_real_fixture_text(patched_mcp):
             },
         )
     )
-    assert invalid.structuredContent == {"valid": False, "reason": "quote not found verbatim"}
+    assert invalid.structuredContent == {
+        "valid": False,
+        "reason": "quote not found verbatim or close enough",
+    }
 
 
 def test_stdio_roundtrip_list_tools_and_get_article(test_engine, fixture_regulations):

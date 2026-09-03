@@ -132,6 +132,55 @@ def test_quote_with_different_whitespace_and_case_still_passes():
     assert state["answer"] is answer
 
 
+def test_quote_with_cosmetic_drift_passes_via_fuzzy_fallback_and_logs_event(caplog):
+    """ADR-0031: a genuine quote with a cosmetic punctuation drift (an
+    inserted comma) fails the exact substring check but must still pass
+    through `_validate_citations`'s fuzzy fallback — and the acceptance
+    must be logged as a `quote_fuzzy_match` guardrail event with a score,
+    never the quote text itself (same "safe to log" rule every other
+    guardrail event in nodes.py already follows)."""
+    answer = AnswerSchema(
+        answer="...",
+        citations=[
+            Citation(
+                regulation="ai_act",
+                anchor="art_6",
+                quote="An AI system shall be considered high-risk, where it is a safety component",
+            )
+        ],
+    )
+    with caplog.at_level("INFO"):
+        state = _run(FakeLLM(answer))  # must not raise
+    assert state["answer"] is answer
+
+    fuzzy_logs = [r for r in caplog.records if "quote_fuzzy_match" in r.message]
+    assert len(fuzzy_logs) == 1
+    assert "art_6" in fuzzy_logs[0].message
+    assert "score=" in fuzzy_logs[0].message
+    # Never leak the quote text into a log line meant to be safe to ship to
+    # Langfuse/an operator (ADR-0009's per-guardrail-event logging rule).
+    assert "safety component" not in fuzzy_logs[0].message
+
+
+def test_hallucinated_quote_still_fails_despite_fuzzy_fallback():
+    """The fuzzy fallback's whole point is tolerating COSMETIC drift, never
+    semantic drift — a fabricated quote with no real basis in the cited
+    excerpt must still raise `CitationError`, exactly like the pre-ADR-0031
+    exact-only check did."""
+    answer = AnswerSchema(
+        answer="...",
+        citations=[
+            Citation(
+                regulation="ai_act",
+                anchor="art_6",
+                quote="providers must delete all training data within 24 hours of deployment",
+            )
+        ],
+    )
+    with pytest.raises(CitationError, match="art_6"):
+        _run(FakeLLM(answer))
+
+
 def test_prompt_contains_article_text_recital_heading_and_question():
     answer = AnswerSchema(answer="...", citations=[])
     llm = FakeLLM(answer)
