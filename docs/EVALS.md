@@ -20,6 +20,15 @@ changes, update the flag in its source file first, then this table.
 | Judge calibration (LLM-judge vs. human) | Cohen's κ, raw agreement, dangerous-cell count, per rubric dimension | report-only by default (`--kappa-min` opt-in, unset today) | `make calibration` / `evals/run_judge_calibration.py` — manual, not in CI | Report step is free; regenerating the 20-item set (`make calibration-build`) costs a few cents (ADR-0027) |
 | Cost report | €/question, €/100 questions, cached-token fraction | report-only, no gate | `make cost-report` / `evals/run_cost_report.py` — manual, not in CI | Real LLM spend, ~$0.01–0.02/run (ADR-0029) |
 
+**Context for the two rows above (ADR-0031, 2026-09-02):** the red-team
+row's own `benign_citation_error_rate` — reported alongside FPR, not gated
+by it (ADR-0022) — measured 0.300 (6/20) before `guards/quotes.py` gained a
+high-floor `difflib` fuzzy fallback for cosmetic quote drift (punctuation,
+whitespace, a dropped marker); the same fragility was also golden item
+c01's failure in the faithfulness row above. Neither row's *threshold*
+changed (ASR ≤ 0.05, FPR ≤ 0.10, faithfulness ≥ 0.8 are unchanged) — see
+ADR-0031 for this session's measured before/after numbers.
+
 ## A gap worth naming, not rounding away
 
 The CI `integration` job (`.github/workflows/ci.yml`) runs `pytest -m

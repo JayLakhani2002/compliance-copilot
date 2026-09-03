@@ -265,5 +265,19 @@ class Settings(BaseSettings):
     # FX API, no live feed dependency for a number this small).
     eur_usd_rate: float = 0.92
 
+    # ADR-0031: `guards/quotes.py`'s `quote_matches()` fuzzy-fallback floor —
+    # a citation whose quote misses the exact normalised-substring check
+    # (ADR-0014's `_normalise`) is accepted only when its best windowed
+    # `difflib.SequenceMatcher` similarity is >= this. 0.92 is the tuned
+    # value from ADR-0031's measured fixture search: high enough that every
+    # adversarial fixture tried (wrong-meaning same-words, spliced
+    # half-sentences, cross-article quotes) scores below it, low enough to
+    # accept the realistic cosmetic-drift fixtures (punctuation swap,
+    # collapsed ellipsis, whitespace/newline drift, a dropped "(1)" marker).
+    # One-line kill switch back to verbatim-only: 1.0 — no fuzzy score ever
+    # reaches exactly 1.0 short of a match the exact substring check would
+    # already have caught, so this value alone is "fuzzy fallback disabled."
+    quote_similarity_min: float = 0.92
+
 
 settings = Settings()

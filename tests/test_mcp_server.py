@@ -161,7 +161,7 @@ def test_cite_valid_quote(monkeypatch):
 def test_cite_invalid_quote_not_found(monkeypatch):
     _patch_session(monkeypatch, ["An AI system shall be considered high-risk where necessary."])
     result = cite("ai_act", "art_6", "this text was never in the source", FakeCtx())
-    assert result == {"valid": False, "reason": "quote not found verbatim"}
+    assert result == {"valid": False, "reason": "quote not found verbatim or close enough"}
 
 
 def test_cite_quote_too_short(monkeypatch):

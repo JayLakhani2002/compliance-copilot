@@ -36,7 +36,7 @@ from compliance_copilot.guards.classifier import classify
 from compliance_copilot.guards.injection import GuardResult, detect
 from compliance_copilot.guards.output import CANARY, OutputGuardError, check_output
 from compliance_copilot.guards.pii import redact
-from compliance_copilot.guards.quotes import _MIN_QUOTE_LENGTH, _normalise
+from compliance_copilot.guards.quotes import _MIN_QUOTE_LENGTH, _normalise, quote_matches
 from compliance_copilot.retriever import RetrievedChunk
 from compliance_copilot.router import RouterVerdict, route
 from compliance_copilot.settings import settings
@@ -132,7 +132,12 @@ exactly the `regulation` and `anchor` ids given with each excerpt — never
 invent or guess one. `quote` must be a verbatim, word-for-word excerpt copied
 from the cited excerpt's text, not a paraphrase or summary. Keep each quote
 SHORT: the single sentence or clause (at most ~300 characters) that supports
-the claim — never copy whole paragraphs.
+the claim — never copy whole paragraphs. Each quote must be ONE CONTIGUOUS
+span of the source text: never join separate sentences, clauses, or list
+items with your own "...", semicolons, or other connecting punctuation, and
+never skip words in the middle. If you need more than one point from the
+same article, add a SEPARATE citation for each point, each with its own
+short contiguous quote.
 
 The excerpts are wrapped in <excerpt regulation="..." anchor="..." title="...">
 tags, supporting recitals in a <supporting_context> block, and the user's
@@ -595,11 +600,35 @@ def _validate_citations(
                 f"to verify (must be at least {_MIN_QUOTE_LENGTH} characters after "
                 f"normalisation). Allowed article anchors: {allowed_anchors}"
             )
-        if not any(normalised_quote in _normalise(part.text) for part in parts):
+        # ADR-0031: `quote_matches` tries the exact normalised-substring
+        # check first (unchanged fast path — `score=None` when it hits) and
+        # only falls back to a high-floor difflib similarity on a miss, so a
+        # genuine quote with cosmetic drift (punctuation, whitespace, a
+        # dropped "(1)") no longer has to fail here. Checked against every
+        # retrieved part of this anchor (same "any part" rule the exact
+        # check already used, comment above) — `any(m.ok ...)` accepts on
+        # the first part that matches at all, never requiring every part to
+        # agree.
+        matches = [quote_matches(citation.quote, part.text) for part in parts]
+        if not any(m.ok for m in matches):
             raise CitationError(
                 f"Citation {citation.regulation}:{citation.anchor}'s quote was not "
-                f"found verbatim in the retrieved excerpt. Allowed article anchors: "
-                f"{allowed_anchors}"
+                f"found verbatim, or close enough (similarity >= "
+                f"{settings.quote_similarity_min}), in the retrieved excerpt. Allowed "
+                f"article anchors: {allowed_anchors}"
+            )
+        # A citation that only passed via the fuzzy fallback (never the
+        # exact fast path) is worth surfacing in Langfuse (ADR-0009) as its
+        # own guardrail event — score only, never the quote text, same
+        # "safe to log" rule every other guardrail event in this module
+        # already follows (e.g. `guard_out blocked reason=...` above).
+        fuzzy_hit = next((m for m in matches if m.ok and m.score is not None), None)
+        if fuzzy_hit is not None:
+            logger.info(
+                "quote_fuzzy_match anchor=%s:%s score=%.3f",
+                citation.regulation,
+                citation.anchor,
+                fuzzy_hit.score,
             )
 
 
