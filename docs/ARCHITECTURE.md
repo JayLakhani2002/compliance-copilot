@@ -44,6 +44,17 @@ C4Context
 
 "Container" here means a deployable unit (a Docker container, in this project's case — the C4 term predates Docker and just means "a separately runnable/deployable thing"), not a database table.
 
+**This is the shipped shape (ADR-0032, Day 26).** It supersedes an earlier
+version of this diagram that included a self-hosted Langfuse stack
+(`langfuse` web/worker + `clickhouse` + `redis` + `minio`) — per ADR-0009's
+planner amendment, Langfuse runs in **Langfuse Cloud (EU region)**, an
+external system this project calls over HTTPS, not a container it deploys.
+The MCP server (ADR-0007) is also **not a separate container**: `mcp_server.py`
+runs as a stdio subprocess spawned BY the `api` container's own process
+(`graph/build.py`'s `_mcp_connection()`), sharing its filesystem/network
+namespace — there's nothing else to route to it, so it isn't drawn as its
+own box.
+
 ```mermaid
 C4Container
     title Compliance Copilot — Containers (Docker Compose, one Hetzner VPS)
@@ -51,35 +62,35 @@ C4Container
     Person(user, "User")
 
     Container_Boundary(vps, "Hetzner VPS (Germany)") {
-        Container(caddy, "Caddy", "reverse proxy", "TLS termination, routes api.example.com")
-        Container(api, "api", "FastAPI + LangGraph, Python 3.12", "Guardrails, graph orchestration, SSE streaming, API-key auth, rate limiting")
-        Container(mcp, "mcp-server", "Python, mcp SDK 1.29.1 (FastMCP)", "search_regulation, get_article, cite tools")
-        ContainerDb(pg, "postgres", "PostgreSQL 16 + pgvector", "documents, chunks+embeddings, LangGraph checkpoints, eval results")
-        Container(langfuse_web, "langfuse (web+worker)", "Langfuse self-host", "Tracing UI + ingestion API")
-        ContainerDb(clickhouse, "clickhouse", "ClickHouse", "Langfuse trace/analytics store (Langfuse's own dependency, not app data)")
-        ContainerDb(redis, "redis", "Redis", "Langfuse cache/queue (Langfuse's own dependency)")
-        ContainerDb(minio, "minio", "S3-compatible object store", "Langfuse blob storage for large trace payloads")
+        Container(caddy, "Caddy", "reverse proxy", "TLS termination (Let's Encrypt), routes DEPLOY_HOSTNAME, HSTS")
+        Container(api, "api", "FastAPI + LangGraph, Python 3.12", "Guardrails, graph orchestration, SSE streaming, API-key auth, rate limiting; spawns mcp_server.py as a stdio subprocess of itself (ADR-0007) — not a separate container")
+        ContainerDb(pg, "postgres", "PostgreSQL 16 + pgvector", "documents, chunks+embeddings, LangGraph checkpoints, eval results — no host port published")
+        Container(backup, "backup", "pg_dump sidecar", "daily dump to a named volume, 7-day retention")
     }
 
+    System_Ext(langfuse_cloud, "Langfuse Cloud (EU region, cloud.langfuse.com)")
     System_Ext(anthropic, "Anthropic API / Bedrock eu-central-1")
     System_Ext(embed, "Embeddings API")
     System_Ext(eurlex, "EUR-Lex")
 
     Rel(user, caddy, "HTTPS")
-    Rel(caddy, api, "HTTP, internal network")
-    Rel(api, mcp, "MCP over stdio or streamable-http, internal network")
-    Rel(api, pg, "asyncpg / SQLAlchemy")
-    Rel(mcp, pg, "reads chunks+embeddings")
-    Rel(api, langfuse_web, "trace + score events (LangChain callback)")
-    Rel(langfuse_web, clickhouse, "writes traces")
-    Rel(langfuse_web, redis, "queue")
-    Rel(langfuse_web, minio, "blob storage")
+    Rel(caddy, api, "HTTP, internal network only")
+    Rel(api, pg, "psycopg / SQLAlchemy")
+    Rel(backup, pg, "pg_dump, internal network only")
+    Rel(api, langfuse_cloud, "trace + score events (LangChain callback), HTTPS")
     Rel(api, anthropic, "chat completions")
     Rel(api, embed, "query embedding")
-    Rel(mcp, eurlex, "ingestion job only, offline")
+    Rel(api, eurlex, "ingestion job only, offline, run manually — not a compose service")
 ```
 
-**Note on ADR-0003 ("Postgres is the one database"):** that decision is true for *application* data — documents, chunks/embeddings, LangGraph checkpoints, and eval results all live in the single `postgres` container. It is not true for the full deployed stack: self-hosted Langfuse (ADR-0009) brings its own ClickHouse, Redis, and S3-compatible blob store as hard dependencies of the Langfuse product, not something this project chose to add. See ADR-0003 §"Why not the others" and ADR-0009 for the full explanation, and §7 below for the resulting VPS sizing impact.
+**Note on ADR-0003 ("Postgres is the one database"):** unchanged and now
+simpler to state than the pre-amendment version above: `postgres` is the
+*only* stateful service this project deploys — no ClickHouse/Redis/MinIO,
+because Langfuse Cloud EU (ADR-0009's amendment) is an external SaaS this
+project calls, not a self-hosted dependency it runs. `backup`'s pg_dump
+volume is a second place *application* data (a copy, not a second live
+store) exists, not a second database. See ADR-0032 for the compose shape
+and ADR-0010's amendment for the resulting (smaller) VPS sizing.
 
 ## 4. The LangGraph graph
 

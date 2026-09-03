@@ -104,9 +104,19 @@ def fail_node(state: GraphState) -> dict:
 def _mcp_connection() -> dict[str, Any]:
     """The stdio connection config for `MultiServerMCPClient` (ADR-0007's
     Day-17 amendment) — spawns `python -m compliance_copilot.mcp_server` as
-    a subprocess via `uv run --frozen` (never re-resolves/re-locks the
+    a subprocess.
+
+    Dev/CI: `uv run --frozen python -m ...` (never re-resolves/re-locks the
     environment on every graph invocation — the lockfile is already
-    committed, so this is a pure perf/determinism win).
+    committed, so this is a pure perf/determinism win). ADR-0032: the
+    production image has no `uv` binary at all (multi-stage build copies
+    only the synced `.venv`, not the `uv` tool) — `settings.mcp_use_uv_run`
+    (default `True`, matching every environment before this ADR) switches
+    to a bare `python -m ...` spawn when `False`, which is exactly as valid
+    since the venv the API process itself runs in already has the package
+    installed. The Dockerfile sets `MCP_USE_UV_RUN=false` at the image
+    level (not per-deploy env) — this is a fact about what the image
+    contains, not a per-environment tuning knob.
 
     `env=dict(os.environ)`, not a curated allowlist: the stdio SDK only
     inherits a small OS-dependent safe subset by default (verified in the
@@ -115,11 +125,16 @@ def _mcp_connection() -> dict[str, Any]:
     the same full-passthrough-plus-override pattern
     `tests/test_mcp_server_integration.py`'s stdio subprocess test already
     uses, reused here rather than re-inventing a second allowlist."""
+    command, *args = (
+        ["uv", "run", "--frozen", "python", "-m", "compliance_copilot.mcp_server"]
+        if settings.mcp_use_uv_run
+        else ["python", "-m", "compliance_copilot.mcp_server"]
+    )
     return {
         "copilot": {
             "transport": "stdio",
-            "command": "uv",
-            "args": ["run", "--frozen", "python", "-m", "compliance_copilot.mcp_server"],
+            "command": command,
+            "args": args,
             "env": dict(os.environ),
             "cwd": os.getcwd(),
         }

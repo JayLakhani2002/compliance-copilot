@@ -120,6 +120,39 @@ pair can resume it (ADR-0016, not solved by this feature). `ask` prints
 409s (exit 9) if you `--thread-id` back into a thread that's already
 paused — run `resume` instead.
 
+## Run in production
+
+`docker-compose.prod.yml` (ADR-0032) is the deployed shape: Caddy (TLS +
+reverse proxy, the only exposed container), `api` (this repo's `Dockerfile`
+— the MCP server runs inside it as a stdio subprocess, ADR-0007, not a
+separate container), `postgres`, and a `backup` sidecar. Langfuse tracing
+(if configured) goes to Langfuse Cloud EU, not a self-hosted service — see
+ADR-0009's amendment.
+
+```bash
+cp .env.example .env   # fill in real secrets + DEPLOY_HOSTNAME/ALLOWED_HOSTS/POSTGRES_* (see comments)
+docker compose -f docker-compose.prod.yml up -d
+docker compose -f docker-compose.prod.yml exec api python -m compliance_copilot.cli init-db
+# Ingest both regulations (one-off; embeds ~590 chunks — this calls the
+# OpenAI embeddings API and costs a few cents, so it needs a funded
+# OPENAI_API_KEY in .env):
+docker compose -f docker-compose.prod.yml exec api python -m compliance_copilot.cli ingest --regulation all
+```
+
+`ALLOWED_HOSTS` must be set to the real public hostname(s) — the compiled-in
+default only accepts `localhost`/`127.0.0.1`/`testserver` and rejects
+everything else (ADR-0030). Backups: the `backup` service dumps `postgres`
+daily to a named volume (`backups`), keeping the last 7 days; `make
+backup-now` runs one on demand. Restore (dump lives in `backup`'s
+container, not `postgres`'s — copy it across first):
+
+```bash
+docker compose -f docker-compose.prod.yml cp backup:/backups/<file>.dump ./restore.dump
+docker compose -f docker-compose.prod.yml cp ./restore.dump postgres:/tmp/restore.dump
+docker compose -f docker-compose.prod.yml exec postgres \
+  pg_restore -U "$POSTGRES_USER" -d "$POSTGRES_DB" --clean /tmp/restore.dump
+```
+
 ## MCP server
 
 `make mcp` starts a standalone MCP server (`search_regulation`, `get_article`,

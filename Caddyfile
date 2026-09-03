@@ -1,0 +1,27 @@
+# Caddyfile — TLS termination + reverse proxy (ADR-0010, ADR-0032). Caddy's
+# automatic HTTPS (Let's Encrypt via the ACME protocol) needs nothing beyond
+# a real hostname in the site address below — no manual cert/key management.
+#
+# {$DEPLOY_HOSTNAME}: Caddyfile env-var substitution (Caddy's own, set via
+# docker-compose.prod.yml's `environment:`), the public hostname this
+# deploys to, e.g. compliance-copilot.example.com.
+{$DEPLOY_HOSTNAME} {
+	# SSE verified via Context7 (/caddyserver/website,
+	# caddyfile/directives/reverse_proxy.md, 2026-09-03): `flush_interval`
+	# is IGNORED — meaning responses are never buffered — whenever the
+	# upstream response has `Content-Type: text/event-stream`. `/ask` and
+	# `/resume` (api.py) already send that header for their SSE stream, so
+	# no `flush_interval` override is needed here; setting one would be
+	# dead configuration for the one route that needs it and a no-op
+	# everywhere else.
+	reverse_proxy api:8000
+
+	# HSTS only — not the app's other security headers (X-Content-Type-
+	# Options, Referrer-Policy, Cache-Control), which api.py's own
+	# SecurityHeadersMiddleware already sets (ADR-0030) and would otherwise
+	# be duplicated here. HSTS belongs at Caddy specifically because THIS
+	# is where TLS actually terminates (ADR-0030 named this exact gap: the
+	# app has no verified X-Forwarded-Proto trust boundary to claim HSTS
+	# from, this proxy does).
+	header Strict-Transport-Security "max-age=31536000; includeSubDomains"
+}

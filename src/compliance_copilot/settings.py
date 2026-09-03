@@ -279,5 +279,16 @@ class Settings(BaseSettings):
     # already have caught, so this value alone is "fuzzy fallback disabled."
     quote_similarity_min: float = 0.92
 
+    # ADR-0032: `build.py`'s `_mcp_connection()` spawns the MCP server
+    # subprocess. `True` (dev/CI, unchanged default) runs it via
+    # `uv run --frozen python -m ...`. The production image
+    # (Dockerfile) has no `uv` binary at all — only the synced `.venv` is
+    # copied into the runtime stage — so it sets `MCP_USE_UV_RUN=false` to
+    # spawn a bare `python -m compliance_copilot.mcp_server` instead, which
+    # works identically since that venv already has the package installed.
+    # An image-level fact, not a per-deploy tuning knob — set in the
+    # Dockerfile's `ENV`, not `.env.example`.
+    mcp_use_uv_run: bool = True
+
 
 settings = Settings()

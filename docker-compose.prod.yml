@@ -1,0 +1,114 @@
+# docker-compose.prod.yml — the deployed shape (ADR-0032, ADR-0010, ADR-0009
+# amendment). Langfuse runs in Langfuse Cloud EU (external, no self-hosted
+# ClickHouse/Redis/MinIO here) — this file only needs to run THIS project's
+# own services: `caddy` (TLS + reverse proxy, the only exposed container),
+# `api` (this repo's Dockerfile, includes the MCP stdio subprocess — ADR-0007
+# — it is NOT a separate service here), `postgres` (pgvector, ADR-0003), and
+# `backup` (daily pg_dump sidecar). `docker compose -f docker-compose.prod.yml
+# up -d` on the Hetzner VPS (ADR-0010) is the whole deploy.
+#
+# Everything except `caddy` sits on the internal network with no host port
+# published — the VPS firewall + "only caddy is reachable" is the entire
+# perimeter (ADR-0010's security note). Secrets come from `.env` via
+# `env_file` (gitignored, never baked into the image).
+
+services:
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    environment:
+      # Caddyfile's `{$DEPLOY_HOSTNAME}` placeholder — Caddy's own env
+      # substitution, not pydantic-settings (Caddy has no settings.py).
+      DEPLOY_HOSTNAME: ${DEPLOY_HOSTNAME}
+    depends_on:
+      api:
+        # service_healthy (not started): the api image has a HEALTHCHECK, so
+        # caddy only routes once the app actually answers — avoids a brief
+        # cold-start 502 window (review NIT).
+        condition: service_healthy
+
+  api:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    # No `ports:` — reachable only from `caddy` over the compose-internal
+    # network (ADR-0010: "only Caddy, and through it the API, should be
+    # publicly reachable").
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    # No env_file here (review): .env also holds OPENAI_API_KEY/API_KEY,
+    # which the database has no business seeing — least privilege at the
+    # container boundary, same reasoning as trust boundary #4 (ADR-0032).
+    environment:
+      # Same decomposition as the dev docker-compose.yml: the postgres
+      # image's entrypoint needs discrete POSTGRES_* vars, not a DSN string.
+      # These three MUST match DATABASE_URL's user/password/db in .env.
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    # No `ports:` in prod (unlike dev's loopback-only bind) — nothing but
+    # `api`/`backup`, both on the same internal network, ever needs to reach
+    # this directly from the host.
+    volumes:
+      - pgvector_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backup:
+    # Same postgres image (has pg_dump/psql already) — no second image to
+    # pull, no extra dependency, just a different entrypoint.
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    # No env_file (review): pg_dump needs exactly these three values, not
+    # the API keys .env also carries.
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - backups:/backups
+    # ponytail: a daily sleep-loop, not cron/systemd-timers/a scheduler
+    # dependency — one line does the whole job for a single-VPS, single-
+    # tenant backup. Keeps the last 7 daily dumps (find -mtime +7 -delete);
+    # `make backup-now` (Makefile) runs the same pg_dump on demand via
+    # `docker compose exec`. Upgrade path if retention/off-site copies ever
+    # matter: a real backup tool (pgBackRest/WAL-G) with S3-compatible
+    # offsite storage — not needed at this project's scale today.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - >
+        while true; do
+          pg_dump -h postgres -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -F c
+            -f "/backups/$$(date +%F).dump" &&
+          find /backups -name '*.dump' -mtime +7 -delete;
+          sleep 86400;
+        done
+
+networks:
+  default:
+    name: compliance_copilot_prod
+
+volumes:
+  pgvector_data:
+  backups:
+  caddy_data:
+  caddy_config:
